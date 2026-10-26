@@ -1,0 +1,2296 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Somaris API",
+    "version": "1.2.0",
+    "description": "Canonical JSON/YAML contract for the Somaris service. The current executable supports the built-in simulator; physical Bluetooth discovery and GATT control are not implemented yet, so readiness reports the scanner as unavailable and physical-device enrollments are unavailable. The /api/v1 namespace provides read-only telemetry, and /api/control/v1 accepts asynchronous, idempotent commands for enrolled simulated devices. A write_acknowledged result means the simulator accepted the command; it does not confirm physical movement. Batches execute child commands sequentially. Command state is persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. The control API has no authentication and is intended for a trusted network; CORS is not authentication."
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ],
+  "paths": {
+    "/api/v1/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Check HTTP service liveness and scanner status",
+        "responses": {
+          "200": {
+            "description": "The HTTP API is available. A degraded response means the BLE scanner is unavailable while the API remains usable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightHealth",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin. API routes allow GET and OPTIONS; HEAD is not advertised."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/ready": {
+      "get": {
+        "operationId": "getReadiness",
+        "summary": "Check whether the Bluetooth scanner is ready",
+        "responses": {
+          "200": {
+            "description": "The service and active Bluetooth scan are ready.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The HTTP service is alive but the scanner is not ready.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightReadiness",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin. API routes allow GET and OPTIONS; HEAD is not advertised."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/diagnostics": {
+      "get": {
+        "operationId": "getDiagnostics",
+        "summary": "Inspect in-memory service and scanner diagnostics",
+        "responses": {
+          "200": {
+            "description": "Runtime counters and scanner state without device addresses or raw system error details.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiagnosticsEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightDiagnostics",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin. API routes allow GET and OPTIONS; HEAD is not advertised."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/devices": {
+      "get": {
+        "operationId": "listDevices",
+        "summary": "List recent Somaris V2 advertisement observations",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Weak ETag received from an earlier response.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current in-memory device snapshots, newest first. An empty list is valid when no devices have been observed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceListEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/ConditionalCacheControl"
+              }
+            }
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightDevices",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin. API routes allow GET and OPTIONS; HEAD is not advertised."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/devices/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Opaque ID scoped to the current service process. Do not use it as a permanent blind identity.",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getDevice",
+        "summary": "Get one current device snapshot",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Weak ETag received from an earlier response.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The latest retained snapshot for this ID.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeviceEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/ConditionalCacheControl"
+              }
+            }
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightDevice",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin. API routes allow GET and OPTIONS; HEAD is not advertised."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/v1/history": {
+      "get": {
+        "operationId": "listHistory",
+        "summary": "Read opt-in persistent telemetry history",
+        "description": "Returns retained normalized advertisement samples in ascending cursor order. History must be enabled with SOMARIS_HISTORY_PATH. Unchanged positions are sampled at most every five seconds; position changes are recorded immediately. device_id accepts a runtime ID or logical_id.",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Weak ETag received from an earlier response.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Exclusive cursor; return records with a greater cursor.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size from 1 to 1000; defaults to 500.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 500
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "description": "RFC3339 timestamp lower bound, clamped to configured retention.",
+            "schema": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          {
+            "name": "device_id",
+            "in": "query",
+            "description": "Filter by runtime device ID or logical_id.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One cursor page of persisted telemetry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/ConditionalCacheControl"
+              }
+            }
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "description": "Persistent history is disabled.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightHistory",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin. API routes allow GET and OPTIONS; HEAD is not advertised."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/dev/simulator": {
+      "get": {
+        "operationId": "getSimulatorStatus",
+        "summary": "Read simulated blind state and active scenario",
+        "responses": {
+          "200": {
+            "description": "Current in-memory simulator status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SimulatorStatusEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightSimulatorStatus",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/dev/simulator/scenario": {
+      "put": {
+        "operationId": "setSimulatorScenario",
+        "summary": "Configure simulator failures, wireless timing, and battery response",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SimulatorScenarioRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The requested simulator scenario is active.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SimulatorStatusEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightSimulatorScenario",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/dev/simulator/reset": {
+      "post": {
+        "operationId": "resetSimulator",
+        "summary": "Reset the simulated blind to an explicit closed percentage",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SimulatorResetRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Simulator reset completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SimulatorStatusEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightSimulatorReset",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/control/v1/devices": {
+      "get": {
+        "operationId": "listManagedDevices",
+        "summary": "List blinds enrolled for open, close, and stop control",
+        "responses": {
+          "200": {
+            "description": "Managed devices with current advertisement availability. Positions are observations, not command results.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedDeviceListEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "operationId": "enrollManagedDevice",
+        "summary": "Enroll one uniquely named fresh Somaris V2 blind for control",
+        "description": "Enrollment stores the advertised name and its opaque logical hash, never the current BLE address. The device name is re-read over GATT before every command. Duplicate active names are rejected. If the file rename succeeds but syncing its directory fails, the API returns 503 with code persistence_outcome_unknown; refresh the device list before retrying.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnrollmentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Enrollment created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedDeviceEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightManagedDevices",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/control/v1/devices/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Persistent managed-device ID returned by enrollment.",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "delete": {
+        "operationId": "forgetManagedDevice",
+        "summary": "Remove a managed-device enrollment",
+        "description": "An enrollment with queued or running commands cannot be removed. Wait for those commands to finish or expire.",
+        "responses": {
+          "204": {
+            "description": "Enrollment removed."
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightManagedDevice",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/control/v1/devices/{id}/commands": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Persistent managed-device ID returned by enrollment.",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "submitBlindCommand",
+        "summary": "Queue a validated open, close, or stop command",
+        "description": "Commands are serialized FIFO per managed device and recheck freshness and identity before connecting and before a safe service-discovery retry. Adapter concurrency is bounded. Stop cancels queued open and close commands for that blind and runs after any command already in flight. Queued commands expire after the configured wait timeout. On service restart, queued commands resume after a fresh observation; a command that was connecting is recovered as outcome_unknown and is never replayed. For physical devices, stop uses the one-byte 00 payload on the separately discovered motor-control characteristic. Simulated commands use the in-memory model and never invoke BlueZ. Acknowledgement is reported separately from movement observed in /api/v1/devices. For physical devices, the service retries BlueZ connection establishment once, then permits one bounded retry for transient service-discovery failures before any GATT write; the default total command timeout is 45 seconds, with up to 30 seconds for initial discovery and 15 seconds for retry. For physical devices, connection_failed means no GATT write was sent; in the simulator it represents the selected pre-write scenario. Retry with a new idempotency key when retryable is true. For physical devices, a GATT write error has a possibly sent outcome and must not be repeated until telemetry is checked.",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "description": "Client-generated key persisted with the command. Repeating the same key and command returns the original record for up to 24 hours, subject to the bounded 1000-record journal retaining it. A different request with the same key returns 409. Use a new key for a new attempt after connection_failed. Commands are recorded durably before a 202 response.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Command accepted for asynchronous processing. Poll the command resource for transport status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightBlindCommand",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/control/v1/devices/{id}/toggle": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Persistent managed-device ID returned by enrollment.",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "toggleBlind",
+        "summary": "Queue the opposite open or close action for one blind",
+        "description": "Uses a fresh unique observation. When no newer command intent exists, target position below 50% closed is treated as open and target position at or above 50% closed is treated as closed; the command targets the opposite endpoint. A queued or connecting open/close command, or an acknowledged movement command not yet reflected in telemetry, supplies the effective target so rapid toggles reverse the latest intent. A pending stop or a possibly-sent movement command without a newer observation returns 409. The Command response includes toggle_basis, toggle_position, and toggle_observed_at to show the decision evidence. Unavailable, stale, or ambiguous positions also return 409. This is a state-changing POST and must not be invoked by GET links or prefetching clients. Retrying the same Idempotency-Key returns the original command and selected action.",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "description": "Client-generated key persisted with the command. Repeating the same key and toggle returns the original record; a different request using that key returns 409.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Toggle accepted. The command's action field reports the selected open or close command; poll the command resource for transport status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightBlindToggle",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/control/v1/batches": {
+      "post": {
+        "operationId": "submitBlindBatch",
+        "summary": "Queue an action for all currently ready enrolled blinds",
+        "description": "The service snapshots enrolled blinds with a unique, fresh supported observation at acceptance. Enrollments that are not seen, stale, or ambiguous are returned in skipped and do not count as failures. The durable batch processes targets sequentially in label order. Each target uses the existing durable command queue, rechecks identity and freshness before connecting, and reports its ordinary child command status. A failed target does not prevent later targets from running. A batch is idempotent by its required Idempotency-Key; repeating that key with another action returns 409. A write_acknowledged child does not confirm physical movement. If no enrolled blind is ready, the request returns 409 no_available_blinds.",
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "description": "Client-generated key for this batch. Repeating the same key and action returns the original batch record.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchCommandRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Batch accepted for sequential asynchronous execution.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "description": "Control unavailable or the batch journal is full (batch_capacity_reached).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightBlindBatches",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/control/v1/batches/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Opaque batch ID returned by submission.",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getBlindBatch",
+        "summary": "Get aggregate progress and child command outcomes for a batch",
+        "description": "The batch record includes the accepted target snapshot, skipped enrollments, per-target child command IDs and statuses, and aggregate counts. Batches and their idempotency keys are kept in the bounded local journal; child command status can also be read from /api/control/v1/commands/{id}.",
+        "responses": {
+          "200": {
+            "description": "Batch lifecycle record.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightBlindBatch",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/control/v1/queue": {
+      "get": {
+        "operationId": "getBlindCommandQueue",
+        "summary": "Inspect blind command backlog and capacity",
+        "description": "Reports pending and running command counts, oldest queued age, total outstanding work, the per-device limit, and configured BlueZ adapter concurrency. It contains no BLE addresses or command payloads.",
+        "responses": {
+          "200": {
+            "description": "Command queue diagnostics.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueueDiagnosticsEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightBlindCommandQueue",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/control/v1/commands/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Opaque command ID persisted in the local queue journal and returned by submission.",
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getBlindCommand",
+        "summary": "Get the transport status for a command",
+        "description": "Command records and idempotency keys are retained in the bounded local journal across service restarts. Completed records are retained for up to 24 hours, subject to the 1000-record cap. Queued commands resume after restart when the blind is observed again; a record recovered from connecting is outcome_unknown and is not replayed. write_state distinguishes not_sent, possibly_sent, and acknowledged. failure_stage and stable error_code identify where execution stopped; retryable means the caller may safely submit a new request. Raw Bluetooth or operating-system details are restricted to sanitized service logs.",
+        "responses": {
+          "200": {
+            "description": "Command lifecycle record.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightBlindCommandStatus",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenApiJson",
+        "summary": "Get this API contract as JSON",
+        "responses": {
+          "200": {
+            "description": "OpenAPI document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.yaml": {
+      "get": {
+        "operationId": "getOpenApiYaml",
+        "summary": "Get this API contract as YAML",
+        "responses": {
+          "200": {
+            "description": "OpenAPI document",
+            "content": {
+              "application/yaml": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "responses": {
+      "Error": {
+        "description": "A consistent API error envelope.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorEnvelope"
+            }
+          }
+        }
+      },
+      "NotModified": {
+        "description": "The semantic response data is unchanged. No body is returned.",
+        "headers": {
+          "ETag": {
+            "$ref": "#/components/headers/ETag"
+          },
+          "Cache-Control": {
+            "$ref": "#/components/headers/ConditionalCacheControl"
+          }
+        }
+      }
+    },
+    "headers": {
+      "ETag": {
+        "description": "Weak validator for semantic response data; send it in If-None-Match to receive 304 when unchanged.",
+        "schema": {
+          "type": "string",
+          "example": "W/\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\""
+        }
+      },
+      "ConditionalCacheControl": {
+        "description": "Responses can be stored and must be revalidated before reuse.",
+        "schema": {
+          "type": "string",
+          "const": "no-cache"
+        }
+      }
+    },
+    "schemas": {
+      "Meta": {
+        "type": "object",
+        "required": [
+          "generated_at"
+        ],
+        "properties": {
+          "generated_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC time at which this response was created."
+          },
+          "count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "HealthEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "status",
+              "scanner_status",
+              "generated_at"
+            ],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "healthy",
+                  "degraded"
+                ]
+              },
+              "scanner_status": {
+                "type": "string",
+                "enum": [
+                  "starting",
+                  "scanning",
+                  "unavailable",
+                  "stopped"
+                ]
+              },
+              "generated_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "UTC health snapshot time."
+              }
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "ScannerDiagnostics": {
+        "type": "object",
+        "required": [
+          "status",
+          "adapter_available",
+          "scan_active",
+          "retry_count",
+          "error_count",
+          "somaris_advertisements_seen",
+          "observations_stored",
+          "malformed_payload_count",
+          "unsupported_version_count"
+        ],
+        "description": "Low-sensitivity runtime metrics. Raw system errors and BLE device identifiers are not returned.",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "starting",
+              "scanning",
+              "unavailable",
+              "stopped"
+            ]
+          },
+          "adapter_available": {
+            "type": "boolean"
+          },
+          "scan_active": {
+            "type": "boolean"
+          },
+          "last_scan_started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_advertisement_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Most recent Somaris manufacturer advertisement received, including payloads that could not be decoded."
+          },
+          "last_error_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_error_code": {
+            "type": "string",
+            "description": "Stable code such as adapter_enable_failed, scan_ended, registry_store_failed, history_write_failed, scan_stop_timeout, or scan_stop_failed. Raw OS error details are never included."
+          },
+          "retry_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of retryable adapter or scan failures."
+          },
+          "error_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "somaris_advertisements_seen": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "observations_stored": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "malformed_payload_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unsupported_version_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "RegistryDiagnostics": {
+        "type": "object",
+        "required": [
+          "retained_device_count",
+          "stale_device_count"
+        ],
+        "properties": {
+          "retained_device_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "stale_device_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "DiagnosticsEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "service_started_at",
+              "uptime_seconds",
+              "history_enabled",
+              "scanner",
+              "registry"
+            ],
+            "properties": {
+              "service_started_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "uptime_seconds": {
+                "type": "number",
+                "minimum": 0
+              },
+              "history_enabled": {
+                "type": "boolean",
+                "description": "Whether persistent telemetry history is enabled."
+              },
+              "scanner": {
+                "$ref": "#/components/schemas/ScannerDiagnostics"
+              },
+              "registry": {
+                "$ref": "#/components/schemas/RegistryDiagnostics"
+              }
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "Position": {
+        "type": "object",
+        "required": [
+          "current_closed_percent",
+          "target_closed_percent"
+        ],
+        "description": "Blind position in percent closed. The first reported position is current and the second is target; 0 is open and 100 is closed.",
+        "properties": {
+          "current_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "target_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC time of the observation that supplied these position values."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "ble_advertisement",
+              "simulator"
+            ]
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "project_confirmed",
+              "simulated"
+            ],
+            "description": "project_confirmed denotes protocol evidence; simulated denotes generated state."
+          }
+        }
+      },
+      "BatteryTelemetry": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "description": "Physical readings are cached BA71 GATT battery-voltage observations from enrolled blinds. This is not conventional Battery Service percentage data. Reads are performed in the background at a low frequency and are serialized with movement commands; GET requests do not connect to the blind. Percent is an estimate from the community-reference curve, not manufacturer-calibrated state of charge. The simulator can also return a synthetic replay of one captured sample; source identifies it as simulated. The physical cache is in memory and resets when the service restarts.",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "observed",
+              "unsupported",
+              "invalid_value",
+              "unavailable",
+              "not_observed"
+            ],
+            "description": "Whether the latest BA71 read succeeded, the characteristic is unsupported, the value was malformed, the latest read failed, or no read has been recorded. An unavailable status may include the last successful measurement. Unenrolled or currently ambiguous identities are not associated with cached readings."
+          },
+          "voltage_mv": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "BA71 value decoded as little-endian u16 multiplied by 10 mV; present after a valid read and retained if a later read fails."
+          },
+          "percent_estimate": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Linear estimate from 0% at/below 3600 mV to 100% at/above 4100 mV; intermediate accuracy is uncalibrated. A last successful estimate is retained if a later read fails."
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC time of the latest successful BA71 read; retained if a later read fails."
+          },
+          "last_attempt_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC time of the latest background BA71 read attempt, whether it succeeded or failed; omitted until an attempt occurs."
+          },
+          "error_code": {
+            "type": "string",
+            "description": "Stable code for the latest unsuccessful read or invalid value. Raw BlueZ and D-Bus error messages are not exposed."
+          },
+          "failure_stage": {
+            "type": "string",
+            "description": "Stable service stage where the latest read failed, when available."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "gatt_ba71",
+              "simulator"
+            ],
+            "description": "gatt_ba71 for a physical read; simulator for a synthetic scenario."
+          }
+        }
+      },
+      "Device": {
+        "type": "object",
+        "required": [
+          "id",
+          "observed_address",
+          "device_name",
+          "rssi_dbm",
+          "last_seen_at",
+          "freshness",
+          "source",
+          "manufacturer_data_hex",
+          "manufacturer_payload_hex",
+          "position_status",
+          "position",
+          "movement_status",
+          "battery"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Opaque ID scoped to the current service process; it is not a permanent device identity."
+          },
+          "logical_id": {
+            "type": "string",
+            "description": "Optional stable opaque hash of a normalized advertised payload name. It is only unique when advertised names are unique and stable; duplicate names can collide."
+          },
+          "observed_address": {
+            "type": "string",
+            "description": "BLE address for physical devices; a simulator URI for the synthetic device."
+          },
+          "device_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "advertised_name": {
+            "type": "string",
+            "description": "Normalized physical payload name or the synthetic simulator name."
+          },
+          "rssi_dbm": {
+            "type": "integer",
+            "description": "Received signal strength for physical observations. The simulator supplies a synthetic placeholder or capture-informed value, never a live motor measurement."
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "UTC time of the latest physical advertisement or synthetic simulator observation."
+          },
+          "freshness": {
+            "type": "string",
+            "enum": [
+              "fresh",
+              "stale"
+            ],
+            "description": "Stale after the configured freshness interval (60 seconds by default)."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "ble_advertisement",
+              "simulator"
+            ],
+            "description": "Origin of the observation; simulated snapshots do not contain BLE evidence."
+          },
+          "is_simulated": {
+            "type": "boolean",
+            "description": "True only for the in-memory simulator device."
+          },
+          "manufacturer_data_hex": {
+            "type": "string",
+            "deprecated": true,
+            "description": "Compatibility diagnostic field containing raw manufacturer bytes; prefer normalized telemetry."
+          },
+          "manufacturer_payload_hex": {
+            "type": "string",
+            "deprecated": true,
+            "description": "Compatibility diagnostic field containing raw payload bytes; prefer normalized telemetry."
+          },
+          "position_status": {
+            "type": "string",
+            "enum": [
+              "observed",
+              "unsupported",
+              "invalid_payload",
+              "not_observed"
+            ],
+            "description": "Explains whether position is available and why it may be null."
+          },
+          "position": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Position"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Decoded physical position or generated simulator state. Current-versus-target comparison describes reported direction only; it is not confirmation of physical motor movement."
+          },
+          "movement_status": {
+            "$ref": "#/components/schemas/MovementStatus"
+          },
+          "battery": {
+            "$ref": "#/components/schemas/BatteryTelemetry"
+          }
+        }
+      },
+      "DeviceListEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Device"
+            }
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Meta"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "count"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "DeviceEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Device"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "required": [
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "MovementStatus": {
+        "type": "string",
+        "enum": [
+          "closing",
+          "opening",
+          "at_target",
+          "unavailable"
+        ],
+        "description": "Derived from reported current and target positions. It does not confirm physical motion or acknowledge a command."
+      },
+      "HistoryObservation": {
+        "type": "object",
+        "required": [
+          "cursor",
+          "device_id",
+          "observed_at",
+          "rssi_dbm",
+          "position_status",
+          "position"
+        ],
+        "properties": {
+          "cursor": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Increasing cursor used to page the retained history file; it can reset when no samples remain."
+          },
+          "device_id": {
+            "type": "string",
+            "description": "Runtime device ID used for this advertisement source."
+          },
+          "logical_id": {
+            "type": "string",
+            "description": "Optional stable opaque hash of a normalized advertised payload name."
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "rssi_dbm": {
+            "type": "integer"
+          },
+          "position_status": {
+            "type": "string",
+            "enum": [
+              "observed",
+              "unsupported",
+              "invalid_payload",
+              "not_observed"
+            ]
+          },
+          "position": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HistoryPosition"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "HistoryPosition": {
+        "type": "object",
+        "required": [
+          "current_closed_percent",
+          "target_closed_percent"
+        ],
+        "properties": {
+          "current_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "target_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        }
+      },
+      "HistoryEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HistoryObservation"
+            }
+          },
+          "meta": {
+            "type": "object",
+            "required": [
+              "generated_at",
+              "count",
+              "next_cursor",
+              "latest_cursor",
+              "has_more"
+            ],
+            "properties": {
+              "generated_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "next_cursor": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "latest_cursor": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "has_more": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "SimulatorStatus": {
+        "type": "object",
+        "required": [
+          "scenario",
+          "wireless_profile",
+          "battery_state",
+          "connection_delay_ms",
+          "write_response_delay_ms",
+          "telemetry_paused",
+          "current_closed_percent",
+          "target_closed_percent"
+        ],
+        "properties": {
+          "scenario": {
+            "type": "string",
+            "enum": [
+              "normal",
+              "pre_write_failure",
+              "outcome_unknown",
+              "gatt_write_error",
+              "telemetry_paused"
+            ]
+          },
+          "wireless_profile": {
+            "type": "string",
+            "enum": [
+              "standard",
+              "hallway_observed",
+              "hallway_slow_link"
+            ],
+            "description": "standard has no transport delay and fixed synthetic RSSI. hallway_observed uses 80 ms connection and 72 ms write-response delays; hallway_slow_link uses the 702 ms maximum seen in six HCI connection samples. Both Hallway profiles use deterministic synthetic host-observation intervals and RSSI based on capture summaries, not an OTA advertising timer."
+          },
+          "battery_state": {
+            "type": "string",
+            "enum": [
+              "unsupported",
+              "unavailable",
+              "observed_sample"
+            ],
+            "description": "observed_sample replays one synthetic 4230 mV Hallway BA71 read, with a 100% estimate from an uncalibrated community curve."
+          },
+          "connection_delay_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 702
+          },
+          "write_response_delay_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 72
+          },
+          "telemetry_paused": {
+            "type": "boolean"
+          },
+          "current_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "target_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        }
+      },
+      "SimulatorStatusEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SimulatorStatus"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "SimulatorScenarioRequest": {
+        "type": "object",
+        "minProperties": 1,
+        "properties": {
+          "scenario": {
+            "type": "string",
+            "enum": [
+              "normal",
+              "pre_write_failure",
+              "outcome_unknown",
+              "gatt_write_error",
+              "telemetry_paused"
+            ]
+          },
+          "wireless_profile": {
+            "type": "string",
+            "enum": [
+              "standard",
+              "hallway_observed",
+              "hallway_slow_link"
+            ]
+          },
+          "battery_state": {
+            "type": "string",
+            "enum": [
+              "unsupported",
+              "unavailable",
+              "observed_sample"
+            ]
+          }
+        }
+      },
+      "SimulatorResetRequest": {
+        "type": "object",
+        "properties": {
+          "position_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "default": 50,
+            "description": "Reset current and target positions to this value; 0 is open and 100 is closed."
+          }
+        }
+      },
+      "EnrollmentRequest": {
+        "type": "object",
+        "required": [
+          "observed_device_id",
+          "label"
+        ],
+        "properties": {
+          "observed_device_id": {
+            "type": "string",
+            "description": "Fresh runtime ID from GET /api/v1/devices. It is used only to confirm the enrollment target and is not persisted."
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "User-facing name for the managed blind."
+          }
+        }
+      },
+      "Enrollment": {
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "advertised_name",
+          "logical_id",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Persistent opaque managed-device ID."
+          },
+          "label": {
+            "type": "string"
+          },
+          "advertised_name": {
+            "type": "string",
+            "description": "Expected physical payload name or simulator name. The service verifies physical names with GATT and simulated names in memory."
+          },
+          "logical_id": {
+            "type": "string",
+            "description": "Opaque hash of the expected name in the physical or simulator namespace. Duplicate live names within a namespace are rejected."
+          },
+          "is_simulated": {
+            "type": "boolean",
+            "description": "True for the in-memory synthetic device; it is persisted so restart recovery keeps transport routing explicit."
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ControlPosition": {
+        "type": "object",
+        "required": [
+          "current_closed_percent",
+          "target_closed_percent"
+        ],
+        "description": "Latest observed BLE or generated simulator position. This is telemetry and does not confirm a command result.",
+        "properties": {
+          "current_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "target_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        }
+      },
+      "ManagedDevice": {
+        "type": "object",
+        "required": [
+          "enrollment",
+          "availability"
+        ],
+        "properties": {
+          "enrollment": {
+            "$ref": "#/components/schemas/Enrollment"
+          },
+          "availability": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "not_seen",
+              "stale",
+              "ambiguous"
+            ],
+            "description": "ready means a unique fresh physical or simulated observation is available; it does not mean the service is connected over GATT."
+          },
+          "last_seen_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "position": {
+            "$ref": "#/components/schemas/ControlPosition"
+          }
+        }
+      },
+      "ManagedDeviceEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Enrollment"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "ManagedDeviceListEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ManagedDevice"
+            }
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Meta"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "count"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "CommandRequest": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "open",
+              "close",
+              "stop"
+            ],
+            "description": "Open and close use the tested three-byte payloads. Stop uses the tested one-byte 00 payload. Percentage positioning and arbitrary GATT writes are not exposed."
+          }
+        }
+      },
+      "BatchCommandRequest": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "open",
+              "close",
+              "stop"
+            ]
+          }
+        }
+      },
+      "BatchTarget": {
+        "type": "object",
+        "required": [
+          "managed_device_id",
+          "label",
+          "status"
+        ],
+        "properties": {
+          "managed_device_id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "pending, a child Command status, or not_submitted."
+          },
+          "command_id": {
+            "type": "string"
+          },
+          "command": {
+            "$ref": "#/components/schemas/Command"
+          },
+          "error_code": {
+            "type": "string"
+          }
+        }
+      },
+      "BatchSkipped": {
+        "type": "object",
+        "required": [
+          "managed_device_id",
+          "label",
+          "availability"
+        ],
+        "properties": {
+          "managed_device_id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "availability": {
+            "type": "string",
+            "enum": [
+              "not_seen",
+              "stale",
+              "ambiguous"
+            ]
+          }
+        }
+      },
+      "Batch": {
+        "type": "object",
+        "required": [
+          "id",
+          "action",
+          "status",
+          "accepted_at",
+          "targets",
+          "skipped",
+          "target_count",
+          "skipped_count",
+          "acknowledged_count",
+          "failed_count",
+          "pending_count"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "open",
+              "close",
+              "stop"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "running",
+              "completed",
+              "partial",
+              "failed"
+            ]
+          },
+          "accepted_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchTarget"
+            }
+          },
+          "skipped": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BatchSkipped"
+            }
+          },
+          "target_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "skipped_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "acknowledged_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pending_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "BatchEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Batch"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "Command": {
+        "type": "object",
+        "required": [
+          "id",
+          "managed_device_id",
+          "action",
+          "status",
+          "accepted_at",
+          "expires_at",
+          "attempt",
+          "write_state",
+          "retryable"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Opaque command ID persisted in the local queue journal."
+          },
+          "managed_device_id": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "open",
+              "close",
+              "stop"
+            ]
+          },
+          "toggle_basis": {
+            "type": "string",
+            "enum": [
+              "observed_target",
+              "command_intent"
+            ],
+            "description": "Present on toggle commands. observed_target means the action was selected from the reported target position; command_intent means it reversed a queued, connecting, or acknowledged movement command not yet reflected in telemetry."
+          },
+          "toggle_position": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ControlPosition"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Position snapshot present on toggle commands. It is telemetry, not confirmation of physical movement."
+          },
+          "toggle_observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Observation timestamp used for the toggle decision. Present on toggle commands."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "connecting",
+              "connection_failed",
+              "write_acknowledged",
+              "write_failed",
+              "outcome_unknown",
+              "expired",
+              "cancelled"
+            ]
+          },
+          "accepted_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the command began consuming adapter capacity."
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Completion time for terminal states, including expired and cancelled."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Deadline after which a command still queued is marked expired."
+          },
+          "attempt": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of execution attempts begun, including the single bounded service-discovery retry."
+          },
+          "error_code": {
+            "type": "string",
+            "description": "Stable failure or cancellation code. preempted_by_stop means a queued open/close was cancelled by a later stop. Raw Bluetooth or operating-system errors are not exposed by the API."
+          },
+          "failure_stage": {
+            "type": "string",
+            "description": "Stable execution stage such as device_connection, service_resolution, gatt_discovery, identity_verification, or gatt_write."
+          },
+          "write_state": {
+            "type": "string",
+            "enum": [
+              "not_sent",
+              "possibly_sent",
+              "acknowledged"
+            ],
+            "description": "Whether the command could have reached the blind. possibly_sent must be checked against telemetry before retrying."
+          },
+          "retryable": {
+            "type": "boolean",
+            "description": "True only when no GATT write was sent and a new request can be safely submitted."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Elapsed execution time in milliseconds, including an automatic retry when one was attempted."
+          }
+        }
+      },
+      "QueueDiagnostics": {
+        "type": "object",
+        "required": [
+          "pending_commands",
+          "running_commands",
+          "outstanding_commands",
+          "oldest_queued_age_seconds",
+          "max_outstanding_commands",
+          "max_queued_per_device",
+          "adapter_concurrency"
+        ],
+        "properties": {
+          "pending_commands": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "running_commands": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "outstanding_commands": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "oldest_queued_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "oldest_queued_age_seconds": {
+            "type": "number",
+            "minimum": 0
+          },
+          "max_outstanding_commands": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "max_queued_per_device": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "adapter_concurrency": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "QueueDiagnosticsEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/QueueDiagnostics"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "CommandEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Command"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      }
+    }
+  }
+}
