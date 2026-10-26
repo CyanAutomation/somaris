@@ -3,7 +3,10 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -156,6 +159,8 @@ pub struct AppState {
     started_at: DateTime<Utc>,
     started: Instant,
     history_path: Option<PathBuf>,
+    history_persist_lock: Arc<Mutex<()>>,
+    history_revision: Arc<AtomicU64>,
     data_path: Option<PathBuf>,
 }
 
@@ -290,6 +295,8 @@ impl AppState {
             started_at,
             started: Instant::now(),
             history_path,
+            history_persist_lock: Arc::new(Mutex::new(())),
+            history_revision: Arc::new(AtomicU64::new(0)),
             data_path,
         }
     }
@@ -357,12 +364,19 @@ impl AppState {
             .map_err(|_| ())
     }
 
-    async fn persist_history(&self, inner: &Inner) -> Result<(), ()> {
+    async fn persist_history(
+        &self,
+        history: &[HistoryObservation],
+        revision: u64,
+    ) -> Result<(), ()> {
         let Some(path) = &self.history_path else {
             return Ok(());
         };
-        let lines = inner
-            .history
+        let _persist_guard = self.history_persist_lock.lock().await;
+        if self.history_revision.load(Ordering::Acquire) != revision {
+            return Ok(());
+        }
+        let lines = history
             .iter()
             .map(serde_json::to_string)
             .collect::<Result<Vec<_>, _>>()
@@ -401,15 +415,21 @@ impl AppState {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 interval.tick().await;
-                let mut inner = state.inner.lock().await;
-                if !inner.simulator_enabled || inner.simulator_config.telemetry_paused {
-                    continue;
-                }
-                let now = Utc::now();
-                inner.simulator.last_seen_at = now;
-                let changed = record_history(&mut inner).unwrap_or(false);
-                if changed {
-                    let _ = state.persist_history(&inner).await;
+                let history = {
+                    let mut inner = state.inner.lock().await;
+                    if !inner.simulator_enabled || inner.simulator_config.telemetry_paused {
+                        continue;
+                    }
+                    inner.simulator.last_seen_at = Utc::now();
+                    if record_history(&mut inner).unwrap_or(false) {
+                        let revision = state.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
+                        Some((inner.history.clone(), revision))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((history, revision)) = history {
+                    let _ = state.persist_history(&history, revision).await;
                 }
             }
         });
@@ -848,22 +868,30 @@ async fn reset_simulator(
     }
     inner.simulator_config.scenario = SimulatorScenario::Normal;
     inner.simulator_config.telemetry_paused = false;
-    inner.simulator.position = Some(position_value(
-        position,
-        position,
-        Utc::now(),
-        Source::Simulator,
-    ));
+    let now = Utc::now();
+    inner.simulator.position = Some(position_value(position, position, now, Source::Simulator));
     inner.simulator.movement_status = MovementStatus::AtTarget;
-    inner.simulator.last_seen_at = Utc::now();
-    if let Err(record) = record_history(&mut inner) {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "history_write_failed",
-            &record,
-        );
-    }
-    if state.persist_history(&inner).await.is_err() {
+    inner.simulator.last_seen_at = now;
+    let history_changed = match record_history(&mut inner) {
+        Ok(changed) => changed,
+        Err(record) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "history_write_failed",
+                &record,
+            );
+        }
+    };
+    let history_revision = if history_changed {
+        state.history_revision.fetch_add(1, Ordering::AcqRel) + 1
+    } else {
+        state.history_revision.load(Ordering::Acquire)
+    };
+    if state
+        .persist_history(&inner.history, history_revision)
+        .await
+        .is_err()
+    {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "history_write_failed",
@@ -2425,8 +2453,15 @@ async fn process_command(state: AppState, command_id: String) {
             SimulatorScenario::Normal | SimulatorScenario::TelemetryPaused
         )
     {
-        let _ = record_history(&mut inner);
-        if state.persist_history(&inner).await.is_err() {
+        if record_history(&mut inner).unwrap_or(false) {
+            state.history_revision.fetch_add(1, Ordering::AcqRel);
+        }
+        let history_revision = state.history_revision.load(Ordering::Acquire);
+        if state
+            .persist_history(&inner.history, history_revision)
+            .await
+            .is_err()
+        {
             tracing::warn!("Could not persist simulator telemetry history.");
         }
     }

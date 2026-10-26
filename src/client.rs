@@ -9,6 +9,10 @@ use crate::telemetry::normalize_reason_codes;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientOptions {
     pub timeout: Duration,
+    /// Validates HTTPS certificates when enabled. Defaults to `true`.
+    ///
+    /// Disabling this accepts invalid certificates and permits man-in-the-middle
+    /// attacks. Use only for controlled development or test environments.
     pub reject_unauthorized: bool,
 }
 
@@ -85,6 +89,9 @@ impl RemoteApiClient {
         }
         if base_url.cannot_be_a_base() {
             return Err("Base URL must support path segments.".into());
+        }
+        if base_url.scheme() == "https" && !options.reject_unauthorized {
+            tracing::warn!("HTTPS certificate validation is disabled for the Somaris API client.");
         }
         if !base_url.path().ends_with('/') {
             base_url.set_path(&format!("{}/", base_url.path()));

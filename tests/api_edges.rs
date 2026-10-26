@@ -310,6 +310,25 @@ async fn simulator_profiles_drive_battery_and_wireless_snapshots() {
 }
 
 #[tokio::test]
+async fn simulator_reset_uses_one_timestamp_for_position_and_last_seen() {
+    let app = router(AppState::new());
+    let (status, _, _) = request(
+        &app,
+        Method::POST,
+        "/api/dev/simulator/reset",
+        &[],
+        Some(json!({"position_closed_percent": 35})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let device = &devices.unwrap()["data"][0];
+    assert_eq!(device["position"]["observed_at"], device["last_seen_at"]);
+}
+
+#[tokio::test]
 async fn invalid_simulator_values_are_rejected_with_json_errors() {
     let app = router(AppState::new());
     let (status, _, body) = request(
