@@ -114,9 +114,7 @@ impl BleAdapter for FakeBleAdapter {
 #[tokio::test]
 async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
     let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
-    let state = AppState::new().with_ble_adapter(adapter.clone());
-    state.spawn_background_tasks();
-    let app = router(state);
+    let app = app_with_adapter(adapter.clone()).await;
 
     let blind = wait_for_blind(&app, "Bedroom Right0").await;
     assert_eq!(blind["source"], "ble_advertisement");
