@@ -482,7 +482,7 @@ impl BleAdapter for BtleplugAdapter {
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             peripheral.write(
-                &characteristic,
+                characteristic,
                 &encode_service_action(action),
                 WriteType::WithResponse,
             ),
