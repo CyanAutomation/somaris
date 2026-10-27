@@ -1,15 +1,14 @@
 name: Publish Docker image
 
 on:
-  push:
-    branches:
-      - main
-    tags:
-      - "v*"
   pull_request:
     branches:
       - main
-  workflow_dispatch:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - closed
 
 permissions:
   contents: read
@@ -17,7 +16,7 @@ permissions:
 jobs:
   pull-request-build:
     name: Build image for pull request
-    if: github.event_name == 'pull_request'
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
 
     steps:
@@ -37,7 +36,7 @@ jobs:
 
   publish:
     name: Build and publish image
-    if: github.event_name != 'pull_request'
+    if: github.event.action == 'closed' && github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     environment: docker
 
@@ -60,8 +59,6 @@ jobs:
         with:
           images: cyanautomation/somaris
           tags: |
-            type=ref,event=branch
-            type=ref,event=tag
             type=sha,prefix=sha-
             type=raw,value=latest
 
