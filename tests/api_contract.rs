@@ -162,6 +162,56 @@ async fn commands_are_idempotent_and_acknowledgement_updates_simulated_target() 
 }
 
 #[tokio::test]
+async fn simulator_reports_ack_separately_then_advances_observed_position() {
+    let state = AppState::new();
+    state.spawn_background_tasks();
+    let app = router(state);
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let observed_id = devices.unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (_, _, enrollment) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": observed_id, "label": "Moving blind"})),
+    )
+    .await;
+    let managed_id = enrollment.unwrap()["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _, accepted) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "close-moving")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = accepted.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    let command = wait_for_command(&app, &command_id).await;
+    assert_eq!(command["status"], "write_acknowledged");
+
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let position = &devices.unwrap()["data"][0]["position"];
+    assert_eq!(position["target_closed_percent"], 100);
+    let initial_current = position["current_closed_percent"].as_u64().unwrap();
+    assert!(initial_current < 100);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let moved_current = devices.unwrap()["data"][0]["position"]["current_closed_percent"]
+        .as_u64()
+        .unwrap();
+    assert!(moved_current > initial_current);
+    assert!(moved_current < 100);
+}
+
+#[tokio::test]
 async fn uncertain_simulator_outcomes_are_never_safe_to_retry() {
     let app = router(AppState::new());
     let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;

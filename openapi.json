@@ -3,7 +3,7 @@
   "info": {
     "title": "Somaris API",
     "version": "1.2.0",
-    "description": "Canonical JSON/YAML contract for the Somaris service. The current executable supports the built-in simulator; physical Bluetooth discovery and GATT control are not implemented yet, so readiness reports the scanner as unavailable and physical-device enrollments are unavailable. The /api/v1 namespace provides read-only telemetry, and /api/control/v1 accepts asynchronous, idempotent commands for enrolled simulated devices. A write_acknowledged result means the simulator accepted the command; it does not confirm physical movement. Batches execute child commands sequentially. Command state is persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. The control API has no authentication and is intended for a trusted network; CORS is not authentication."
+    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes only the documented fixed actions. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. The built-in simulator remains available for software development. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. The control API has no authentication and is intended for a trusted network; CORS is not authentication."
   },
   "servers": [
     {
@@ -1115,7 +1115,7 @@
           "scan_active",
           "retry_count",
           "error_count",
-          "somaris_advertisements_seen",
+          "soma_advertisements_seen",
           "observations_stored",
           "malformed_payload_count",
           "unsupported_version_count"
@@ -1163,7 +1163,7 @@
             "type": "integer",
             "minimum": 0
           },
-          "somaris_advertisements_seen": {
+          "soma_advertisements_seen": {
             "type": "integer",
             "minimum": 0
           },
@@ -1341,7 +1341,6 @@
         "type": "object",
         "required": [
           "id",
-          "observed_address",
           "device_name",
           "rssi_dbm",
           "last_seen_at",
@@ -1364,8 +1363,11 @@
             "description": "Optional stable opaque hash of a normalized advertised payload name. It is only unique when advertised names are unique and stable; duplicate names can collide."
           },
           "observed_address": {
-            "type": "string",
-            "description": "BLE address for physical devices; a simulator URI for the synthetic device."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "BLE address when the host platform exposes a usable value; it may be absent on privacy-preserving platforms and is never the enrollment identity."
           },
           "device_name": {
             "type": [
