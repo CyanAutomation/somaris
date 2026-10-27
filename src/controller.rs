@@ -1,7 +1,9 @@
 use thiserror::Error;
 
-pub const OPEN_CLOSE_SERVICE_UUID: &str = "00001896-b87f-490c-92cb-11ba5ea5167c";
-pub const STOP_SERVICE_UUID: &str = "00001530-b87f-490c-92cb-11ba5ea5167c";
+pub const OPEN_CLOSE_SERVICE_UUID: &str = "00001890-b87f-490c-92cb-11ba5ea5167c";
+pub const OPEN_CLOSE_CHARACTERISTIC_UUID: &str = "00001896-b87f-490c-92cb-11ba5ea5167c";
+pub const STOP_SERVICE_UUID: &str = "00001861-b87f-490c-92cb-11ba5ea5167c";
+pub const STOP_CHARACTERISTIC_UUID: &str = "00001530-b87f-490c-92cb-11ba5ea5167c";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerCommand {

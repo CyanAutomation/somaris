@@ -45,12 +45,14 @@ const OPENAPI_JSON: &str = include_str!("../openapi.json");
 const SIMULATOR_ID: &str = "simulator-1";
 const MAX_COMMANDS: usize = 1000;
 const MAX_BATCHES: usize = 1000;
+const SCAN_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueConfig {
     pub max_outstanding_commands: usize,
     pub max_queued_per_device: usize,
     pub adapter_concurrency: usize,
+    pub adapter_scan_window_ms: u64,
     pub queue_wait_timeout_seconds: i64,
 }
 
@@ -60,6 +62,7 @@ impl Default for QueueConfig {
             max_outstanding_commands: 1000,
             max_queued_per_device: 32,
             adapter_concurrency: 1,
+            adapter_scan_window_ms: 5_000,
             queue_wait_timeout_seconds: 120,
         }
     }
@@ -82,6 +85,9 @@ impl QueueConfig {
         if self.adapter_concurrency == 0 || self.adapter_concurrency > 64 {
             return Err("adapter_concurrency must be between 1 and 64".into());
         }
+        if !(100..=10_000).contains(&self.adapter_scan_window_ms) {
+            return Err("adapter_scan_window_ms must be between 100 and 10000".into());
+        }
         if !(1..=86_400).contains(&self.queue_wait_timeout_seconds) {
             return Err("queue_wait_timeout_seconds must be between 1 and 86400".into());
         }
@@ -102,6 +108,10 @@ impl QueueConfig {
             adapter_concurrency: env_positive_usize(
                 "SOMARIS_ADAPTER_CONCURRENCY",
                 defaults.adapter_concurrency,
+            )?,
+            adapter_scan_window_ms: env_positive_u64(
+                "SOMARIS_ADAPTER_SCAN_WINDOW_MS",
+                defaults.adapter_scan_window_ms,
             )?,
             queue_wait_timeout_seconds: env_positive_usize(
                 "SOMARIS_COMMAND_QUEUE_WAIT_TIMEOUT_SECONDS",
@@ -148,6 +158,14 @@ fn env_positive_usize(name: &str, default: usize) -> io::Result<usize> {
         return Ok(default);
     };
     let parsed = value.parse::<usize>().ok().filter(|value| *value > 0);
+    parsed.ok_or_else(|| invalid_configuration(format!("{name} must be a positive integer")))
+}
+
+fn env_positive_u64(name: &str, default: u64) -> io::Result<u64> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(default);
+    };
+    let parsed = value.parse::<u64>().ok().filter(|value| *value > 0);
     parsed.ok_or_else(|| invalid_configuration(format!("{name} must be a positive integer")))
 }
 
@@ -530,6 +548,15 @@ impl AppState {
             }
 
             let Some(adapter) = adapter else { continue };
+            let scan_permits = self
+                .adapter_slots
+                .clone()
+                .acquire_many_owned(self.queue_config.adapter_concurrency as u32)
+                .await;
+            let Ok(scan_permit) = scan_permits else {
+                tracing::error!("BLE adapter coordination semaphore closed; scanner stopped");
+                return;
+            };
             let (sender, mut receiver) = mpsc::channel(128);
             {
                 let mut inner = self.inner.lock().await;
@@ -539,14 +566,43 @@ impl AppState {
                 inner.scanner.last_scan_started_at = Some(Utc::now());
                 inner.scanner.last_error_code = None;
             }
-            let scan = tokio::spawn(async move { adapter.scan(sender).await });
+            let scan_window =
+                std::time::Duration::from_millis(self.queue_config.adapter_scan_window_ms);
+            let scan = tokio::spawn(async move { adapter.scan(sender, scan_window).await });
             while let Some(observation) = receiver.recv().await {
                 self.store_ble_observation(observation).await;
             }
             let failure = match scan.await {
+                Ok(Ok(())) => None,
                 Ok(Err(failure)) => Some(failure),
-                _ => None,
+                Err(error) => {
+                    tracing::error!(%error, "BLE scan task terminated unexpectedly");
+                    Some(BleFailure {
+                        stage: BleFailureStage::Adapter,
+                        retryable_before_write: true,
+                        write_may_have_been_sent: false,
+                        outcome_unknown: false,
+                    })
+                }
             };
+            if failure.is_none() {
+                let mut inner = self.inner.lock().await;
+                inner.scanner.scan_active = false;
+                inner.scanner.status = "available".into();
+                inner.scanner.adapter_available = true;
+                inner.scanner.last_error_code = None;
+                drop(inner);
+                drop(scan_permit);
+                tokio::time::sleep(SCAN_RESTART_DELAY).await;
+                continue;
+            }
+            if let Some(failure) = &failure {
+                tracing::warn!(
+                    stage = failure.stage.as_str(),
+                    error_code = ble_failure_code(failure),
+                    "BLE scan window failed"
+                );
+            }
             let adapter_failed = failure
                 .as_ref()
                 .is_some_and(|failure| failure.stage == BleFailureStage::Adapter);
@@ -561,10 +617,9 @@ impl AppState {
                     .as_ref()
                     .map(|failure| ble_failure_code(failure).to_owned())
                     .or_else(|| Some("scan_ended".into()));
-                if adapter_failed {
-                    inner.scanner.adapter_available = false;
-                }
+                inner.scanner.adapter_available = false;
             }
+            drop(scan_permit);
             if adapter_failed {
                 *self.ble_adapter.write().await = None;
             }
@@ -951,7 +1006,7 @@ async fn openapi_yaml() -> Response {
 async fn health(State(state): State<AppState>) -> Response {
     let inner = state.inner.lock().await;
     let scanner_status = inner.scanner.status.clone();
-    let status = if inner.scanner.scan_active && inner.scanner.adapter_available {
+    let status = if inner.scanner.adapter_available {
         "healthy"
     } else {
         "degraded"
@@ -966,7 +1021,7 @@ async fn health(State(state): State<AppState>) -> Response {
 
 async fn ready(State(state): State<AppState>) -> Response {
     let inner = state.inner.lock().await;
-    let ready = inner.scanner.scan_active && inner.scanner.adapter_available;
+    let ready = inner.scanner.adapter_available;
     let data = HealthData {
         status: if ready { "healthy" } else { "degraded" }.to_owned(),
         scanner_status: inner.scanner.status.clone(),
@@ -1716,6 +1771,7 @@ struct QueueDiagnostics {
     max_outstanding_commands: u64,
     max_queued_per_device: u64,
     adapter_concurrency: u64,
+    adapter_scan_window_ms: u64,
 }
 
 fn envelope<T>(data: T, count: Option<u64>) -> Envelope<T> {
@@ -1974,13 +2030,15 @@ fn advance_simulator(inner: &mut Inner, now: DateTime<Utc>) {
 
 fn simulator_rssi(profile: WirelessProfile, now: DateTime<Utc>) -> i16 {
     const HALLWAY_RSSI_SAMPLES: [i16; 26] = [
-        -82, -85, -87, -71, -83, -67, -67, -90, -85, -85, -86, -85, -88, -85, -87, -86, -83,
-        -83, -83, -82, -84, -84, -84, -85, -84, -82,
+        -82, -85, -87, -71, -83, -67, -67, -90, -85, -85, -86, -85, -88, -85, -87, -86, -83, -83,
+        -83, -82, -84, -84, -84, -85, -84, -82,
     ];
     match profile {
         WirelessProfile::Standard => -60,
         WirelessProfile::HallwayObserved | WirelessProfile::HallwaySlowLink => {
-            let index = now.timestamp().rem_euclid(HALLWAY_RSSI_SAMPLES.len() as i64) as usize;
+            let index = now
+                .timestamp()
+                .rem_euclid(HALLWAY_RSSI_SAMPLES.len() as i64) as usize;
             HALLWAY_RSSI_SAMPLES[index]
         }
     }
@@ -2498,6 +2556,7 @@ async fn get_queue(State(state): State<AppState>) -> Response {
         max_outstanding_commands: state.queue_config.max_outstanding_commands as u64,
         max_queued_per_device: state.queue_config.max_queued_per_device as u64,
         adapter_concurrency: state.queue_config.adapter_concurrency as u64,
+        adapter_scan_window_ms: state.queue_config.adapter_scan_window_ms,
     };
     Json(envelope(data, None)).into_response()
 }
@@ -3109,26 +3168,19 @@ fn physical_target(
     }
 }
 
-async fn perform_physical_action(
-    adapter: &dyn BleAdapter,
-    peripheral_id: &str,
-    expected_name: &str,
-    action: ServiceAction,
-) -> Result<(), BleFailure> {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(45),
-        adapter.write_action(peripheral_id, expected_name, action),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(BleFailure {
-            stage: BleFailureStage::GattWrite,
-            retryable_before_write: false,
-            write_may_have_been_sent: true,
-            outcome_unknown: true,
-        }),
-    }
+fn retryable_prewrite_failure(failure: &BleFailure) -> bool {
+    failure.retryable_before_write
+        && !failure.write_may_have_been_sent
+        && !failure.outcome_unknown
+        && matches!(
+            failure.stage,
+            BleFailureStage::DeviceConnection | BleFailureStage::ServiceResolution
+        )
+}
+
+fn retry_backoff(attempt: u8) -> std::time::Duration {
+    let exponent = attempt.saturating_sub(1).min(3);
+    std::time::Duration::from_millis(250_u64.saturating_mul(1_u64 << exponent))
 }
 
 async fn process_physical_command(state: &AppState, command_id: &str, action: Action) {
@@ -3187,21 +3239,22 @@ async fn process_physical_command(state: &AppState, command_id: &str, action: Ac
         Action::Close => ServiceAction::Close,
         Action::Stop => ServiceAction::Stop,
     };
-    let mut result = perform_physical_action(
-        adapter.as_ref(),
-        &peripheral_id,
-        &expected_name,
-        service_action,
-    )
-    .await;
+    let mut result = adapter
+        .write_action(&peripheral_id, &expected_name, service_action)
+        .await;
     let mut attempt = 1;
-    if result.as_ref().is_err_and(|failure| {
-        failure.retryable_before_write
-            && matches!(
-                failure.stage,
-                BleFailureStage::DeviceConnection | BleFailureStage::ServiceResolution
-            )
-    }) {
+    if result.as_ref().is_err_and(retryable_prewrite_failure) {
+        let delay = retry_backoff(attempt);
+        if let Err(failure) = &result {
+            tracing::warn!(
+                command_id,
+                attempt,
+                stage = failure.stage.as_str(),
+                retry_delay_ms = delay.as_millis() as u64,
+                "Retrying physical command after a confirmed pre-write BLE failure"
+            );
+        }
+        tokio::time::sleep(delay).await;
         let retry_target = {
             let inner = state.inner.lock().await;
             physical_target(&inner, &managed_device_id)
@@ -3218,13 +3271,9 @@ async fn process_physical_command(state: &AppState, command_id: &str, action: Ac
                     state.persist(&inner).await
                 };
                 let _ = persist_result;
-                result = perform_physical_action(
-                    adapter.as_ref(),
-                    &peripheral_id,
-                    &expected_name,
-                    service_action,
-                )
-                .await;
+                result = adapter
+                    .write_action(&peripheral_id, &expected_name, service_action)
+                    .await;
             }
             Err(code) => {
                 complete_physical_failure(
@@ -3243,6 +3292,17 @@ async fn process_physical_command(state: &AppState, command_id: &str, action: Ac
                 return;
             }
         }
+    }
+
+    if let Err(failure) = &result {
+        tracing::warn!(
+            command_id,
+            attempt,
+            stage = failure.stage.as_str(),
+            write_may_have_been_sent = failure.write_may_have_been_sent,
+            outcome_unknown = failure.outcome_unknown,
+            "Physical command failed"
+        );
     }
 
     let mut inner = state.inner.lock().await;

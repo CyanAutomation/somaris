@@ -1,8 +1,10 @@
 use std::{
     collections::VecDeque,
-    future::pending,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -14,7 +16,7 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use somaris::{
-    api::{AppState, router},
+    api::{AppState, QueueConfig, router},
     ble::{BleAdapter, BleFailure, BleFailureStage, BleObservation},
     controller::ServiceAction,
 };
@@ -26,6 +28,8 @@ struct FakeBleAdapter {
     observations: Vec<BleObservation>,
     action_results: Mutex<VecDeque<Result<(), BleFailure>>>,
     actions: Mutex<Vec<(String, String, ServiceAction)>>,
+    scan_active: AtomicBool,
+    gatt_overlapped_scan: AtomicBool,
 }
 
 impl FakeBleAdapter {
@@ -44,24 +48,36 @@ impl FakeBleAdapter {
             observations,
             action_results: Mutex::new(results.into_iter().collect()),
             actions: Mutex::default(),
+            scan_active: AtomicBool::default(),
+            gatt_overlapped_scan: AtomicBool::default(),
         }
     }
 
     fn actions(&self) -> Vec<(String, String, ServiceAction)> {
         self.actions.lock().unwrap().clone()
     }
+
+    fn gatt_overlapped_scan(&self) -> bool {
+        self.gatt_overlapped_scan.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
 impl BleAdapter for FakeBleAdapter {
-    async fn scan(&self, observations: mpsc::Sender<BleObservation>) -> Result<(), BleFailure> {
+    async fn scan(
+        &self,
+        observations: mpsc::Sender<BleObservation>,
+        window: Duration,
+    ) -> Result<(), BleFailure> {
+        self.scan_active.store(true, Ordering::SeqCst);
         for observation in &self.observations {
-            observations
-                .send(observation.clone())
-                .await
-                .expect("scanner should keep receiving observations");
+            if observations.send(observation.clone()).await.is_err() {
+                self.scan_active.store(false, Ordering::SeqCst);
+                return Ok(());
+            }
         }
-        pending::<()>().await;
+        tokio::time::sleep(window).await;
+        self.scan_active.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -71,6 +87,9 @@ impl BleAdapter for FakeBleAdapter {
         expected_name: &str,
         action: ServiceAction,
     ) -> Result<(), BleFailure> {
+        if self.scan_active.load(Ordering::SeqCst) {
+            self.gatt_overlapped_scan.store(true, Ordering::SeqCst);
+        }
         self.actions.lock().unwrap().push((
             peripheral_id.to_owned(),
             expected_name.to_owned(),
@@ -95,9 +114,7 @@ impl BleAdapter for FakeBleAdapter {
 #[tokio::test]
 async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
     let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
-    let state = AppState::new().with_ble_adapter(adapter.clone());
-    state.spawn_background_tasks();
-    let app = router(state);
+    let app = app_with_adapter(adapter.clone()).await;
 
     let blind = wait_for_blind(&app, "Bedroom Right0").await;
     assert_eq!(blind["source"], "ble_advertisement");
@@ -180,12 +197,48 @@ async fn transient_service_discovery_failure_retries_only_before_a_write() {
     let app = app_with_adapter(adapter.clone()).await;
     let blind = wait_for_blind(&app, "Bedroom Right0").await;
     let managed_id = enroll(&app, &blind).await;
+    let started = Instant::now();
     let command = submit(&app, &managed_id, "retry-safe", "close").await;
 
     assert_eq!(command["status"], "write_acknowledged");
     assert_eq!(command["attempt"], 2);
     assert_eq!(command["retryable"], false);
     assert_eq!(adapter.actions().len(), 2);
+    assert!(started.elapsed() >= Duration::from_millis(250));
+}
+
+#[tokio::test]
+async fn retry_is_refused_when_write_may_have_been_sent() {
+    let ambiguous_prewrite_flag = BleFailure {
+        stage: BleFailureStage::ServiceResolution,
+        retryable_before_write: true,
+        write_may_have_been_sent: true,
+        outcome_unknown: true,
+    };
+    let adapter = Arc::new(FakeBleAdapter::with_results(
+        vec![closed_blind()],
+        [Err(ambiguous_prewrite_flag)],
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let command = submit(&app, &managed_id, "no-ambiguous-retry", "close").await;
+
+    assert_eq!(command["attempt"], 1);
+    assert_eq!(command["status"], "outcome_unknown");
+    assert_eq!(adapter.actions().len(), 1);
+}
+
+#[tokio::test]
+async fn gatt_commands_wait_until_the_adapter_scan_window_ends() {
+    let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let command = submit(&app, &managed_id, "serialized-gatt", "close").await;
+
+    assert_eq!(command["status"], "write_acknowledged");
+    assert!(!adapter.gatt_overlapped_scan());
 }
 
 #[tokio::test]
@@ -273,8 +326,38 @@ async fn scanner_keeps_blinds_separate_by_opaque_adapter_identifier() {
     assert_eq!(names, ["Bedroom Right0", "Hallway Blinds0"]);
 }
 
+#[tokio::test]
+async fn scanner_yield_keeps_api_ready_while_adapter_is_available() {
+    let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
+    let app = app_with_adapter(adapter).await;
+    let _ = wait_for_blind(&app, "Bedroom Right0").await;
+
+    let mut saw_yield = false;
+    for _ in 0..200 {
+        let (_, diagnostics) = request(&app, Method::GET, "/api/v1/diagnostics", &[], None).await;
+        let scanner = diagnostics.unwrap()["data"]["scanner"].clone();
+        if scanner["adapter_available"] == true && scanner["scan_active"] == false {
+            assert_eq!(scanner["retry_count"], 0);
+            assert_eq!(scanner["error_count"], 0);
+            let (status, readiness) = request(&app, Method::GET, "/api/v1/ready", &[], None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(readiness.unwrap()["data"]["status"], "healthy");
+            saw_yield = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(saw_yield, "scanner should report its bounded scan yield");
+}
+
 async fn app_with_adapter(adapter: Arc<FakeBleAdapter>) -> Router {
-    let state = AppState::new().with_ble_adapter(adapter);
+    let state = AppState::new()
+        .with_ble_adapter(adapter)
+        .with_queue_config(QueueConfig {
+            adapter_scan_window_ms: 100,
+            ..QueueConfig::default()
+        })
+        .unwrap();
     state.spawn_background_tasks();
     router(state)
 }
@@ -326,7 +409,8 @@ async fn submit(app: &Router, managed_id: &str, key: &str, action: &str) -> Valu
 }
 
 async fn wait_for_command(app: &Router, command_id: &str) -> Value {
-    for _ in 0..200 {
+    let mut last_command = Value::Null;
+    for _ in 0..2_000 {
         let (_, response) = request(
             app,
             Method::GET,
@@ -339,9 +423,10 @@ async fn wait_for_command(app: &Router, command_id: &str) -> Value {
         if !matches!(command["status"].as_str(), Some("queued" | "connecting")) {
             return command;
         }
+        last_command = command;
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    panic!("command did not reach a terminal state");
+    panic!("command {command_id} did not reach a terminal state: {last_command}");
 }
 
 async fn request(

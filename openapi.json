@@ -3,7 +3,7 @@
   "info": {
     "title": "Somaris API",
     "version": "1.2.0",
-    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes only the documented fixed actions. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. The built-in simulator remains available for software development. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. The control API has no authentication and is intended for a trusted network; CORS is not authentication."
+    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes only the documented fixed actions. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. The built-in simulator remains available for software development. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. BLE scans use bounded windows and yield exclusive adapter access to GATT operations between windows. The control API has no authentication and is intended for a trusted network; CORS is not authentication."
   },
   "servers": [
     {
@@ -17,7 +17,7 @@
         "summary": "Check HTTP service liveness and scanner status",
         "responses": {
           "200": {
-            "description": "The HTTP API is available. A degraded response means the BLE scanner is unavailable while the API remains usable.",
+            "description": "The HTTP API is available. A degraded response means the BLE adapter is unavailable while the API remains usable.",
             "content": {
               "application/json": {
                 "schema": {
@@ -47,10 +47,10 @@
     "/api/v1/ready": {
       "get": {
         "operationId": "getReadiness",
-        "summary": "Check whether the Bluetooth scanner is ready",
+        "summary": "Check whether the Bluetooth adapter is ready",
         "responses": {
           "200": {
-            "description": "The service and active Bluetooth scan are ready.",
+            "description": "The service has a Bluetooth adapter available. Scanning may briefly yield the adapter to a GATT operation.",
             "content": {
               "application/json": {
                 "schema": {
@@ -60,7 +60,7 @@
             }
           },
           "503": {
-            "description": "The HTTP service is alive but the scanner is not ready.",
+            "description": "The HTTP service is alive but the Bluetooth adapter is unavailable.",
             "content": {
               "application/json": {
                 "schema": {
@@ -888,7 +888,7 @@
       "get": {
         "operationId": "getBlindCommandQueue",
         "summary": "Inspect blind command backlog and capacity",
-        "description": "Reports pending and running command counts, oldest queued age, total outstanding work, the per-device limit, and configured BlueZ adapter concurrency. It contains no BLE addresses or command payloads.",
+        "description": "Reports pending and running command counts, oldest queued age, total outstanding work, per-device and adapter limits, and the bounded adapter scan window. Scans yield exclusive adapter access to GATT operations between windows. It contains no BLE addresses or command payloads.",
         "responses": {
           "200": {
             "description": "Command queue diagnostics.",
@@ -1091,6 +1091,7 @@
                 "enum": [
                   "starting",
                   "scanning",
+                  "available",
                   "unavailable",
                   "stopped"
                 ]
@@ -1127,6 +1128,7 @@
             "enum": [
               "starting",
               "scanning",
+              "available",
               "unavailable",
               "stopped"
             ]
@@ -2226,7 +2228,8 @@
           "oldest_queued_age_seconds",
           "max_outstanding_commands",
           "max_queued_per_device",
-          "adapter_concurrency"
+          "adapter_concurrency",
+          "adapter_scan_window_ms"
         ],
         "properties": {
           "pending_commands": {
@@ -2260,6 +2263,12 @@
           "adapter_concurrency": {
             "type": "integer",
             "minimum": 1
+          },
+          "adapter_scan_window_ms": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 10000,
+            "description": "Configured BLE adapter scan window in milliseconds. GATT operations take exclusive adapter access between scan windows."
           }
         }
       },
