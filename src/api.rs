@@ -543,6 +543,9 @@ impl AppState {
                 Ok(Err(failure)) => Some(failure),
                 _ => None,
             };
+            let adapter_failed = failure
+                .as_ref()
+                .is_some_and(|failure| failure.stage == BleFailureStage::Adapter);
             {
                 let mut inner = self.inner.lock().await;
                 inner.scanner.scan_active = false;
@@ -554,13 +557,12 @@ impl AppState {
                     .as_ref()
                     .map(|failure| ble_failure_code(failure).to_owned())
                     .or_else(|| Some("scan_ended".into()));
-                if failure
-                    .as_ref()
-                    .is_some_and(|failure| failure.stage == BleFailureStage::Adapter)
-                {
+                if adapter_failed {
                     inner.scanner.adapter_available = false;
-                    *self.ble_adapter.write().await = None;
                 }
+            }
+            if adapter_failed {
+                *self.ble_adapter.write().await = None;
             }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }

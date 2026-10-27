@@ -38,9 +38,10 @@ pub enum BleDecodeError {
 
 /// Decodes the SOMA V2 manufacturer payload observed through the API.
 ///
-/// The captured format has version byte 0, position bytes 2 and 3, and a
-/// space-padded UTF-8 advertised name beginning at byte 4. The second byte is
-/// retained by callers as raw telemetry but is not interpreted here.
+/// The captured format has version `0x05` at byte offset 0, position bytes 2
+/// and 3, and a space-padded UTF-8 advertised name beginning at byte 4. The
+/// second byte is retained by callers as raw telemetry but is not interpreted
+/// here.
 pub fn parse_soma_payload(payload: &[u8]) -> Result<ParsedSomaAdvertisement, BleDecodeError> {
     if payload.len() < 4 {
         return Err(BleDecodeError::PayloadTooShort);
