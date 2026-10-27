@@ -20,7 +20,7 @@ The machine-readable contract is served at `/openapi.json` and `/openapi.yaml`. 
 
 ## Container image
 
-The GitHub Actions workflow always publishes `cyanautomation/somaris:latest` on publishing runs. It also publishes branch and commit tags, and tags matching `v*` as Docker image tags. Pull requests build the image without pushing it.
+The GitHub Actions workflow builds pull requests targeting `main` without publishing. After a pull request is merged into `main`, it publishes `cyanautomation/somaris:latest` and a commit tag.
 
 ```sh
 docker run --detach \
