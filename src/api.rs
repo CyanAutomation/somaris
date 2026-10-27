@@ -1078,7 +1078,7 @@ async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Resp
     if inner.simulator_enabled {
         devices.push(device_snapshot(&inner));
     }
-    devices.sort_by(|left, right| right.last_seen_at.cmp(&left.last_seen_at));
+    devices.sort_by_key(|device| std::cmp::Reverse(device.last_seen_at));
     conditional_json(
         &headers,
         devices.clone(),
