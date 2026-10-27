@@ -12,7 +12,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::controller::{
-    OPEN_CLOSE_SERVICE_UUID, STOP_SERVICE_UUID, ServiceAction, encode_service_action,
+    OPEN_CLOSE_CHARACTERISTIC_UUID, OPEN_CLOSE_SERVICE_UUID, STOP_CHARACTERISTIC_UUID,
+    STOP_SERVICE_UUID, ServiceAction, encode_service_action,
 };
 
 use super::{BA71_CHARACTERISTIC_UUID, SOMA_MANUFACTURER_ID, parse_soma_payload};
@@ -258,19 +259,27 @@ impl BleAdapter for BtleplugAdapter {
         let peripheral = self
             .connect_and_discover(peripheral_id, expected_name)
             .await?;
-        let service_uuid = Uuid::parse_str(match action {
-            ServiceAction::Open | ServiceAction::Close => OPEN_CLOSE_SERVICE_UUID,
-            ServiceAction::Stop => STOP_SERVICE_UUID,
-        })
-        .map_err(|_| BleFailure::before_write(BleFailureStage::GattDiscovery, false))?;
+        let (service_uuid, characteristic_uuid) = match action {
+            ServiceAction::Open | ServiceAction::Close => (
+                OPEN_CLOSE_SERVICE_UUID,
+                OPEN_CLOSE_CHARACTERISTIC_UUID,
+            ),
+            ServiceAction::Stop => (STOP_SERVICE_UUID, STOP_CHARACTERISTIC_UUID),
+        };
+        let service_uuid = Uuid::parse_str(service_uuid)
+            .map_err(|_| BleFailure::before_write(BleFailureStage::GattDiscovery, false))?;
+        let characteristic_uuid = Uuid::parse_str(characteristic_uuid)
+            .map_err(|_| BleFailure::before_write(BleFailureStage::GattDiscovery, false))?;
         let characteristics = peripheral.characteristics();
         let characteristic = characteristics.iter().find(|characteristic| {
             characteristic.service_uuid == service_uuid
+                && characteristic.uuid == characteristic_uuid
                 && characteristic.properties.contains(CharPropFlags::WRITE)
         });
         let Some(characteristic) = characteristic else {
             tracing::warn!(
                 expected_service = %service_uuid,
+                expected_characteristic = %characteristic_uuid,
                 services = ?peripheral.services(),
                 ?characteristics,
                 "No writable SOMA command characteristic was found after service discovery"
