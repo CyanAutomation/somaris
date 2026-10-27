@@ -1,5 +1,7 @@
 # Somaris
 
+[![Publish Docker image](https://github.com/CyanAutomation/somaris/actions/workflows/publish-image.yml/badge.svg?branch=main)](https://github.com/CyanAutomation/somaris/actions/workflows/publish-image.yml)
+
 Somaris is a Rust service and API for Wazombi Labs smart blind motors. The initial implementation focuses on telemetry, simulator-backed control, command tracking, and API reliability. A dashboard can be added after the service contract is established.
 
 ## Run
