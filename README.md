@@ -17,3 +17,17 @@ Set `SOMARIS_ALLOWED_ORIGINS` to a comma-separated list of exact HTTP or HTTPS o
 ## API
 
 The machine-readable contract is served at `/openapi.json` and `/openapi.yaml`. Control requests require an `Idempotency-Key`; command acceptance is asynchronous, so clients poll the returned command resource. A write acknowledgement does not confirm that a physical blind moved.
+
+## Container image
+
+The GitHub Actions workflow always publishes `cyanautomation/somaris:latest` on publishing runs. It also publishes branch and commit tags, and tags matching `v*` as Docker image tags. Pull requests build the image without pushing it.
+
+```sh
+docker run --detach \
+  --name somaris \
+  --publish 8080:8080 \
+  --volume somaris-data:/data \
+  cyanautomation/somaris:latest
+```
+
+The container listens on port `8080` and stores persistent service state in `/data`.
