@@ -7,6 +7,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
+COPY openapi.json ./openapi.json
 COPY src ./src
 
 RUN cargo build --locked --release --bin somaris
