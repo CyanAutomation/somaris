@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use serde_json::json;
 use somaris::controller::{
-    ControllerCommand, Notification, OPEN_CLOSE_SERVICE_UUID, PositionError, STOP_SERVICE_UUID,
-    ServiceAction, Version, closed_percent_from_open_percent, encode_controller_command,
-    encode_service_action, open_percent_from_wire_byte, parse_notification, set_position_byte,
+    ControllerCommand, Notification, OPEN_CLOSE_CHARACTERISTIC_UUID, OPEN_CLOSE_SERVICE_UUID,
+    PositionError, STOP_CHARACTERISTIC_UUID, STOP_SERVICE_UUID, ServiceAction, Version,
+    closed_percent_from_open_percent, encode_controller_command, encode_service_action,
+    open_percent_from_wire_byte, parse_notification, set_position_byte,
 };
 use somaris::device_info::{CharacteristicReader, DeviceInfo};
 use somaris::telemetry::{
@@ -59,9 +60,17 @@ fn controller_commands_keep_the_tested_opcodes() {
     assert_eq!(encode_service_action(ServiceAction::Stop), [0x00]);
     assert_eq!(
         OPEN_CLOSE_SERVICE_UUID,
+        "00001890-b87f-490c-92cb-11ba5ea5167c"
+    );
+    assert_eq!(
+        OPEN_CLOSE_CHARACTERISTIC_UUID,
         "00001896-b87f-490c-92cb-11ba5ea5167c"
     );
-    assert_eq!(STOP_SERVICE_UUID, "00001530-b87f-490c-92cb-11ba5ea5167c");
+    assert_eq!(STOP_SERVICE_UUID, "00001861-b87f-490c-92cb-11ba5ea5167c");
+    assert_eq!(
+        STOP_CHARACTERISTIC_UUID,
+        "00001530-b87f-490c-92cb-11ba5ea5167c"
+    );
     assert_eq!(
         encode_service_action(ServiceAction::Open),
         [0x1a, 0x01, 0x00]

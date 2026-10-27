@@ -432,6 +432,7 @@ async fn queue_limits_match_documented_defaults_and_can_be_configured() {
     assert_eq!(queue["max_outstanding_commands"], 1000);
     assert_eq!(queue["max_queued_per_device"], 32);
     assert_eq!(queue["adapter_concurrency"], 1);
+    assert_eq!(queue["adapter_scan_window_ms"], 5000);
 
     let configured_app = router(
         AppState::new()
@@ -439,6 +440,7 @@ async fn queue_limits_match_documented_defaults_and_can_be_configured() {
                 max_outstanding_commands: 7,
                 max_queued_per_device: 3,
                 adapter_concurrency: 2,
+                adapter_scan_window_ms: 250,
                 queue_wait_timeout_seconds: 90,
             })
             .unwrap(),
@@ -455,4 +457,19 @@ async fn queue_limits_match_documented_defaults_and_can_be_configured() {
     assert_eq!(queue["max_outstanding_commands"], 7);
     assert_eq!(queue["max_queued_per_device"], 3);
     assert_eq!(queue["adapter_concurrency"], 2);
+    assert_eq!(queue["adapter_scan_window_ms"], 250);
+}
+
+#[test]
+fn adapter_scan_window_must_stay_within_bounded_limits() {
+    for invalid_window in [99, 10_001] {
+        assert!(
+            AppState::new()
+                .with_queue_config(QueueConfig {
+                    adapter_scan_window_ms: invalid_window,
+                    ..QueueConfig::default()
+                })
+                .is_err()
+        );
+    }
 }
