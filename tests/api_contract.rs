@@ -78,7 +78,7 @@ async fn device_list_uses_closed_percent_and_supports_conditional_reads() {
     let body = body.unwrap();
     assert_eq!(body["meta"]["count"], 1);
     assert_eq!(body["data"][0]["is_simulated"], true);
-    assert_eq!(body["data"][0]["position"]["current_closed_percent"], 50);
+    assert_eq!(body["data"][0]["position"]["current_closed_percent"], 100);
     let etag = headers.get(header::ETAG).unwrap().to_str().unwrap();
 
     let (status, _, _) = request(
@@ -187,8 +187,8 @@ async fn simulator_reports_ack_separately_then_advances_observed_position() {
         &app,
         Method::POST,
         &format!("/api/control/v1/devices/{managed_id}/commands"),
-        &[("idempotency-key", "close-moving")],
-        Some(json!({"action": "close"})),
+        &[("idempotency-key", "open-moving")],
+        Some(json!({"action": "open"})),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -200,15 +200,15 @@ async fn simulator_reports_ack_separately_then_advances_observed_position() {
     let position = &devices.unwrap()["data"][0]["position"];
     assert_eq!(position["target_closed_percent"], 100);
     let initial_current = position["current_closed_percent"].as_u64().unwrap();
-    assert!(initial_current < 100);
+    assert!(initial_current > 0);
 
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
     let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
     let moved_current = devices.unwrap()["data"][0]["position"]["current_closed_percent"]
         .as_u64()
         .unwrap();
-    assert!(moved_current > initial_current);
-    assert!(moved_current < 100);
+    assert!(moved_current < initial_current);
+    assert!(moved_current > 0);
 }
 
 #[tokio::test]

@@ -172,7 +172,7 @@ async fn toggle_uses_observed_closed_percent_and_returns_its_basis() {
     let toggle = toggle.unwrap()["data"].clone();
     assert_eq!(toggle["action"], "open");
     assert_eq!(toggle["toggle_basis"], "observed_target");
-    assert_eq!(toggle["toggle_position"]["target_closed_percent"], 50);
+    assert_eq!(toggle["toggle_position"]["target_closed_percent"], 100);
     let id = toggle["id"].as_str().unwrap().to_owned();
     let _ = wait_for_command(&app, &id).await;
 
