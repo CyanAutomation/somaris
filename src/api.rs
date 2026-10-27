@@ -1830,7 +1830,7 @@ fn read_history(path: &Path) -> io::Result<Vec<HistoryObservation>> {
 
 fn make_simulated_device(now: DateTime<Utc>) -> Device {
     let name = "Hallway Blinds0".to_owned();
-    let payload = simulated_manufacturer_payload(100, 100);
+    let payload = simulated_manufacturer_payload(&name, 100, 100);
     let mut manufacturer_data = SOMA_MANUFACTURER_ID.to_le_bytes().to_vec();
     manufacturer_data.extend_from_slice(&payload);
     Device {
@@ -1987,13 +1987,28 @@ fn simulator_rssi(profile: WirelessProfile, now: DateTime<Utc>) -> i16 {
 }
 
 fn simulated_manufacturer_payload(
+    advertised_name: &str,
     current_closed_percent: u8,
     target_closed_percent: u8,
 ) -> Vec<u8> {
     // Byte 1 is retained as the opaque 0x64 value seen in the live advertisement.
     let mut payload = vec![0x05, 0x64, current_closed_percent, target_closed_percent];
-    payload.extend_from_slice(b"Hallway Blinds0");
+    payload.extend_from_slice(advertised_name.as_bytes());
     payload
+}
+
+#[cfg(test)]
+mod simulated_manufacturer_payload_tests {
+    use super::simulated_manufacturer_payload;
+
+    #[test]
+    fn payload_uses_the_device_advertised_name() {
+        let advertised_name = "Study Blinds1";
+        let payload = simulated_manufacturer_payload(advertised_name, 23, 57);
+
+        assert_eq!(&payload[..4], &[0x05, 0x64, 23, 57]);
+        assert_eq!(&payload[4..], advertised_name.as_bytes());
+    }
 }
 
 fn simulator_battery_telemetry(state: BatteryState, now: DateTime<Utc>) -> BatteryTelemetry {
@@ -2083,7 +2098,7 @@ fn device_snapshot(inner: &Inner) -> Device {
             )
         })
         .unwrap_or((100, 100));
-    let payload = simulated_manufacturer_payload(current, target);
+    let payload = simulated_manufacturer_payload(&device.advertised_name, current, target);
     let mut manufacturer_data = SOMA_MANUFACTURER_ID.to_le_bytes().to_vec();
     manufacturer_data.extend_from_slice(&payload);
     device.manufacturer_data_hex = hex::encode(manufacturer_data);
