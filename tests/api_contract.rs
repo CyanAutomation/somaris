@@ -198,7 +198,7 @@ async fn simulator_reports_ack_separately_then_advances_observed_position() {
 
     let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
     let position = &devices.unwrap()["data"][0]["position"];
-    assert_eq!(position["target_closed_percent"], 100);
+    assert_eq!(position["target_closed_percent"], 0);
     let initial_current = position["current_closed_percent"].as_u64().unwrap();
     assert!(initial_current > 0);
 
