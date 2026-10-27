@@ -4,38 +4,44 @@ use axum::{
     Json, Router,
     body::{Body, to_bytes},
     extract::State,
-    http::Request,
+    http::{HeaderMap, Request, StatusCode},
+    response::IntoResponse,
     routing::any,
 };
 use serde_json::{Value, json};
-use somaris::client::{ClientOptions, PositionInput, RemoteApiClient, validate_device_id};
+use somaris::client::{ClientOptions, RemoteAction, RemoteApiClient, validate_device_id};
 use tokio::sync::Mutex;
 
-type Requests = Arc<Mutex<Vec<(String, String, Value)>>>;
+type CapturedRequest = (String, String, HeaderMap, Value);
+type Requests = Arc<Mutex<Vec<CapturedRequest>>>;
 
-async fn mock_handler(State(requests): State<Requests>, request: Request<Body>) -> Json<Value> {
+async fn mock_handler(
+    State(requests): State<Requests>,
+    request: Request<Body>,
+) -> impl IntoResponse {
     let method = request.method().to_string();
     let path = request.uri().path().to_owned();
+    let headers = request.headers().clone();
     let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
     let body = if bytes.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&bytes).unwrap()
     };
-    requests.lock().await.push((method, path.clone(), body));
-    if path.ends_with("/diagnostics") || path.ends_with("/connect-metadata") {
-        Json(json!({
-            "input_voltage_mv": 5100,
-            "battery_voltage": 3980,
-            "boot_count": "3",
-            "undervoltage_count": "",
-            "restart_reason_code": "4",
-            "motor_stop_reason_code": 5,
-            "sun": { "sunrise_time": "06:15", "sunset_time": "19:40" }
-        }))
-    } else {
-        Json(json!({"ok": true}))
+    requests
+        .lock()
+        .await
+        .push((method.clone(), path.clone(), headers, body));
+
+    if method == "DELETE" {
+        return (StatusCode::NO_CONTENT, Body::empty()).into_response();
     }
+    let response = if path == "/api/v1/diagnostics" {
+        json!({"data": {"scanner_status": "scanning", "soma_advertisements_seen": 5}})
+    } else {
+        json!({"ok": true})
+    };
+    Json(response).into_response()
 }
 
 fn mock_router(requests: Requests) -> Router {
@@ -59,19 +65,73 @@ async fn client_defaults_to_thirty_seconds_and_validates_tls_by_default() {
 }
 
 #[tokio::test]
-async fn client_encodes_device_path_and_clamps_numeric_string_position() {
+async fn telemetry_client_uses_documented_v1_paths() {
     let requests: Requests = Arc::default();
     let client = test_client(requests.clone()).await;
-    client.set_device_position("Device A", "150").await.unwrap();
+    client.get_device_status("Device A").await.unwrap();
+    client.get_device_list().await.unwrap();
+    let diagnostics = client.get_diagnostics().await.unwrap();
+    assert_eq!(diagnostics["data"]["scanner_status"], "scanning");
 
     let requests = requests.lock().await;
-    let (_, path, body) = requests.last().unwrap();
-    assert_eq!(path, "/api/device/Device%20A/position");
-    assert_eq!(body, &json!({"position": 100.0}));
+    assert_eq!(requests[0].0, "GET");
+    assert_eq!(requests[0].1, "/api/v1/devices/Device%20A");
+    assert_eq!(requests[1].1, "/api/v1/devices");
+    assert_eq!(requests[2].1, "/api/v1/diagnostics");
 }
 
 #[tokio::test]
-async fn client_rejects_unsafe_identifiers_and_invalid_positions_before_sending() {
+async fn control_client_posts_only_fixed_actions_with_idempotency_key() {
+    let requests: Requests = Arc::default();
+    let client = test_client(requests.clone()).await;
+    client
+        .submit_command("managed A", RemoteAction::Open, "open-1")
+        .await
+        .unwrap();
+    client.submit_toggle("managed A", "toggle-1").await.unwrap();
+    client.get_command("cmd-123").await.unwrap();
+
+    let requests = requests.lock().await;
+    assert_eq!(requests[0].0, "POST");
+    assert_eq!(
+        requests[0].1,
+        "/api/control/v1/devices/managed%20A/commands"
+    );
+    assert_eq!(requests[0].2.get("idempotency-key").unwrap(), "open-1");
+    assert_eq!(requests[0].3, json!({"action": "open"}));
+    assert_eq!(requests[1].0, "POST");
+    assert_eq!(requests[1].1, "/api/control/v1/devices/managed%20A/toggle");
+    assert_eq!(requests[1].2.get("idempotency-key").unwrap(), "toggle-1");
+    assert_eq!(requests[2].0, "GET");
+    assert_eq!(requests[2].1, "/api/control/v1/commands/cmd-123");
+}
+
+#[tokio::test]
+async fn enrollment_client_matches_control_api_and_handles_no_content_removal() {
+    let requests: Requests = Arc::default();
+    let client = test_client(requests.clone()).await;
+    client.get_managed_devices().await.unwrap();
+    client
+        .enroll_device("observed-1", "Bedroom Right")
+        .await
+        .unwrap();
+    client.remove_enrollment("managed-1").await.unwrap();
+
+    let requests = requests.lock().await;
+    assert_eq!(requests[0].0, "GET");
+    assert_eq!(requests[0].1, "/api/control/v1/devices");
+    assert_eq!(requests[1].0, "POST");
+    assert_eq!(requests[1].1, "/api/control/v1/devices");
+    assert_eq!(
+        requests[1].3,
+        json!({"observed_device_id": "observed-1", "label": "Bedroom Right"})
+    );
+    assert_eq!(requests[2].0, "DELETE");
+    assert_eq!(requests[2].1, "/api/control/v1/devices/managed-1");
+}
+
+#[tokio::test]
+async fn client_rejects_unsafe_ids_and_invalid_idempotency_keys_before_sending() {
     for invalid in [
         "", "  ", " edge", "edge ", "a/b", "a\\b", "a?b", "a#b", "a..b",
     ] {
@@ -86,42 +146,17 @@ async fn client_rejects_unsafe_identifiers_and_invalid_positions_before_sending(
     assert!(client.get_device_status("bad/id").await.is_err());
     assert!(
         client
-            .set_device_position("blind-1", PositionInput::Number(f64::NAN))
+            .submit_command("blind-1", RemoteAction::Stop, "")
             .await
             .is_err()
     );
     assert!(
         client
-            .set_device_position("blind-1", "not a number")
+            .submit_toggle("blind-1", &"x".repeat(129))
             .await
             .is_err()
     );
     assert!(requests.lock().await.is_empty());
-}
-
-#[tokio::test]
-async fn diagnostics_are_normalized_with_reason_labels_and_null_defaults() {
-    let requests: Requests = Arc::default();
-    let client = test_client(requests.clone()).await;
-    let diagnostics = client.get_device_diagnostics("blind-1").await.unwrap();
-    assert_eq!(diagnostics["inputVoltageMv"], 5100);
-    assert_eq!(diagnostics["batteryVoltageMv"], 3980);
-    assert_eq!(diagnostics["bootCount"], 3);
-    assert_eq!(diagnostics["undervoltageCount"], Value::Null);
-    assert_eq!(diagnostics["restartReasonLabel"], "BROWNOUT_RESET");
-    assert_eq!(diagnostics["motorStopReasonLabel"], "LOW_BATTERY");
-    assert_eq!(diagnostics["sunrise"], "06:15");
-    assert_eq!(diagnostics["sunset"], "19:40");
-    assert_eq!(diagnostics["firmwareVersion"], Value::Null);
-
-    let metadata = client.get_connect_metadata("blind-1").await.unwrap();
-    assert_eq!(metadata["sunrise"], "06:15");
-    let requests = requests.lock().await;
-    assert!(
-        requests
-            .iter()
-            .any(|(_, path, _)| path == "/api/device/blind-1/connect-metadata")
-    );
 }
 
 async fn test_client(requests: Requests) -> RemoteApiClient {
@@ -130,5 +165,5 @@ async fn test_client(requests: Requests) -> RemoteApiClient {
     tokio::spawn(async move {
         axum::serve(listener, mock_router(requests)).await.unwrap();
     });
-    RemoteApiClient::new(&format!("http://{address}/api")).unwrap()
+    RemoteApiClient::new(&format!("http://{address}")).unwrap()
 }

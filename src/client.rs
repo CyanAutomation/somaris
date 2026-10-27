@@ -1,10 +1,9 @@
 use std::time::Duration;
 
 use reqwest::{Client, Method};
+use serde::Serialize;
 use serde_json::{Value, json};
 use url::Url;
-
-use crate::telemetry::normalize_reason_codes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientOptions {
@@ -25,55 +24,19 @@ impl Default for ClientOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteAction {
+    Open,
+    Close,
+    Stop,
+}
+
 #[derive(Clone)]
 pub struct RemoteApiClient {
     base_url: Url,
     client: Client,
     options: ClientOptions,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum PositionInput {
-    Number(f64),
-    String(String),
-    Other(String),
-}
-
-impl From<f64> for PositionInput {
-    fn from(value: f64) -> Self {
-        Self::Number(value)
-    }
-}
-
-impl From<i32> for PositionInput {
-    fn from(value: i32) -> Self {
-        Self::Number(f64::from(value))
-    }
-}
-
-impl From<String> for PositionInput {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
-}
-
-impl From<&str> for PositionInput {
-    fn from(value: &str) -> Self {
-        Self::String(value.to_owned())
-    }
-}
-
-impl From<Value> for PositionInput {
-    fn from(value: Value) -> Self {
-        match value {
-            Value::Number(number) => number
-                .as_f64()
-                .map(Self::Number)
-                .unwrap_or_else(|| Self::Other(number.to_string())),
-            Value::String(value) => Self::String(value),
-            other => Self::Other(other.to_string()),
-        }
-    }
 }
 
 impl RemoteApiClient {
@@ -115,23 +78,11 @@ impl RemoteApiClient {
     }
 
     pub async fn get_device_status(&self, device_id: &str) -> Result<Value, String> {
-        let url = self.device_url(device_id, &["status"])?;
-        self.send_json(Method::GET, url, None, "Failed to get device status")
-            .await
-    }
-
-    pub async fn set_device_position(
-        &self,
-        device_id: &str,
-        position: impl Into<PositionInput>,
-    ) -> Result<Value, String> {
-        let url = self.device_url(device_id, &["position"])?;
-        let position = validate_position(position.into())?;
         self.send_json(
-            Method::PUT,
-            url,
-            Some(json!({ "position": position })),
-            "Failed to set device position",
+            Method::GET,
+            self.device_url("api/v1/devices", device_id)?,
+            None,
+            "Failed to get device status",
         )
         .await
     }
@@ -139,34 +90,129 @@ impl RemoteApiClient {
     pub async fn get_device_list(&self) -> Result<Value, String> {
         self.send_json(
             Method::GET,
-            self.endpoint_url(&["devices"])?,
+            self.endpoint_url(&["api", "v1", "devices"])?,
             None,
             "Failed to get device list",
         )
         .await
     }
 
-    pub async fn get_device_diagnostics(&self, device_id: &str) -> Result<Value, String> {
-        let url = self.device_url(device_id, &["diagnostics"])?;
-        let value = self
-            .send_json(Method::GET, url, None, "Failed to get device diagnostics")
-            .await?;
-        Ok(normalize_diagnostics(&value))
+    pub async fn get_diagnostics(&self) -> Result<Value, String> {
+        self.send_json(
+            Method::GET,
+            self.endpoint_url(&["api", "v1", "diagnostics"])?,
+            None,
+            "Failed to get diagnostics",
+        )
+        .await
     }
 
-    pub async fn get_connect_metadata(&self, device_id: &str) -> Result<Value, String> {
-        let url = self.device_url(device_id, &["connect-metadata"])?;
-        let value = self
-            .send_json(Method::GET, url, None, "Failed to get connect metadata")
-            .await?;
-        Ok(normalize_diagnostics(&value))
+    pub async fn get_managed_devices(&self) -> Result<Value, String> {
+        self.send_json(
+            Method::GET,
+            self.endpoint_url(&["api", "control", "v1", "devices"])?,
+            None,
+            "Failed to get managed devices",
+        )
+        .await
     }
 
-    fn device_url(&self, device_id: &str, suffix: &[&str]) -> Result<Url, String> {
+    pub async fn enroll_device(
+        &self,
+        observed_device_id: &str,
+        label: &str,
+    ) -> Result<Value, String> {
+        validate_device_id(observed_device_id)?;
+        self.send_json(
+            Method::POST,
+            self.endpoint_url(&["api", "control", "v1", "devices"])?,
+            Some(json!({
+                "observed_device_id": observed_device_id,
+                "label": label,
+            })),
+            "Failed to enroll device",
+        )
+        .await
+    }
+
+    pub async fn remove_enrollment(&self, managed_device_id: &str) -> Result<Value, String> {
+        self.send_json(
+            Method::DELETE,
+            self.device_url("api/control/v1/devices", managed_device_id)?,
+            None,
+            "Failed to remove enrollment",
+        )
+        .await
+    }
+
+    pub async fn submit_command(
+        &self,
+        managed_device_id: &str,
+        action: RemoteAction,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        self.send_command(
+            managed_device_id,
+            "commands",
+            idempotency_key,
+            Some(json!({ "action": action })),
+            "Failed to submit command",
+        )
+        .await
+    }
+
+    pub async fn submit_toggle(
+        &self,
+        managed_device_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        self.send_command(
+            managed_device_id,
+            "toggle",
+            idempotency_key,
+            None,
+            "Failed to submit toggle",
+        )
+        .await
+    }
+
+    pub async fn get_command(&self, command_id: &str) -> Result<Value, String> {
+        self.send_json(
+            Method::GET,
+            self.device_url("api/control/v1/commands", command_id)?,
+            None,
+            "Failed to get command",
+        )
+        .await
+    }
+
+    async fn send_command(
+        &self,
+        managed_device_id: &str,
+        endpoint: &str,
+        idempotency_key: &str,
+        body: Option<Value>,
+        context: &str,
+    ) -> Result<Value, String> {
+        validate_device_id(managed_device_id)?;
+        validate_idempotency_key(idempotency_key)?;
+        let url = self.device_url("api/control/v1/devices", managed_device_id)?;
+        let url = append_segment(url, endpoint)?;
+        let mut request = self
+            .client
+            .post(url)
+            .header("Idempotency-Key", idempotency_key);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        self.send_request(request, context).await
+    }
+
+    fn device_url(&self, prefix: &str, device_id: &str) -> Result<Url, String> {
         validate_device_id(device_id)?;
-        let mut segments = vec!["device", device_id];
-        segments.extend_from_slice(suffix);
-        self.endpoint_url(&segments)
+        let mut url = self.endpoint_url(&prefix.split('/').collect::<Vec<_>>())?;
+        url = append_segment(url, device_id)?;
+        Ok(url)
     }
 
     fn endpoint_url(&self, segments: &[&str]) -> Result<Url, String> {
@@ -192,6 +238,14 @@ impl RemoteApiClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
+        self.send_request(request, context).await
+    }
+
+    async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        context: &str,
+    ) -> Result<Value, String> {
         let response = request
             .send()
             .await
@@ -210,9 +264,19 @@ impl RemoteApiClient {
                 format!("{context}: HTTP {status}: {detail}")
             });
         }
+        if bytes.is_empty() {
+            return Ok(Value::Null);
+        }
         serde_json::from_slice(&bytes)
             .map_err(|error| format!("{context}: invalid JSON response: {error}"))
     }
+}
+
+fn append_segment(mut url: Url, segment: &str) -> Result<Url, String> {
+    url.path_segments_mut()
+        .map_err(|_| "Base URL does not support path segments.".to_owned())?
+        .push(segment);
+    Ok(url)
 }
 
 pub fn validate_device_id(device_id: &str) -> Result<(), String> {
@@ -228,88 +292,11 @@ pub fn validate_device_id(device_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_position(value: PositionInput) -> Result<f64, String> {
-    let number = match value {
-        PositionInput::Number(value) => value,
-        PositionInput::String(value) => value
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| invalid_position(&value))?,
-        PositionInput::Other(value) => return Err(invalid_position(&value)),
-    };
-    if !number.is_finite() {
-        return Err(invalid_position(&format_number(number)));
+fn validate_idempotency_key(key: &str) -> Result<(), String> {
+    if key.trim().is_empty() || key != key.trim() || key.chars().count() > 128 {
+        return Err(
+            "Invalid Idempotency-Key: must contain 1 to 128 non-whitespace characters.".into(),
+        );
     }
-    Ok(number.clamp(0.0, 100.0))
-}
-
-fn invalid_position(value: &str) -> String {
-    format!(
-        "Failed to set device position: Invalid position value \"{value}\". Position must be a finite number."
-    )
-}
-
-fn format_number(value: f64) -> String {
-    if value.is_nan() {
-        "NaN".into()
-    } else if value == f64::INFINITY {
-        "Infinity".into()
-    } else if value == f64::NEG_INFINITY {
-        "-Infinity".into()
-    } else {
-        value.to_string()
-    }
-}
-
-fn normalize_diagnostics(input: &Value) -> Value {
-    let reasons = normalize_reason_codes(input);
-    let sun = input.get("sun").unwrap_or(&Value::Null);
-    let sun_times = input.get("sun_times").unwrap_or(&Value::Null);
-    json!({
-        "inputVoltageMv": find_integer(input, &["inputVoltageMv", "input_voltage_mv"]),
-        "batteryVoltageMv": find_integer(input, &["batteryVoltageMv", "battery_voltage_mv", "battery_voltage"]),
-        "bootCount": find_integer(input, &["bootCount", "boot_count"]),
-        "undervoltageCount": find_integer(input, &["undervoltageCount", "undervoltage_count"]),
-        "restartReasonCode": reasons.restart_reason_code,
-        "restartReasonLabel": reasons.restart_reason_label,
-        "motorStopReasonCode": reasons.motor_stop_reason_code,
-        "motorStopReasonLabel": reasons.motor_stop_reason_label,
-        "sunrise": find(input, &["sunrise", "sunrise_time"]).or_else(|| find(sun, &["sunrise", "sunrise_time"])).or_else(|| find(sun_times, &["sunrise_time", "sunrise"])),
-        "sunset": find(input, &["sunset", "sunset_time"]).or_else(|| find(sun, &["sunset", "sunset_time"])).or_else(|| find(sun_times, &["sunset_time", "sunset"])),
-        "connectId": find(input, &["connectId", "connect_id"]),
-        "homekitCode": find(input, &["homekitCode", "homekit_code", "pairing_code"]),
-        "hardwareRevision": find(input, &["hardwareRevision", "hardware_revision"]),
-        "firmwareVersion": find(input, &["firmwareVersion", "firmware_version"]),
-    })
-}
-
-fn find(value: &Value, names: &[&str]) -> Option<Value> {
-    names
-        .iter()
-        .find_map(|name| value.get(*name).filter(|value| !value.is_null()).cloned())
-}
-
-fn find_integer(value: &Value, names: &[&str]) -> Value {
-    names
-        .iter()
-        .find_map(|name| value.get(*name).and_then(parse_integer))
-        .map_or(Value::Null, |number| json!(number))
-}
-
-fn parse_integer(value: &Value) -> Option<i64> {
-    match value {
-        Value::Number(number) => {
-            if let Some(integer) = number.as_i64() {
-                return Some(integer);
-            }
-            let number = number.as_f64()?;
-            (number.is_finite()
-                && number.fract() == 0.0
-                && number >= i64::MIN as f64
-                && number < 9_223_372_036_854_775_808.0)
-                .then_some(number as i64)
-        }
-        Value::String(text) => text.trim().parse::<i64>().ok(),
-        _ => None,
-    }
+    Ok(())
 }

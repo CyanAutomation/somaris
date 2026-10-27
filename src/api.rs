@@ -10,6 +10,13 @@ use std::{
     time::Instant,
 };
 
+use crate::{
+    ble::{
+        BleAdapter, BleFailure, BleFailureStage, BleObservation, BtleplugAdapter,
+        SOMA_MANUFACTURER_ID, decode_ba71_voltage, parse_soma_payload,
+    },
+    controller::ServiceAction,
+};
 use axum::{
     Json, Router,
     body::Body,
@@ -26,8 +33,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -154,6 +160,8 @@ pub struct AppState {
     inner: Arc<Mutex<Inner>>,
     device_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     adapter_slots: Arc<Semaphore>,
+    ble_adapter: Arc<RwLock<Option<Arc<dyn BleAdapter>>>>,
+    ble_enabled: bool,
     queue_config: QueueConfig,
     allowed_origins: Vec<HeaderValue>,
     started_at: DateTime<Utc>,
@@ -177,6 +185,8 @@ struct Inner {
     history: Vec<HistoryObservation>,
     next_cursor: u64,
     scanner: ScannerCounters,
+    #[serde(skip)]
+    devices: HashMap<String, Device>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,12 +201,46 @@ struct SimulatorConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ScannerCounters {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    adapter_available: bool,
+    #[serde(default)]
+    scan_active: bool,
+    #[serde(default)]
+    last_scan_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_advertisement_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_error_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    last_error_code: Option<String>,
     retry_count: u64,
     error_count: u64,
     advertisements_seen: u64,
     observations_stored: u64,
     malformed_payload_count: u64,
     unsupported_version_count: u64,
+}
+
+impl ScannerCounters {
+    fn unavailable() -> Self {
+        Self {
+            status: "unavailable".into(),
+            adapter_available: false,
+            scan_active: false,
+            last_scan_started_at: None,
+            last_advertisement_at: None,
+            last_error_at: None,
+            last_error_code: Some("adapter_unavailable".into()),
+            retry_count: 0,
+            error_count: 0,
+            advertisements_seen: 0,
+            observations_stored: 0,
+            malformed_payload_count: 0,
+            unsupported_version_count: 0,
+        }
+    }
 }
 
 impl AppState {
@@ -213,6 +257,12 @@ impl AppState {
         self.adapter_slots = Arc::new(Semaphore::new(config.adapter_concurrency));
         self.queue_config = config;
         Ok(self)
+    }
+
+    pub fn with_ble_adapter(mut self, adapter: Arc<dyn BleAdapter>) -> Self {
+        self.ble_adapter = Arc::new(RwLock::new(Some(adapter)));
+        self.ble_enabled = true;
+        self
     }
 
     pub fn with_allowed_origins<I, S>(mut self, origins: I) -> Result<Self, String>
@@ -246,6 +296,7 @@ impl AppState {
                 .unwrap_or_else(|| PathBuf::from("data/state.json")),
         );
         let mut state = Self::configured(simulator_enabled, history_path, data_path);
+        state.ble_enabled = true;
         state = state
             .with_queue_config(QueueConfig::from_environment()?)
             .map_err(invalid_configuration)?;
@@ -275,7 +326,8 @@ impl AppState {
             batch_idempotency: HashMap::new(),
             history: Vec::new(),
             next_cursor: 1,
-            scanner: ScannerCounters::default(),
+            scanner: ScannerCounters::unavailable(),
+            devices: HashMap::new(),
         };
         if let Some(path) = &history_path {
             inner.history = read_history(path).unwrap_or_default();
@@ -290,6 +342,8 @@ impl AppState {
             inner: Arc::new(Mutex::new(inner)),
             device_locks: Arc::new(Mutex::new(HashMap::new())),
             adapter_slots: Arc::new(Semaphore::new(queue_config.adapter_concurrency)),
+            ble_adapter: Arc::new(RwLock::new(None)),
+            ble_enabled: false,
             queue_config,
             allowed_origins: Vec::new(),
             started_at,
@@ -314,6 +368,7 @@ impl AppState {
         let now = Utc::now();
         let mut guard = self.inner.lock().await;
         persisted.simulator_enabled = guard.simulator_enabled;
+        persisted.scanner = ScannerCounters::unavailable();
         for command in persisted.commands.values_mut() {
             if command.status == CommandStatus::Connecting {
                 command.status = CommandStatus::OutcomeUnknown;
@@ -420,8 +475,11 @@ impl AppState {
                     if !inner.simulator_enabled || inner.simulator_config.telemetry_paused {
                         continue;
                     }
-                    inner.simulator.last_seen_at = Utc::now();
-                    if record_history(&mut inner).unwrap_or(false) {
+                    let now = Utc::now();
+                    advance_simulator(&mut inner, now);
+                    inner.simulator.last_seen_at = now;
+                    let recorded = record_history(&mut inner).unwrap_or(false);
+                    if recorded {
                         let revision = state.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
                         Some((inner.history.clone(), revision))
                     } else {
@@ -433,6 +491,285 @@ impl AppState {
                 }
             }
         });
+        if self.ble_enabled {
+            let scanner_state = self.clone();
+            tokio::spawn(async move { scanner_state.scanner_supervisor().await });
+            let battery_state = self.clone();
+            tokio::spawn(async move { battery_state.battery_poll_loop().await });
+        }
+    }
+
+    async fn scanner_supervisor(&self) {
+        loop {
+            let mut adapter = self.ble_adapter.read().await.clone();
+            if adapter.is_none() {
+                match BtleplugAdapter::new().await {
+                    Ok(value) => {
+                        let value: Arc<dyn BleAdapter> = Arc::new(value);
+                        *self.ble_adapter.write().await = Some(value.clone());
+                        adapter = Some(value);
+                    }
+                    Err(failure) => {
+                        let mut inner = self.inner.lock().await;
+                        inner.scanner.status = "unavailable".into();
+                        inner.scanner.adapter_available = false;
+                        inner.scanner.scan_active = false;
+                        inner.scanner.retry_count = inner.scanner.retry_count.saturating_add(1);
+                        inner.scanner.error_count = inner.scanner.error_count.saturating_add(1);
+                        inner.scanner.last_error_at = Some(Utc::now());
+                        inner.scanner.last_error_code = Some(ble_failure_code(&failure).into());
+                        drop(inner);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }
+            }
+
+            let Some(adapter) = adapter else { continue };
+            let (sender, mut receiver) = mpsc::channel(128);
+            {
+                let mut inner = self.inner.lock().await;
+                inner.scanner.status = "scanning".into();
+                inner.scanner.adapter_available = true;
+                inner.scanner.scan_active = true;
+                inner.scanner.last_scan_started_at = Some(Utc::now());
+                inner.scanner.last_error_code = None;
+            }
+            let scan = tokio::spawn(async move { adapter.scan(sender).await });
+            while let Some(observation) = receiver.recv().await {
+                self.store_ble_observation(observation).await;
+            }
+            let failure = match scan.await {
+                Ok(Err(failure)) => Some(failure),
+                _ => None,
+            };
+            let adapter_failed = failure
+                .as_ref()
+                .is_some_and(|failure| failure.stage == BleFailureStage::Adapter);
+            {
+                let mut inner = self.inner.lock().await;
+                inner.scanner.scan_active = false;
+                inner.scanner.status = "unavailable".into();
+                inner.scanner.retry_count = inner.scanner.retry_count.saturating_add(1);
+                inner.scanner.error_count = inner.scanner.error_count.saturating_add(1);
+                inner.scanner.last_error_at = Some(Utc::now());
+                inner.scanner.last_error_code = failure
+                    .as_ref()
+                    .map(|failure| ble_failure_code(failure).to_owned())
+                    .or_else(|| Some("scan_ended".into()));
+                if adapter_failed {
+                    inner.scanner.adapter_available = false;
+                }
+            }
+            if adapter_failed {
+                *self.ble_adapter.write().await = None;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    }
+
+    async fn store_ble_observation(&self, observation: BleObservation) {
+        let now = Utc::now();
+        let parsed = match parse_soma_payload(&observation.manufacturer_payload) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let mut inner = self.inner.lock().await;
+                inner.scanner.advertisements_seen =
+                    inner.scanner.advertisements_seen.saturating_add(1);
+                inner.scanner.last_advertisement_at = Some(now);
+                match error {
+                    crate::ble::BleDecodeError::UnsupportedVersion(_) => {
+                        inner.scanner.unsupported_version_count =
+                            inner.scanner.unsupported_version_count.saturating_add(1);
+                    }
+                    _ => {
+                        inner.scanner.malformed_payload_count =
+                            inner.scanner.malformed_payload_count.saturating_add(1);
+                    }
+                }
+                return;
+            }
+        };
+        let mut raw_manufacturer_data = SOMA_MANUFACTURER_ID.to_le_bytes().to_vec();
+        raw_manufacturer_data.extend_from_slice(&observation.manufacturer_payload);
+        let logical_id = logical_id_for_name(&parsed.advertised_name, "soma");
+        let persisted_history = {
+            let mut inner = self.inner.lock().await;
+            inner.scanner.advertisements_seen = inner.scanner.advertisements_seen.saturating_add(1);
+            inner.scanner.observations_stored = inner.scanner.observations_stored.saturating_add(1);
+            inner.scanner.last_advertisement_at = Some(now);
+            let previous = inner.devices.get(&observation.peripheral_id).cloned();
+            let id = previous
+                .as_ref()
+                .map(|device| device.id.clone())
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let battery =
+                previous
+                    .map(|device| device.battery)
+                    .unwrap_or_else(|| BatteryTelemetry {
+                        status: BatteryStatus::NotObserved,
+                        voltage_mv: None,
+                        percent_estimate: None,
+                        observed_at: None,
+                        last_attempt_at: None,
+                        error_code: None,
+                        failure_stage: None,
+                        source: None,
+                    });
+            let device = Device {
+                id,
+                logical_id: Some(logical_id),
+                observed_address: observation.observed_address,
+                adapter_device_id: observation.peripheral_id.clone(),
+                device_name: observation.device_name,
+                advertised_name: parsed.advertised_name,
+                rssi_dbm: observation.rssi_dbm,
+                last_seen_at: now,
+                freshness: Freshness::Fresh,
+                source: Source::BleAdvertisement,
+                is_simulated: false,
+                manufacturer_data_hex: hex::encode(raw_manufacturer_data),
+                manufacturer_payload_hex: hex::encode(observation.manufacturer_payload),
+                position_status: PositionStatus::Observed,
+                position: Some(position_value(
+                    parsed.current_closed_percent,
+                    parsed.target_closed_percent,
+                    now,
+                    Source::BleAdvertisement,
+                )),
+                movement_status: movement_status(
+                    parsed.current_closed_percent,
+                    parsed.target_closed_percent,
+                ),
+                battery,
+            };
+            inner.devices.insert(observation.peripheral_id, device);
+            prune_registry(&mut inner, now);
+            if record_history(&mut inner).unwrap_or(false) {
+                let revision = self.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
+                Some((inner.history.clone(), revision))
+            } else {
+                None
+            }
+        };
+        if let Some((history, revision)) = persisted_history {
+            let _ = self.persist_history(&history, revision).await;
+        }
+    }
+
+    async fn battery_poll_loop(&self) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let adapter = self.ble_adapter.read().await.clone();
+            let Some(adapter) = adapter else { continue };
+            let now = Utc::now();
+            let candidates = {
+                let mut inner = self.inner.lock().await;
+                prune_registry(&mut inner, now);
+                inner
+                    .enrollments
+                    .values()
+                    .filter(|enrollment| !enrollment.is_simulated)
+                    .filter_map(|enrollment| {
+                        let matches: Vec<_> = inner
+                            .devices
+                            .values()
+                            .filter(|device| {
+                                device.logical_id.as_deref() == Some(enrollment.logical_id.as_str())
+                                    && device.advertised_name == enrollment.advertised_name
+                                    && device.freshness == Freshness::Fresh
+                            })
+                            .collect();
+                        if matches.len() != 1 {
+                            return None;
+                        }
+                        let device = matches[0];
+                        let due = device.battery.last_attempt_at.is_none_or(|attempt| {
+                            now.signed_duration_since(attempt) >= ChronoDuration::hours(1)
+                        });
+                        due.then(|| {
+                            (
+                                enrollment.id.clone(),
+                                enrollment.logical_id.clone(),
+                                enrollment.advertised_name.clone(),
+                                device.adapter_device_id.clone(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for (managed_id, logical_id, expected_name, peripheral_id) in candidates {
+                let lock = {
+                    let mut locks = self.device_locks.lock().await;
+                    locks
+                        .entry(managed_id.clone())
+                        .or_insert_with(|| Arc::new(Semaphore::new(1)))
+                        .clone()
+                };
+                let Ok(_device_permit) = lock.acquire_owned().await else {
+                    continue;
+                };
+                let Ok(_adapter_permit) = self.adapter_slots.clone().acquire_owned().await else {
+                    continue;
+                };
+                self.record_battery_attempt(
+                    &logical_id,
+                    &peripheral_id,
+                    expected_name,
+                    adapter.clone(),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn record_battery_attempt(
+        &self,
+        logical_id: &str,
+        peripheral_id: &str,
+        expected_name: String,
+        adapter: Arc<dyn BleAdapter>,
+    ) {
+        let attempted_at = Utc::now();
+        let response = adapter.read_battery(peripheral_id, &expected_name).await;
+        let mut inner = self.inner.lock().await;
+        let Some(device) = inner.devices.get_mut(peripheral_id) else {
+            return;
+        };
+        if device.logical_id.as_deref() != Some(logical_id) {
+            return;
+        }
+        device.battery.last_attempt_at = Some(attempted_at);
+        device.battery.source = Some(BatterySource::GattBa71);
+        match response {
+            Ok(bytes) => match decode_ba71_voltage(&bytes) {
+                Ok(reading) => {
+                    device.battery.status = BatteryStatus::Observed;
+                    device.battery.voltage_mv = Some(reading.voltage_mv);
+                    device.battery.percent_estimate = Some(reading.percent_estimate);
+                    device.battery.observed_at = Some(attempted_at);
+                    device.battery.error_code = None;
+                    device.battery.failure_stage = None;
+                }
+                Err(_) => {
+                    device.battery.status = BatteryStatus::InvalidValue;
+                    device.battery.error_code = Some("invalid_battery_value".into());
+                    device.battery.failure_stage = Some("battery_read".into());
+                }
+            },
+            Err(failure) => {
+                device.battery.status = if failure.stage == BleFailureStage::BatteryDiscovery {
+                    BatteryStatus::Unsupported
+                } else {
+                    BatteryStatus::Unavailable
+                };
+                device.battery.error_code = (device.battery.status == BatteryStatus::Unsupported)
+                    .then(|| "ba71_unsupported".into())
+                    .or_else(|| Some(ble_failure_code(&failure).into()));
+                device.battery.failure_stage = Some(failure.stage.as_str().into());
+            }
+        }
     }
 }
 
@@ -607,61 +944,82 @@ async fn openapi_yaml() -> Response {
     }
 }
 
-async fn health() -> Response {
+async fn health(State(state): State<AppState>) -> Response {
+    let inner = state.inner.lock().await;
+    let scanner_status = inner.scanner.status.clone();
+    let status = if inner.scanner.scan_active && inner.scanner.adapter_available {
+        "healthy"
+    } else {
+        "degraded"
+    };
     let data = HealthData {
-        status: "degraded".to_owned(),
-        scanner_status: "unavailable".to_owned(),
+        status: status.to_owned(),
+        scanner_status,
         generated_at: Utc::now(),
     };
     Json(envelope(data, None)).into_response()
 }
 
-async fn ready() -> Response {
+async fn ready(State(state): State<AppState>) -> Response {
+    let inner = state.inner.lock().await;
+    let ready = inner.scanner.scan_active && inner.scanner.adapter_available;
     let data = HealthData {
-        status: "degraded".to_owned(),
-        scanner_status: "unavailable".to_owned(),
+        status: if ready { "healthy" } else { "degraded" }.to_owned(),
+        scanner_status: inner.scanner.status.clone(),
         generated_at: Utc::now(),
     };
-    (StatusCode::SERVICE_UNAVAILABLE, Json(envelope(data, None))).into_response()
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, Json(envelope(data, None))).into_response()
 }
 
 async fn diagnostics(State(state): State<AppState>) -> Response {
-    let inner = state.inner.lock().await;
-    let retained = usize::from(inner.simulator_enabled);
+    let mut inner = state.inner.lock().await;
+    prune_registry(&mut inner, Utc::now());
+    let retained = inner.devices.len() + usize::from(inner.simulator_enabled);
+    let stale = inner
+        .devices
+        .values()
+        .filter(|device| device.freshness == Freshness::Stale)
+        .count();
     let data = Diagnostics {
         service_started_at: state.started_at,
         uptime_seconds: state.started.elapsed().as_secs_f64(),
         history_enabled: state.history_path.is_some(),
         scanner: ScannerDiagnostics {
-            status: "unavailable".into(),
-            adapter_available: false,
-            scan_active: false,
-            last_scan_started_at: None,
-            last_advertisement_at: None,
-            last_error_at: None,
-            last_error_code: Some("adapter_unavailable".into()),
+            status: inner.scanner.status.clone(),
+            adapter_available: inner.scanner.adapter_available,
+            scan_active: inner.scanner.scan_active,
+            last_scan_started_at: inner.scanner.last_scan_started_at,
+            last_advertisement_at: inner.scanner.last_advertisement_at,
+            last_error_at: inner.scanner.last_error_at,
+            last_error_code: inner.scanner.last_error_code.clone(),
             retry_count: inner.scanner.retry_count,
             error_count: inner.scanner.error_count,
-            somaris_advertisements_seen: inner.scanner.advertisements_seen,
+            soma_advertisements_seen: inner.scanner.advertisements_seen,
             observations_stored: inner.scanner.observations_stored,
             malformed_payload_count: inner.scanner.malformed_payload_count,
             unsupported_version_count: inner.scanner.unsupported_version_count,
         },
         registry: RegistryDiagnostics {
             retained_device_count: retained as u64,
-            stale_device_count: 0,
+            stale_device_count: stale as u64,
         },
     };
     Json(envelope(data, None)).into_response()
 }
 
 async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let inner = state.inner.lock().await;
-    let devices = if inner.simulator_enabled {
-        vec![device_snapshot(&inner)]
-    } else {
-        Vec::new()
-    };
+    let mut inner = state.inner.lock().await;
+    prune_registry(&mut inner, Utc::now());
+    let mut devices: Vec<_> = inner.devices.values().cloned().collect();
+    if inner.simulator_enabled {
+        devices.push(device_snapshot(&inner));
+    }
+    devices.sort_by(|left, right| right.last_seen_at.cmp(&left.last_seen_at));
     conditional_json(
         &headers,
         devices.clone(),
@@ -679,6 +1037,13 @@ async fn get_device(
         .simulator_enabled
         .then(|| device_snapshot(&inner))
         .filter(|device| device.id == id)
+        .or_else(|| {
+            inner
+                .devices
+                .values()
+                .find(|device| device.id == id)
+                .cloned()
+        })
     else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -969,7 +1334,10 @@ struct Device {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     logical_id: Option<String>,
-    observed_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_address: Option<String>,
+    #[serde(default, skip_serializing)]
+    adapter_device_id: String,
     device_name: Option<String>,
     advertised_name: String,
     rssi_dbm: i16,
@@ -1069,7 +1437,7 @@ struct ScannerDiagnostics {
     last_error_code: Option<String>,
     retry_count: u64,
     error_count: u64,
-    somaris_advertisements_seen: u64,
+    soma_advertisements_seen: u64,
     observations_stored: u64,
     malformed_payload_count: u64,
     unsupported_version_count: u64,
@@ -1456,11 +1824,11 @@ fn read_history(path: &Path) -> io::Result<Vec<HistoryObservation>> {
 
 fn make_simulated_device(now: DateTime<Utc>) -> Device {
     let name = "Somaris Simulated Blind".to_owned();
-    let digest = Sha256::digest(format!("simulator:{name}").as_bytes());
     Device {
         id: SIMULATOR_ID.to_owned(),
-        logical_id: Some(hex::encode(digest)),
-        observed_address: "simulator://blind-1".to_owned(),
+        logical_id: Some(logical_id_for_name(&name, "simulator")),
+        observed_address: Some("simulator://blind-1".to_owned()),
+        adapter_device_id: "simulator://blind-1".to_owned(),
         device_name: Some(name.clone()),
         advertised_name: name,
         rssi_dbm: -60,
@@ -1524,48 +1892,121 @@ fn simulator_status(inner: &Inner) -> SimulatorStatus {
 }
 
 fn record_history(inner: &mut Inner) -> Result<bool, String> {
-    if !inner.simulator_enabled {
-        return Ok(false);
+    let mut devices: Vec<_> = inner.devices.values().cloned().collect();
+    if inner.simulator_enabled {
+        devices.push(device_snapshot(inner));
     }
-    let position = inner.simulator.position.as_ref();
-    let same_position = inner.history.last().is_some_and(|last| {
-        last.device_id == inner.simulator.id
-            && last
-                .position
-                .as_ref()
-                .map(|value| (value.current_closed_percent, value.target_closed_percent))
-                == position.map(|value| (value.current_closed_percent, value.target_closed_percent))
-    });
-    if same_position
-        && inner.history.last().is_some_and(|last| {
-            inner
-                .simulator
-                .last_seen_at
-                .signed_duration_since(last.observed_at)
-                < ChronoDuration::seconds(5)
-        })
-    {
-        return Ok(false);
+    let mut changed = false;
+    for device in devices {
+        let current_position = device.position.as_ref().map(|position| {
+            (
+                position.current_closed_percent,
+                position.target_closed_percent,
+            )
+        });
+        let latest = inner
+            .history
+            .iter()
+            .rev()
+            .find(|record| record.device_id == device.id);
+        let same_position = latest.is_some_and(|last| {
+            last.position.as_ref().map(|position| {
+                (
+                    position.current_closed_percent,
+                    position.target_closed_percent,
+                )
+            }) == current_position
+        });
+        if same_position
+            && latest.is_some_and(|last| {
+                device.last_seen_at.signed_duration_since(last.observed_at)
+                    < ChronoDuration::seconds(5)
+            })
+        {
+            continue;
+        }
+        inner.history.push(HistoryObservation {
+            cursor: inner.next_cursor,
+            device_id: device.id,
+            logical_id: device.logical_id,
+            observed_at: device.last_seen_at,
+            rssi_dbm: device.rssi_dbm,
+            position_status: device.position_status,
+            position: device.position.map(|position| HistoryPosition {
+                current_closed_percent: position.current_closed_percent,
+                target_closed_percent: position.target_closed_percent,
+            }),
+        });
+        inner.next_cursor = inner.next_cursor.saturating_add(1);
+        changed = true;
     }
-    let observation = HistoryObservation {
-        cursor: inner.next_cursor,
-        device_id: inner.simulator.id.clone(),
-        logical_id: inner.simulator.logical_id.clone(),
-        observed_at: inner.simulator.last_seen_at,
-        rssi_dbm: inner.simulator.rssi_dbm,
-        position_status: inner.simulator.position_status,
-        position: position.map(|position| HistoryPosition {
-            current_closed_percent: position.current_closed_percent,
-            target_closed_percent: position.target_closed_percent,
-        }),
-    };
-    inner.next_cursor = inner.next_cursor.saturating_add(1);
-    inner.history.push(observation);
     if inner.history.len() > 50_000 {
         let remove = inner.history.len() - 50_000;
         inner.history.drain(0..remove);
     }
-    Ok(true)
+    Ok(changed)
+}
+
+fn advance_simulator(inner: &mut Inner, now: DateTime<Utc>) {
+    let Some(position) = inner.simulator.position.as_mut() else {
+        return;
+    };
+    if position.current_closed_percent < position.target_closed_percent {
+        position.current_closed_percent = position
+            .current_closed_percent
+            .saturating_add(5)
+            .min(position.target_closed_percent);
+    } else if position.current_closed_percent > position.target_closed_percent {
+        position.current_closed_percent = position
+            .current_closed_percent
+            .saturating_sub(5)
+            .max(position.target_closed_percent);
+    }
+    position.observed_at = now;
+    inner.simulator.movement_status = movement_status(
+        position.current_closed_percent,
+        position.target_closed_percent,
+    );
+}
+
+fn prune_registry(inner: &mut Inner, now: DateTime<Utc>) {
+    inner.devices.retain(|_, device| {
+        let age = now.signed_duration_since(device.last_seen_at);
+        if age > ChronoDuration::minutes(10) {
+            false
+        } else {
+            device.freshness = if age > ChronoDuration::seconds(60) {
+                Freshness::Stale
+            } else {
+                Freshness::Fresh
+            };
+            true
+        }
+    });
+}
+
+fn logical_id_for_name(name: &str, namespace: &str) -> String {
+    let digest = Sha256::digest(name.as_bytes());
+    format!("{namespace}-{}", hex::encode(digest))
+}
+
+fn ble_failure_code(failure: &BleFailure) -> &'static str {
+    match failure.stage {
+        BleFailureStage::Adapter => "adapter_unavailable",
+        BleFailureStage::DeviceConnection => "device_connection_failed",
+        BleFailureStage::ServiceResolution => "service_resolution_failed",
+        BleFailureStage::GattDiscovery => "gatt_discovery_failed",
+        BleFailureStage::IdentityVerification => "identity_verification_failed",
+        BleFailureStage::GattWrite => {
+            if failure.outcome_unknown {
+                "outcome_unknown"
+            } else {
+                "gatt_write_error"
+            }
+        }
+        BleFailureStage::BatteryDiscovery => "ba71_unsupported",
+        BleFailureStage::BatteryRead => "battery_read_failed",
+    }
 }
 
 fn device_snapshot(inner: &Inner) -> Device {
@@ -1606,7 +2047,8 @@ fn device_snapshot(inner: &Inner) -> Device {
 }
 
 async fn list_managed_devices(State(state): State<AppState>) -> Response {
-    let inner = state.inner.lock().await;
+    let mut inner = state.inner.lock().await;
+    prune_registry(&mut inner, Utc::now());
     let mut devices: Vec<_> = inner
         .enrollments
         .values()
@@ -1634,14 +2076,31 @@ async fn enroll_device(
         );
     }
     let mut inner = state.inner.lock().await;
-    if !inner.simulator_enabled || request.observed_device_id != inner.simulator.id {
+    prune_registry(&mut inner, Utc::now());
+    let observed = if inner.simulator_enabled && request.observed_device_id == inner.simulator.id {
+        Some(device_snapshot(&inner))
+    } else {
+        inner
+            .devices
+            .values()
+            .find(|device| device.id == request.observed_device_id)
+            .cloned()
+    };
+    let Some(observed) = observed else {
         return error_response(
             StatusCode::NOT_FOUND,
             "device_not_found",
             "The observed device was not found.",
         );
+    };
+    if observed.freshness != Freshness::Fresh {
+        return error_response(
+            StatusCode::CONFLICT,
+            "device_not_ready",
+            "A fresh device observation is required for enrollment.",
+        );
     }
-    let Some(logical_id) = inner.simulator.logical_id.clone() else {
+    let Some(logical_id) = observed.logical_id.clone() else {
         return error_response(
             StatusCode::CONFLICT,
             "identity_unavailable",
@@ -1651,7 +2110,7 @@ async fn enroll_device(
     if inner
         .enrollments
         .values()
-        .any(|entry| entry.logical_id == logical_id)
+        .any(|entry| entry.logical_id == logical_id && entry.is_simulated == observed.is_simulated)
     {
         return error_response(
             StatusCode::CONFLICT,
@@ -1659,12 +2118,30 @@ async fn enroll_device(
             "This device is already enrolled.",
         );
     }
+    if !observed.is_simulated
+        && inner
+            .devices
+            .values()
+            .filter(|device| {
+                !device.is_simulated
+                    && device.logical_id.as_deref() == Some(logical_id.as_str())
+                    && device.freshness == Freshness::Fresh
+            })
+            .count()
+            != 1
+    {
+        return error_response(
+            StatusCode::CONFLICT,
+            "ambiguous_device",
+            "The advertised name matches more than one fresh device.",
+        );
+    }
     let enrollment = Enrollment {
         id: Uuid::new_v4().to_string(),
         label: label.to_owned(),
-        advertised_name: inner.simulator.advertised_name.clone(),
+        advertised_name: observed.advertised_name,
         logical_id,
-        is_simulated: true,
+        is_simulated: observed.is_simulated,
         created_at: Utc::now(),
     };
     inner
@@ -2126,26 +2603,34 @@ async fn submit_command(
             "The command journal is at capacity.",
         ));
     }
-    let Some(enrollment) = inner.enrollments.get(managed_device_id) else {
+    let Some(enrollment) = inner.enrollments.get(managed_device_id).cloned() else {
         return Err(ApiFailure::new(
             StatusCode::NOT_FOUND,
             "enrollment_not_found",
             "Managed-device enrollment was not found.",
         ));
     };
-    if !enrollment.is_simulated {
-        return Err(ApiFailure::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "adapter_unavailable",
-            "Physical Bluetooth control is unavailable in this build.",
-        ));
-    }
-    if !inner.simulator_enabled {
+    if enrollment.is_simulated && !inner.simulator_enabled {
         return Err(ApiFailure::new(
             StatusCode::CONFLICT,
             "device_unavailable",
             "The simulated device is unavailable.",
         ));
+    }
+    let managed = managed_device(&inner, enrollment);
+    if managed.availability != "ready" {
+        let (code, message) = if managed.availability == "ambiguous" {
+            (
+                "ambiguous_device",
+                "The enrolled name matches more than one fresh device.",
+            )
+        } else {
+            (
+                "device_not_ready",
+                "A unique fresh device observation is required for control.",
+            )
+        };
+        return Err(ApiFailure::new(StatusCode::CONFLICT, code, message));
     }
     let outstanding: Vec<_> = inner
         .commands
@@ -2220,14 +2705,51 @@ fn resolve_toggle(
             "Managed-device enrollment was not found.",
         ));
     };
-    if !enrollment.is_simulated || !inner.simulator_enabled {
+    if enrollment.is_simulated && !inner.simulator_enabled {
         return Err(ApiFailure::new(
             StatusCode::CONFLICT,
             "device_unavailable",
             "A unique fresh observation is not available.",
         ));
     }
-    let Some(position) = inner.simulator.position.as_ref() else {
+    let device = if enrollment.is_simulated {
+        inner
+            .simulator
+            .logical_id
+            .as_deref()
+            .filter(|logical_id| *logical_id == enrollment.logical_id)
+            .map(|_| &inner.simulator)
+    } else {
+        let matching: Vec<_> = inner
+            .devices
+            .values()
+            .filter(|device| {
+                !device.is_simulated
+                    && device.logical_id.as_deref() == Some(enrollment.logical_id.as_str())
+                    && device.advertised_name == enrollment.advertised_name
+                    && device.freshness == Freshness::Fresh
+            })
+            .collect();
+        if matching.len() > 1 {
+            return Err(ApiFailure::new(
+                StatusCode::CONFLICT,
+                "ambiguous_device",
+                "The enrolled name matches more than one fresh device.",
+            ));
+        }
+        matching.first().copied()
+    };
+    let Some(device) = device.filter(|device| {
+        device.freshness == Freshness::Fresh
+            && Utc::now().signed_duration_since(device.last_seen_at) <= ChronoDuration::seconds(60)
+    }) else {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "device_not_ready",
+            "A unique fresh observation is required to toggle this blind.",
+        ));
+    };
+    let Some(position) = device.position.as_ref() else {
         return Err(ApiFailure::new(
             StatusCode::CONFLICT,
             "position_unavailable",
@@ -2351,8 +2873,12 @@ async fn process_command(state: AppState, command_id: String) {
     let Ok(_adapter_permit) = state.adapter_slots.clone().acquire_owned().await else {
         return;
     };
-    let (action, scenario, connection_delay_ms, write_delay_ms) = {
+    let (action, scenario, connection_delay_ms, write_delay_ms, is_simulated) = {
         let mut inner = state.inner.lock().await;
+        let is_simulated = inner
+            .enrollments
+            .get(&managed_device_id)
+            .is_some_and(|enrollment| enrollment.is_simulated);
         let Some(command) = inner.commands.get_mut(&command_id) else {
             return;
         };
@@ -2374,8 +2900,18 @@ async fn process_command(state: AppState, command_id: String) {
         let connection_delay_ms = inner.simulator_config.connection_delay_ms;
         let write_delay_ms = inner.simulator_config.write_response_delay_ms;
         let _ = state.persist(&inner).await;
-        (action, scenario, connection_delay_ms, write_delay_ms)
+        (
+            action,
+            scenario,
+            connection_delay_ms,
+            write_delay_ms,
+            is_simulated,
+        )
     };
+    if !is_simulated {
+        process_physical_command(&state, &command_id, action).await;
+        return;
+    }
     tokio::time::sleep(std::time::Duration::from_millis(
         connection_delay_ms.saturating_add(write_delay_ms),
     ))
@@ -2383,7 +2919,6 @@ async fn process_command(state: AppState, command_id: String) {
 
     let mut inner = state.inner.lock().await;
     let now = Utc::now();
-    let paused = inner.simulator_config.telemetry_paused;
     if matches!(
         scenario,
         SimulatorScenario::PreWriteFailure
@@ -2395,20 +2930,32 @@ async fn process_command(state: AppState, command_id: String) {
     if scenario == SimulatorScenario::TelemetryPaused {
         inner.simulator_config.telemetry_paused = true;
     }
-    if (scenario == SimulatorScenario::Normal || scenario == SimulatorScenario::TelemetryPaused)
-        && inner.simulator_enabled
-        && let Some(position) = inner.simulator.position.as_mut()
+    let update_simulator_telemetry = matches!(
+        scenario,
+        SimulatorScenario::Normal | SimulatorScenario::OutcomeUnknown
+    );
+    let simulator_position = if matches!(
+        scenario,
+        SimulatorScenario::Normal
+            | SimulatorScenario::OutcomeUnknown
+            | SimulatorScenario::TelemetryPaused
+    ) && inner.simulator_enabled
     {
-        let target = action.target_closed_percent(position.current_closed_percent);
-        position.target_closed_percent = target;
-        if !paused {
-            position.current_closed_percent = target;
-            position.observed_at = now;
+        inner.simulator.position.as_mut().map(|position| {
+            let target = action.target_closed_percent(position.current_closed_percent);
+            position.target_closed_percent = target;
+            if update_simulator_telemetry {
+                position.observed_at = now;
+            }
+            (position.current_closed_percent, target)
+        })
+    } else {
+        None
+    };
+    if let Some((current, target)) = simulator_position {
+        inner.simulator.movement_status = movement_status(current, target);
+        if update_simulator_telemetry {
             inner.simulator.last_seen_at = now;
-            inner.simulator.movement_status = MovementStatus::AtTarget;
-        } else {
-            inner.simulator.movement_status =
-                movement_status(position.current_closed_percent, target);
         }
     }
     if let Some(command) = inner.commands.get_mut(&command_id) {
@@ -2450,7 +2997,7 @@ async fn process_command(state: AppState, command_id: String) {
     if inner.simulator_enabled
         && matches!(
             scenario,
-            SimulatorScenario::Normal | SimulatorScenario::TelemetryPaused
+            SimulatorScenario::Normal | SimulatorScenario::OutcomeUnknown
         )
     {
         if record_history(&mut inner).unwrap_or(false) {
@@ -2467,6 +3014,247 @@ async fn process_command(state: AppState, command_id: String) {
     }
     if state.persist(&inner).await.is_err() {
         tracing::warn!(%command_id, "Command result could not be persisted.");
+    }
+}
+
+fn physical_target(
+    inner: &Inner,
+    managed_device_id: &str,
+) -> Result<(String, String), &'static str> {
+    let Some(enrollment) = inner.enrollments.get(managed_device_id) else {
+        return Err("enrollment_not_found");
+    };
+    if enrollment.is_simulated {
+        return Err("device_not_ready");
+    }
+    let now = Utc::now();
+    let matches: Vec<_> = inner
+        .devices
+        .values()
+        .filter(|device| {
+            !device.is_simulated
+                && device.logical_id.as_deref() == Some(enrollment.logical_id.as_str())
+                && device.advertised_name == enrollment.advertised_name
+                && device.freshness == Freshness::Fresh
+                && now.signed_duration_since(device.last_seen_at) <= ChronoDuration::seconds(60)
+        })
+        .collect();
+    match matches.as_slice() {
+        [] => Err("device_not_ready"),
+        [device] => Ok((
+            device.adapter_device_id.clone(),
+            enrollment.advertised_name.clone(),
+        )),
+        _ => Err("ambiguous_device"),
+    }
+}
+
+async fn perform_physical_action(
+    adapter: &dyn BleAdapter,
+    peripheral_id: &str,
+    expected_name: &str,
+    action: ServiceAction,
+) -> Result<(), BleFailure> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        adapter.write_action(peripheral_id, expected_name, action),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(BleFailure {
+            stage: BleFailureStage::GattWrite,
+            retryable_before_write: false,
+            write_may_have_been_sent: true,
+            outcome_unknown: true,
+        }),
+    }
+}
+
+async fn process_physical_command(state: &AppState, command_id: &str, action: Action) {
+    let (managed_device_id, started_at) = {
+        let inner = state.inner.lock().await;
+        let Some(command) = inner.commands.get(command_id) else {
+            return;
+        };
+        (
+            command.managed_device_id.clone(),
+            command.started_at.unwrap_or(command.accepted_at),
+        )
+    };
+    let Some(adapter) = state.ble_adapter.read().await.clone() else {
+        complete_physical_failure(
+            state,
+            command_id,
+            BleFailure {
+                stage: BleFailureStage::Adapter,
+                retryable_before_write: true,
+                write_may_have_been_sent: false,
+                outcome_unknown: false,
+            },
+            "adapter_unavailable",
+            started_at,
+        )
+        .await;
+        return;
+    };
+
+    let target = {
+        let inner = state.inner.lock().await;
+        physical_target(&inner, &managed_device_id)
+    };
+    let (mut peripheral_id, expected_name) = match target {
+        Ok(target) => target,
+        Err(code) => {
+            complete_physical_failure(
+                state,
+                command_id,
+                BleFailure {
+                    stage: BleFailureStage::IdentityVerification,
+                    retryable_before_write: true,
+                    write_may_have_been_sent: false,
+                    outcome_unknown: false,
+                },
+                code,
+                started_at,
+            )
+            .await;
+            return;
+        }
+    };
+    let service_action = match action {
+        Action::Open => ServiceAction::Open,
+        Action::Close => ServiceAction::Close,
+        Action::Stop => ServiceAction::Stop,
+    };
+    let mut result = perform_physical_action(
+        adapter.as_ref(),
+        &peripheral_id,
+        &expected_name,
+        service_action,
+    )
+    .await;
+    let mut attempt = 1;
+    if result.as_ref().is_err_and(|failure| {
+        failure.retryable_before_write
+            && matches!(
+                failure.stage,
+                BleFailureStage::DeviceConnection | BleFailureStage::ServiceResolution
+            )
+    }) {
+        let retry_target = {
+            let inner = state.inner.lock().await;
+            physical_target(&inner, &managed_device_id)
+        };
+        match retry_target {
+            Ok((retry_peripheral_id, _)) => {
+                peripheral_id = retry_peripheral_id;
+                attempt = 2;
+                if let Some(command) = state.inner.lock().await.commands.get_mut(command_id) {
+                    command.attempt = attempt;
+                }
+                let persist_result = {
+                    let inner = state.inner.lock().await;
+                    state.persist(&inner).await
+                };
+                let _ = persist_result;
+                result = perform_physical_action(
+                    adapter.as_ref(),
+                    &peripheral_id,
+                    &expected_name,
+                    service_action,
+                )
+                .await;
+            }
+            Err(code) => {
+                complete_physical_failure(
+                    state,
+                    command_id,
+                    BleFailure {
+                        stage: BleFailureStage::IdentityVerification,
+                        retryable_before_write: true,
+                        write_may_have_been_sent: false,
+                        outcome_unknown: false,
+                    },
+                    code,
+                    started_at,
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    let mut inner = state.inner.lock().await;
+    let Some(command) = inner.commands.get_mut(command_id) else {
+        return;
+    };
+    let now = Utc::now();
+    command.attempt = attempt;
+    command.duration_ms = Some(
+        now.signed_duration_since(started_at)
+            .num_milliseconds()
+            .max(0) as u64,
+    );
+    command.completed_at = Some(now);
+    match result {
+        Ok(()) => {
+            command.status = CommandStatus::WriteAcknowledged;
+            command.write_state = WriteState::Acknowledged;
+            command.retryable = false;
+            command.error_code = None;
+            command.failure_stage = None;
+        }
+        Err(failure) => {
+            command.status = if failure.write_may_have_been_sent {
+                if failure.outcome_unknown {
+                    CommandStatus::OutcomeUnknown
+                } else {
+                    CommandStatus::WriteFailed
+                }
+            } else {
+                CommandStatus::ConnectionFailed
+            };
+            command.write_state = if failure.write_may_have_been_sent {
+                WriteState::PossiblySent
+            } else {
+                WriteState::NotSent
+            };
+            command.retryable = failure.retryable_before_write && !failure.write_may_have_been_sent;
+            command.error_code = Some(ble_failure_code(&failure).into());
+            command.failure_stage = Some(failure.stage.as_str().into());
+        }
+    }
+    if state.persist(&inner).await.is_err() {
+        tracing::warn!(%command_id, "Physical command result could not be persisted.");
+    }
+}
+
+async fn complete_physical_failure(
+    state: &AppState,
+    command_id: &str,
+    failure: BleFailure,
+    error_code: &str,
+    started_at: DateTime<Utc>,
+) {
+    let mut inner = state.inner.lock().await;
+    let Some(command) = inner.commands.get_mut(command_id) else {
+        return;
+    };
+    let now = Utc::now();
+    command.status = CommandStatus::ConnectionFailed;
+    command.completed_at = Some(now);
+    command.duration_ms = Some(
+        now.signed_duration_since(started_at)
+            .num_milliseconds()
+            .max(0) as u64,
+    );
+    command.error_code = Some(error_code.to_owned());
+    command.failure_stage = Some(failure.stage.as_str().into());
+    command.write_state = WriteState::NotSent;
+    command.retryable = failure.retryable_before_write;
+    if state.persist(&inner).await.is_err() {
+        tracing::warn!(%command_id, "Physical command failure could not be persisted.");
     }
 }
 
@@ -2543,26 +3331,47 @@ async fn process_batch(state: AppState, batch_id: String) {
 }
 
 fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
-    let device = inner
-        .simulator_enabled
-        .then_some(&inner.simulator)
-        .filter(|device| {
-            enrollment.is_simulated && device.logical_id.as_deref() == Some(&enrollment.logical_id)
-        });
-    match device {
-        Some(device) => ManagedDevice {
+    let matching: Vec<&Device> = if enrollment.is_simulated {
+        inner
+            .simulator_enabled
+            .then_some(&inner.simulator)
+            .filter(|device| device.logical_id.as_deref() == Some(enrollment.logical_id.as_str()))
+            .into_iter()
+            .collect()
+    } else {
+        inner
+            .devices
+            .values()
+            .filter(|device| {
+                !device.is_simulated
+                    && device.logical_id.as_deref() == Some(enrollment.logical_id.as_str())
+                    && device.advertised_name == enrollment.advertised_name
+            })
+            .collect()
+    };
+    if matching.len() > 1 {
+        return ManagedDevice {
             enrollment,
-            availability: if device.freshness == Freshness::Fresh {
-                "ready".into()
-            } else {
-                "stale".into()
-            },
-            last_seen_at: Some(device.last_seen_at),
-            position: device.position.as_ref().map(|position| ControlPosition {
-                current_closed_percent: position.current_closed_percent,
-                target_closed_percent: position.target_closed_percent,
-            }),
-        },
+            availability: "ambiguous".into(),
+            last_seen_at: matching.iter().map(|device| device.last_seen_at).max(),
+            position: None,
+        };
+    }
+    match matching.first().copied() {
+        Some(device) => {
+            let fresh = device.freshness == Freshness::Fresh
+                && Utc::now().signed_duration_since(device.last_seen_at)
+                    <= ChronoDuration::seconds(60);
+            ManagedDevice {
+                enrollment,
+                availability: if fresh { "ready" } else { "stale" }.into(),
+                last_seen_at: Some(device.last_seen_at),
+                position: device.position.as_ref().map(|position| ControlPosition {
+                    current_closed_percent: position.current_closed_percent,
+                    target_closed_percent: position.target_closed_percent,
+                }),
+            }
+        }
         None => ManagedDevice {
             enrollment,
             availability: "not_seen".into(),
