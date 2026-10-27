@@ -385,6 +385,10 @@ impl AppState {
             if let Some(position) = persisted.simulator.position.as_mut() {
                 position.observed_at = persisted.simulator.last_seen_at;
             }
+            persisted.simulator.battery = simulator_battery_telemetry(
+                persisted.simulator_config.battery_state,
+                persisted.simulator.last_seen_at,
+            );
         }
         *guard = persisted;
         self.persist(&guard)
@@ -783,10 +787,10 @@ impl Default for SimulatorConfig {
     fn default() -> Self {
         Self {
             scenario: SimulatorScenario::Normal,
-            wireless_profile: WirelessProfile::Standard,
-            battery_state: BatteryState::Unsupported,
-            connection_delay_ms: 0,
-            write_response_delay_ms: 0,
+            wireless_profile: WirelessProfile::HallwayObserved,
+            battery_state: BatteryState::Unavailable,
+            connection_delay_ms: 80,
+            write_response_delay_ms: 72,
             telemetry_paused: false,
         }
     }
@@ -1193,9 +1197,11 @@ async fn set_simulator_scenario(
             WirelessProfile::HallwayObserved => (80, 72),
             WirelessProfile::HallwaySlowLink => (702, 72),
         };
+        inner.simulator.rssi_dbm = simulator_rssi(profile, Utc::now());
     }
     if let Some(battery_state) = request.battery_state {
         inner.simulator_config.battery_state = battery_state;
+        inner.simulator.battery = simulator_battery_telemetry(battery_state, Utc::now());
     }
     if state.persist(&inner).await.is_err() {
         return error_response(
@@ -1223,7 +1229,7 @@ async fn reset_simulator(
             "The simulator is disabled.",
         );
     }
-    let position = request.position_closed_percent.unwrap_or(50);
+    let position = request.position_closed_percent.unwrap_or(100);
     if position > 100 {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -1823,34 +1829,28 @@ fn read_history(path: &Path) -> io::Result<Vec<HistoryObservation>> {
 }
 
 fn make_simulated_device(now: DateTime<Utc>) -> Device {
-    let name = "Somaris Simulated Blind".to_owned();
+    let name = "Hallway Blinds0".to_owned();
+    let payload = simulated_manufacturer_payload(100, 100);
+    let mut manufacturer_data = SOMA_MANUFACTURER_ID.to_le_bytes().to_vec();
+    manufacturer_data.extend_from_slice(&payload);
     Device {
         id: SIMULATOR_ID.to_owned(),
         logical_id: Some(logical_id_for_name(&name, "simulator")),
         observed_address: Some("simulator://blind-1".to_owned()),
         adapter_device_id: "simulator://blind-1".to_owned(),
-        device_name: Some(name.clone()),
+        device_name: Some("S".to_owned()),
         advertised_name: name,
-        rssi_dbm: -60,
+        rssi_dbm: -84,
         last_seen_at: now,
         freshness: Freshness::Fresh,
         source: Source::Simulator,
         is_simulated: true,
-        manufacturer_data_hex: String::new(),
-        manufacturer_payload_hex: String::new(),
+        manufacturer_data_hex: hex::encode(manufacturer_data),
+        manufacturer_payload_hex: hex::encode(payload),
         position_status: PositionStatus::Observed,
-        position: Some(position_value(50, 50, now, Source::Simulator)),
+        position: Some(position_value(100, 100, now, Source::Simulator)),
         movement_status: MovementStatus::AtTarget,
-        battery: BatteryTelemetry {
-            status: BatteryStatus::Unsupported,
-            voltage_mv: None,
-            percent_estimate: None,
-            observed_at: None,
-            last_attempt_at: None,
-            error_code: None,
-            failure_stage: None,
-            source: Some(BatterySource::Simulator),
-        },
+        battery: simulator_battery_telemetry(BatteryState::Unavailable, now),
     }
 }
 
@@ -1884,10 +1884,10 @@ fn simulator_status(inner: &Inner) -> SimulatorStatus {
         telemetry_paused: inner.simulator_config.telemetry_paused,
         current_closed_percent: position
             .map(|value| value.current_closed_percent)
-            .unwrap_or(50),
+            .unwrap_or(100),
         target_closed_percent: position
             .map(|value| value.target_closed_percent)
-            .unwrap_or(50),
+            .unwrap_or(100),
     }
 }
 
@@ -1948,25 +1948,87 @@ fn record_history(inner: &mut Inner) -> Result<bool, String> {
 }
 
 fn advance_simulator(inner: &mut Inner, now: DateTime<Utc>) {
-    let Some(position) = inner.simulator.position.as_mut() else {
+    let Some((current, target)) = inner.simulator.position.as_mut().map(|position| {
+        if position.current_closed_percent < position.target_closed_percent {
+            position.current_closed_percent = position
+                .current_closed_percent
+                .saturating_add(1)
+                .min(position.target_closed_percent);
+        } else if position.current_closed_percent > position.target_closed_percent {
+            position.current_closed_percent = position
+                .current_closed_percent
+                .saturating_sub(1)
+                .max(position.target_closed_percent);
+        }
+        position.observed_at = now;
+        (
+            position.current_closed_percent,
+            position.target_closed_percent,
+        )
+    }) else {
         return;
     };
-    if position.current_closed_percent < position.target_closed_percent {
-        position.current_closed_percent = position
-            .current_closed_percent
-            .saturating_add(5)
-            .min(position.target_closed_percent);
-    } else if position.current_closed_percent > position.target_closed_percent {
-        position.current_closed_percent = position
-            .current_closed_percent
-            .saturating_sub(5)
-            .max(position.target_closed_percent);
+    inner.simulator.movement_status = movement_status(current, target);
+    inner.simulator.rssi_dbm = simulator_rssi(inner.simulator_config.wireless_profile, now);
+}
+
+fn simulator_rssi(profile: WirelessProfile, now: DateTime<Utc>) -> i16 {
+    const HALLWAY_RSSI_SAMPLES: [i16; 26] = [
+        -82, -85, -87, -71, -83, -67, -67, -90, -85, -85, -86, -85, -88, -85, -87, -86, -83,
+        -83, -83, -82, -84, -84, -84, -85, -84, -82,
+    ];
+    match profile {
+        WirelessProfile::Standard => -60,
+        WirelessProfile::HallwayObserved | WirelessProfile::HallwaySlowLink => {
+            let index = now.timestamp().rem_euclid(HALLWAY_RSSI_SAMPLES.len() as i64) as usize;
+            HALLWAY_RSSI_SAMPLES[index]
+        }
     }
-    position.observed_at = now;
-    inner.simulator.movement_status = movement_status(
-        position.current_closed_percent,
-        position.target_closed_percent,
-    );
+}
+
+fn simulated_manufacturer_payload(
+    current_closed_percent: u8,
+    target_closed_percent: u8,
+) -> Vec<u8> {
+    // Byte 1 is retained as the opaque 0x64 value seen in the live advertisement.
+    let mut payload = vec![0x05, 0x64, current_closed_percent, target_closed_percent];
+    payload.extend_from_slice(b"Hallway Blinds0");
+    payload
+}
+
+fn simulator_battery_telemetry(state: BatteryState, now: DateTime<Utc>) -> BatteryTelemetry {
+    match state {
+        BatteryState::Unsupported => BatteryTelemetry {
+            status: BatteryStatus::Unsupported,
+            voltage_mv: None,
+            percent_estimate: None,
+            observed_at: None,
+            last_attempt_at: None,
+            error_code: None,
+            failure_stage: None,
+            source: Some(BatterySource::Simulator),
+        },
+        BatteryState::Unavailable => BatteryTelemetry {
+            status: BatteryStatus::Unavailable,
+            voltage_mv: Some(4210),
+            percent_estimate: Some(100),
+            observed_at: Some(now - ChronoDuration::minutes(40)),
+            last_attempt_at: Some(now - ChronoDuration::minutes(10)),
+            error_code: Some("device_disconnected_during_service_resolution".into()),
+            failure_stage: Some("service_resolution".into()),
+            source: Some(BatterySource::Simulator),
+        },
+        BatteryState::ObservedSample => BatteryTelemetry {
+            status: BatteryStatus::Observed,
+            voltage_mv: Some(4230),
+            percent_estimate: Some(100),
+            observed_at: Some(now),
+            last_attempt_at: Some(now),
+            error_code: None,
+            failure_stage: None,
+            source: Some(BatterySource::Simulator),
+        },
+    }
 }
 
 fn prune_registry(inner: &mut Inner, now: DateTime<Utc>) {
@@ -2011,38 +2073,21 @@ fn ble_failure_code(failure: &BleFailure) -> &'static str {
 
 fn device_snapshot(inner: &Inner) -> Device {
     let mut device = inner.simulator.clone();
-    device.battery = match inner.simulator_config.battery_state {
-        BatteryState::Unsupported => BatteryTelemetry {
-            status: BatteryStatus::Unsupported,
-            voltage_mv: None,
-            percent_estimate: None,
-            observed_at: None,
-            last_attempt_at: None,
-            error_code: None,
-            failure_stage: None,
-            source: Some(BatterySource::Simulator),
-        },
-        BatteryState::Unavailable => BatteryTelemetry {
-            status: BatteryStatus::Unavailable,
-            voltage_mv: None,
-            percent_estimate: None,
-            observed_at: None,
-            last_attempt_at: Some(device.last_seen_at),
-            error_code: Some("simulated_unavailable".into()),
-            failure_stage: Some("battery_read".into()),
-            source: Some(BatterySource::Simulator),
-        },
-        BatteryState::ObservedSample => BatteryTelemetry {
-            status: BatteryStatus::Observed,
-            voltage_mv: Some(4230),
-            percent_estimate: Some(100),
-            observed_at: Some(device.last_seen_at),
-            last_attempt_at: Some(device.last_seen_at),
-            error_code: None,
-            failure_stage: None,
-            source: Some(BatterySource::Simulator),
-        },
-    };
+    let (current, target) = device
+        .position
+        .as_ref()
+        .map(|position| {
+            (
+                position.current_closed_percent,
+                position.target_closed_percent,
+            )
+        })
+        .unwrap_or((100, 100));
+    let payload = simulated_manufacturer_payload(current, target);
+    let mut manufacturer_data = SOMA_MANUFACTURER_ID.to_le_bytes().to_vec();
+    manufacturer_data.extend_from_slice(&payload);
+    device.manufacturer_data_hex = hex::encode(manufacturer_data);
+    device.manufacturer_payload_hex = hex::encode(payload);
     device
 }
 

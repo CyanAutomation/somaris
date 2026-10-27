@@ -1674,7 +1674,7 @@
               "hallway_observed",
               "hallway_slow_link"
             ],
-            "description": "standard has no transport delay and fixed synthetic RSSI. hallway_observed uses 80 ms connection and 72 ms write-response delays; hallway_slow_link uses the 702 ms maximum seen in six HCI connection samples. Both Hallway profiles use deterministic synthetic host-observation intervals and RSSI based on capture summaries, not an OTA advertising timer."
+            "description": "The default hallway_observed profile uses the observed 80 ms connection and 72 ms write-response delays, one simulated position update per second (about 100 seconds for full travel), and capture-informed synthetic RSSI samples. hallway_slow_link uses the 702 ms maximum seen in six HCI connection samples and the same RSSI samples. standard has no transport delay and fixed -60 dBm synthetic RSSI."
           },
           "battery_state": {
             "type": "string",
@@ -1683,7 +1683,7 @@
               "unavailable",
               "observed_sample"
             ],
-            "description": "observed_sample replays one synthetic 4230 mV Hallway BA71 read, with a 100% estimate from an uncalibrated community curve."
+            "description": "The default unavailable state retains a synthetic 4210 mV, 100% last-good sample and reports a later service-resolution failure, matching the observed Hallway cache. observed_sample replays a synthetic 4230 mV Hallway BA71 read, with a 100% estimate from an uncalibrated community curve."
           },
           "connection_delay_ms": {
             "type": "integer",
@@ -1764,8 +1764,8 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 100,
-            "default": 50,
-            "description": "Reset current and target positions to this value; 0 is open and 100 is closed."
+            "default": 100,
+            "description": "Reset current and target positions to this value; 0 is open and 100 is closed. The default is the observed Hallway starting position, fully closed."
           }
         }
       },
