@@ -11,6 +11,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    if env::args().nth(1).as_deref() == Some("mcp") {
+        somaris::mcp::run().await?;
+        return Ok(());
+    }
+
     let address: SocketAddr = env::var("SOMARIS_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:8080".to_owned())
         .parse()?;

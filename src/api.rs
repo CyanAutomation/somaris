@@ -42,6 +42,75 @@ use url::Url;
 use uuid::Uuid;
 
 const OPENAPI_JSON: &str = include_str!("../openapi.json");
+const DOCS_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Somaris API reference</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { margin: 0 auto; max-width: 960px; padding: 2rem 1.25rem; }
+    h1 { margin-bottom: .25rem; }
+    nav { margin: 1rem 0 2rem; }
+    a { color: #1683d8; }
+    .operation { border-top: 1px solid #8886; padding: 1rem 0; }
+    .method { display: inline-block; min-width: 4.5rem; font-weight: 700; }
+    code { overflow-wrap: anywhere; }
+    .description { margin: .5rem 0 0 5rem; white-space: pre-wrap; }
+    #status { color: #a33; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>OpenAPI reference</h1>
+    <p>Somaris API operations and descriptions.</p>
+    <nav><a href="/openapi.json">OpenAPI JSON</a> · <a href="/openapi.yaml">OpenAPI YAML</a></nav>
+  </header>
+  <p id="status" role="status"></p>
+  <main id="operations"></main>
+  <script>
+    const methods = ["get", "post", "put", "patch", "delete"];
+    fetch("/openapi.json")
+      .then(response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      })
+      .then(spec => {
+        document.title = `${spec.info.title} reference`;
+        document.querySelector("h1").textContent = `${spec.info.title} reference`;
+        const root = document.querySelector("#operations");
+        for (const [path, pathItem] of Object.entries(spec.paths)) {
+          for (const method of methods) {
+            const operation = pathItem[method];
+            if (!operation) continue;
+            const row = document.createElement("section");
+            row.className = "operation";
+            const heading = document.createElement("div");
+            const verb = document.createElement("span");
+            verb.className = "method";
+            verb.textContent = method.toUpperCase();
+            const route = document.createElement("code");
+            route.textContent = path;
+            heading.append(verb, route);
+            row.append(heading);
+            if (operation.summary || operation.description) {
+              const description = document.createElement("p");
+              description.className = "description";
+              description.textContent = operation.summary || operation.description;
+              row.append(description);
+            }
+            root.append(row);
+          }
+        }
+      })
+      .catch(error => {
+        document.querySelector("#status").textContent = `Could not load the OpenAPI document: ${error.message}`;
+      });
+  </script>
+</body>
+</html>
+"##;
 const SIMULATOR_ID: &str = "simulator-1";
 const MAX_COMMANDS: usize = 1000;
 const MAX_BATCHES: usize = 1000;
@@ -918,6 +987,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/openapi.json", get(openapi_json))
         .route("/openapi.yaml", get(openapi_yaml))
+        .route("/docs", get(api_docs))
         .with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
@@ -985,6 +1055,13 @@ async fn openapi_json() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
         OPENAPI_JSON,
+    )
+}
+
+async fn api_docs() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        DOCS_HTML,
     )
 }
 
@@ -1179,10 +1256,14 @@ async fn get_history(
         .last()
         .map(|record| record.cursor)
         .unwrap_or(query.after.unwrap_or(0));
-    let has_more = inner
-        .history
-        .iter()
-        .any(|record| record.cursor > next_cursor);
+    let has_more = inner.history.iter().any(|record| {
+        record.cursor > next_cursor
+            && since.is_none_or(|since| record.observed_at >= since)
+            && query
+                .device_id
+                .as_deref()
+                .is_none_or(|id| id == record.device_id || record.logical_id.as_deref() == Some(id))
+    });
     let data = HistoryData {
         data: records.clone(),
         meta: HistoryMeta {
@@ -1827,14 +1908,18 @@ fn conditional_json<T: Serialize, R: Serialize>(
     response_value: R,
 ) -> Response {
     let serialized = serde_json::to_vec(&etag_value).unwrap_or_default();
-    let etag = format!("\"{}\"", hex::encode(Sha256::digest(serialized)));
+    // The response envelope includes a fresh generated_at timestamp, while the
+    // validator covers only semantic data. It is therefore a weak validator.
+    let opaque_etag = format!("\"{}\"", hex::encode(Sha256::digest(serialized)));
+    let etag = format!("W/{opaque_etag}");
     let matches = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|candidate| candidate.trim() == etag || candidate.trim() == "*")
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == opaque_etag
+            })
         });
     if matches {
         return Response::builder()

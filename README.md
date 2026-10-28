@@ -18,7 +18,15 @@ Set `SOMARIS_ALLOWED_ORIGINS` to a comma-separated list of exact HTTP or HTTPS o
 
 ## API
 
-The machine-readable contract is served at `/openapi.json` and `/openapi.yaml`. Control requests require an `Idempotency-Key`; command acceptance is asynchronous, so clients poll the returned command resource. A write acknowledgement does not confirm that a physical blind moved.
+The HTML API reference is available at `/docs`; the machine-readable contract is served at `/openapi.json` and `/openapi.yaml`. Control requests require an `Idempotency-Key`; command acceptance is asynchronous, so clients poll the returned command resource. A write acknowledgement does not confirm that a physical blind moved.
+
+### MCP
+
+Somaris also provides a local stdio MCP server. Keep the HTTP service running, then configure an MCP client to launch `somaris mcp`. The MCP process forwards tool calls to the HTTP service, so it shares its device observations, queue, and persistent journal without starting a second Bluetooth scanner. `SOMARIS_API_URL` selects the API base URL and defaults to `http://127.0.0.1:8080`; it can point to another Somaris service on a trusted LAN.
+
+The MCP tools expose health, readiness, device discovery, telemetry history, enrollment, open/close/stop/toggle commands, batch commands, and command status. The `somaris://api/openapi.json` resource provides the live machine-readable HTTP contract. Mutating control tools require a caller-provided idempotency key. Commands return asynchronously; use the returned command or batch ID with the corresponding status tool. A write reported as possibly sent must be checked against telemetry before retrying. Simulator configuration is intentionally not exposed through MCP.
+
+The control API and MCP tools do not authenticate callers. This deployment is intended for a trusted LAN; keep the service behind the network boundary you trust. CORS does not authenticate MCP or HTTP clients.
 
 ## Container image
 

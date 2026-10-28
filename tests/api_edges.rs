@@ -275,6 +275,60 @@ async fn history_can_be_enabled_and_paged_from_a_persistent_file() {
 }
 
 #[tokio::test]
+async fn filtered_history_does_not_advertise_an_empty_next_page() {
+    let directory = tempfile::tempdir().unwrap();
+    let history_path = directory.path().join("history.jsonl");
+    let app = router(AppState::with_history_path(&history_path));
+    let (status, _, _) = request(
+        &app,
+        Method::POST,
+        "/api/dev/simulator/reset",
+        &[],
+        Some(json!({"position_closed_percent": 0})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, page) = request(
+        &app,
+        Method::GET,
+        "/api/v1/history?after=0&limit=1&device_id=not-a-device",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let page = page.unwrap();
+    assert_eq!(page["data"], json!([]));
+    assert_eq!(page["meta"]["has_more"], false);
+    assert_eq!(page["meta"]["next_cursor"], 0);
+}
+
+#[tokio::test]
+async fn conditional_get_accepts_weak_form_of_its_etag() {
+    let app = router(AppState::new());
+    let (status, headers, _) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = headers.get(header::ETAG).unwrap().to_str().unwrap();
+    assert!(etag.starts_with("W/"));
+    let weak_etag = if etag.starts_with("W/") {
+        etag.to_owned()
+    } else {
+        format!("W/{etag}")
+    };
+
+    let (status, _, _) = request(
+        &app,
+        Method::GET,
+        "/api/v1/devices",
+        &[("if-none-match", &weak_etag)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
 async fn simulator_profiles_drive_battery_and_wireless_snapshots() {
     let app = router(AppState::new());
     let (status, _, _) = request(
@@ -371,6 +425,28 @@ async fn openapi_yaml_and_options_are_available() {
 
     let (status, _, _) = request(&app, Method::OPTIONS, "/api/control/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn docs_page_renders_the_openapi_contract_without_external_assets() {
+    let app = router(AppState::new());
+    let (status, headers, body) = request(&app, Method::GET, "/docs", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("text/html")
+    );
+    let html = body.unwrap().as_str().unwrap().to_owned();
+    assert!(html.contains("OpenAPI reference"));
+    assert!(html.contains("fetch(\"/openapi.json\")"));
+    assert!(html.contains("/openapi.yaml"));
+    assert!(!html.contains("swagger"));
+    assert!(!html.contains("https://"));
+    assert!(html.contains("/openapi.json"));
 }
 
 #[tokio::test]
