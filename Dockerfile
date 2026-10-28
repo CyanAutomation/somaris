@@ -1,4 +1,5 @@
-FROM rust:1-bookworm AS builder
+# Keep these official-image digests updated with reviewed base-image releases.
+FROM rust:1-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c AS builder
 
 WORKDIR /build
 
@@ -21,7 +22,7 @@ COPY src ./src
 
 RUN cargo build --locked --release --bin somaris
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates libdbus-1-3 \

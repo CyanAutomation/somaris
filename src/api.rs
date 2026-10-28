@@ -1,7 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
@@ -9,6 +9,9 @@ use std::{
     },
     time::Instant,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{
     ble::{
@@ -118,6 +121,7 @@ const DOCS_HTML: &str = r##"<!doctype html>
 const SIMULATOR_ID: &str = "simulator-1";
 const MAX_COMMANDS: usize = 1000;
 const MAX_BATCHES: usize = 1000;
+const MAX_DISCOVERED_DEVICES: usize = 1024;
 const SCAN_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,7 +279,7 @@ struct Inner {
     command_idempotency: HashMap<String, String>,
     batches: HashMap<String, Batch>,
     batch_idempotency: HashMap<String, String>,
-    history: Vec<HistoryObservation>,
+    history: VecDeque<HistoryObservation>,
     #[serde(skip)]
     latest_history_by_device: HashMap<String, HistoryObservation>,
     next_cursor: u64,
@@ -339,10 +343,10 @@ impl ScannerCounters {
 }
 
 impl AppState {
-    fn pending_history(&self, history: &[HistoryObservation]) -> Vec<HistoryObservation> {
+    fn pending_history(&self, history: &VecDeque<HistoryObservation>) -> Vec<HistoryObservation> {
         let cursor = self.history_persisted_cursor.load(Ordering::Acquire);
         let first = history.partition_point(|record| record.cursor <= cursor);
-        history[first..].to_vec()
+        history.iter().skip(first).cloned().collect()
     }
 
     pub fn new() -> Self {
@@ -425,17 +429,17 @@ impl AppState {
             command_idempotency: HashMap::new(),
             batches: HashMap::new(),
             batch_idempotency: HashMap::new(),
-            history: Vec::new(),
+            history: VecDeque::new(),
             latest_history_by_device: HashMap::new(),
             next_cursor: 1,
             scanner: ScannerCounters::unavailable(),
             devices: HashMap::new(),
         };
         if let Some(path) = &history_path {
-            inner.history = read_history(path).unwrap_or_default();
+            inner.history = read_history(path).unwrap_or_default().into();
             inner.next_cursor = inner
                 .history
-                .last()
+                .back()
                 .map(|record| record.cursor.saturating_add(1))
                 .unwrap_or(1);
         }
@@ -444,7 +448,7 @@ impl AppState {
             .iter()
             .map(|record| (record.device_id.clone(), record.clone()))
             .collect();
-        let history_persisted_cursor = inner.history.last().map_or(0, |record| record.cursor);
+        let history_persisted_cursor = inner.history.back().map_or(0, |record| record.cursor);
         let history_persisted_count = inner.history.len();
         let queue_config = QueueConfig::default();
         Self {
@@ -473,7 +477,9 @@ impl AppState {
         if !path.exists() {
             return Ok(());
         }
-        let content = fs::read(path)?;
+        let mut file = open_private_file(path, false)?;
+        let mut content = Vec::new();
+        file.read_to_end(&mut content)?;
         let mut persisted: Inner = serde_json::from_slice(&content)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let now = Utc::now();
@@ -523,14 +529,14 @@ impl AppState {
             .last()
             .map(|record| record.cursor.saturating_add(1))
             .unwrap_or(1);
-        inner.history = history;
+        inner.history = history.into();
         inner.latest_history_by_device = inner
             .history
             .iter()
             .map(|record| (record.device_id.clone(), record.clone()))
             .collect();
         self.history_persisted_cursor.store(
-            inner.history.last().map_or(0, |record| record.cursor),
+            inner.history.back().map_or(0, |record| record.cursor),
             Ordering::Release,
         );
         self.history_persisted_count
@@ -803,9 +809,52 @@ impl AppState {
         let persisted_history = {
             let mut inner = self.inner.lock().await;
             inner.scanner.advertisements_seen = inner.scanner.advertisements_seen.saturating_add(1);
-            inner.scanner.observations_stored = inner.scanner.observations_stored.saturating_add(1);
             inner.scanner.last_advertisement_at = Some(now);
-            let previous = inner.devices.get(&observation.peripheral_id).cloned();
+            prune_registry(&mut inner, now);
+            let mut rebound_device = None;
+            if !inner.devices.contains_key(&observation.peripheral_id)
+                && inner.enrollments.values().any(|enrollment| {
+                    !enrollment.is_simulated && enrollment.logical_id == logical_id
+                })
+            {
+                if inner.devices.values().any(|device| {
+                    device.freshness == Freshness::Fresh
+                        && device.logical_id.as_deref() == Some(logical_id.as_str())
+                }) {
+                    return;
+                }
+                let stale_ids: Vec<_> = inner
+                    .devices
+                    .iter()
+                    .filter(|(_, device)| device.logical_id.as_deref() == Some(logical_id.as_str()))
+                    .map(|(peripheral_id, _)| peripheral_id.clone())
+                    .collect();
+                rebound_device = stale_ids
+                    .iter()
+                    .filter_map(|peripheral_id| inner.devices.get(peripheral_id))
+                    .max_by_key(|device| device.last_seen_at)
+                    .cloned();
+                for peripheral_id in stale_ids {
+                    inner.devices.remove(&peripheral_id);
+                }
+            }
+            if inner.devices.len() >= MAX_DISCOVERED_DEVICES
+                && !inner.devices.contains_key(&observation.peripheral_id)
+            {
+                let Some(evicted_ids) = oldest_evictable_devices(&inner, logical_id.as_str())
+                else {
+                    return;
+                };
+                for evicted_id in evicted_ids {
+                    inner.devices.remove(&evicted_id);
+                }
+            }
+            inner.scanner.observations_stored = inner.scanner.observations_stored.saturating_add(1);
+            let previous = inner
+                .devices
+                .get(&observation.peripheral_id)
+                .cloned()
+                .or(rebound_device);
             let id = previous
                 .as_ref()
                 .map(|device| device.id.clone())
@@ -850,9 +899,14 @@ impl AppState {
                 ),
                 battery,
             };
+            let mut history_changed = record_history_for_device(&mut inner, &device);
             inner.devices.insert(observation.peripheral_id, device);
-            prune_registry(&mut inner, now);
-            if record_history(&mut inner).unwrap_or(false) {
+            if inner.simulator_enabled {
+                let simulator = device_snapshot(&inner);
+                history_changed |= record_history_for_device(&mut inner, &simulator);
+            }
+            prune_history(&mut inner);
+            if history_changed {
                 let revision = self.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
                 Some((self.pending_history(&inner.history), revision))
             } else {
@@ -1361,15 +1415,17 @@ async fn get_history(
     let inner = state.inner.lock().await;
     let latest_cursor = inner
         .history
-        .last()
+        .back()
         .map(|record| record.cursor)
         .unwrap_or(0);
     let after = query.after.unwrap_or(0);
     let first = inner
         .history
         .partition_point(|record| record.cursor <= after);
-    let records: Vec<_> = inner.history[first..]
+    let records: Vec<_> = inner
+        .history
         .iter()
+        .skip(first)
         .filter(|record| since.is_none_or(|since| record.observed_at >= since))
         .filter(|record| {
             query
@@ -1387,7 +1443,7 @@ async fn get_history(
     let more_start = inner
         .history
         .partition_point(|record| record.cursor <= next_cursor);
-    let has_more = inner.history[more_start..].iter().any(|record| {
+    let has_more = inner.history.iter().skip(more_start).any(|record| {
         since.is_none_or(|since| record.observed_at >= since)
             && query
                 .device_id
@@ -2107,16 +2163,29 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let mut temporary = path.as_os_str().to_owned();
-    temporary.push(".tmp");
+    temporary.push(format!(".{}.tmp", Uuid::new_v4()));
     let temporary = PathBuf::from(temporary);
-    let mut file = fs::File::create(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(temporary, path)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
-    fs::File::open(parent)?.sync_all()?;
-    Ok(())
+    options.mode(0o600);
+    let mut file = options.open(&temporary)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn append_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -2127,10 +2196,15 @@ fn append_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::create_dir_all(parent)?;
     let existed = path.exists();
     {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW);
+        let mut file = options.open(path)?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(bytes)?;
         file.sync_data()?;
     }
@@ -2140,18 +2214,34 @@ fn append_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn open_private_file(path: &Path, write: bool) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(write);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "persistent state paths must point to regular files",
+        ));
+    }
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
 fn read_history(path: &Path) -> io::Result<Vec<HistoryObservation>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let mut content = fs::read_to_string(path)?;
+    let mut file = open_private_file(path, true)?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
     if !content.is_empty() && !content.ends_with('\n') {
         let valid_len = content.rfind('\n').map_or(0, |index| index + 1);
         content.truncate(valid_len);
-        fs::OpenOptions::new()
-            .write(true)
-            .open(path)?
-            .set_len(valid_len as u64)?;
+        file.set_len(valid_len as u64)?;
     }
     content
         .lines()
@@ -2233,74 +2323,71 @@ fn record_history(inner: &mut Inner) -> Result<bool, String> {
     }
     let mut changed = false;
     for device in devices {
-        let current_position = device.position.as_ref().map(|position| {
+        changed |= record_history_for_device(inner, &device);
+    }
+    prune_history(inner);
+    Ok(changed)
+}
+
+fn record_history_for_device(inner: &mut Inner, device: &Device) -> bool {
+    let current_position = device.position.as_ref().map(|position| {
+        (
+            position.current_closed_percent,
+            position.target_closed_percent,
+        )
+    });
+    let latest = inner.latest_history_by_device.get(&device.id);
+    let same_position = latest.is_some_and(|last| {
+        last.position.as_ref().map(|position| {
             (
                 position.current_closed_percent,
                 position.target_closed_percent,
             )
-        });
-        let latest = inner.latest_history_by_device.get(&device.id);
-        let same_position = latest.is_some_and(|last| {
-            last.position.as_ref().map(|position| {
-                (
-                    position.current_closed_percent,
-                    position.target_closed_percent,
-                )
-            }) == current_position
-        });
-        if same_position
-            && latest.is_some_and(|last| {
-                device.last_seen_at.signed_duration_since(last.observed_at)
-                    < ChronoDuration::seconds(5)
-            })
-        {
-            continue;
-        }
-        inner.history.push(HistoryObservation {
-            cursor: inner.next_cursor,
-            device_id: device.id,
-            logical_id: device.logical_id,
-            observed_at: device.last_seen_at,
-            rssi_dbm: device.rssi_dbm,
-            position_status: device.position_status,
-            position: device.position.map(|position| HistoryPosition {
-                current_closed_percent: position.current_closed_percent,
-                target_closed_percent: position.target_closed_percent,
-            }),
-        });
-        if let Some(record) = inner.history.last() {
-            inner
-                .latest_history_by_device
-                .insert(record.device_id.clone(), record.clone());
-        }
-        inner.next_cursor = inner.next_cursor.saturating_add(1);
-        changed = true;
+        }) == current_position
+    });
+    if same_position
+        && latest.is_some_and(|last| {
+            device.last_seen_at.signed_duration_since(last.observed_at) < ChronoDuration::seconds(5)
+        })
+    {
+        return false;
     }
+    let record = HistoryObservation {
+        cursor: inner.next_cursor,
+        device_id: device.id.clone(),
+        logical_id: device.logical_id.clone(),
+        observed_at: device.last_seen_at,
+        rssi_dbm: device.rssi_dbm,
+        position_status: device.position_status,
+        position: device.position.as_ref().map(|position| HistoryPosition {
+            current_closed_percent: position.current_closed_percent,
+            target_closed_percent: position.target_closed_percent,
+        }),
+    };
+    inner.history.push_back(record.clone());
+    inner
+        .latest_history_by_device
+        .insert(record.device_id.clone(), record);
+    inner.next_cursor = inner.next_cursor.saturating_add(1);
+    true
+}
+
+fn prune_history(inner: &mut Inner) {
     if inner.history.len() > 50_000 {
         let remove = inner.history.len() - 50_000;
-        let removed: Vec<_> = inner.history.drain(0..remove).collect();
-        for record in removed {
+        for _ in 0..remove {
+            let Some(record) = inner.history.pop_front() else {
+                break;
+            };
             if inner
                 .latest_history_by_device
                 .get(&record.device_id)
                 .is_some_and(|latest| latest.cursor == record.cursor)
             {
-                if let Some(latest) = inner
-                    .history
-                    .iter()
-                    .rev()
-                    .find(|candidate| candidate.device_id == record.device_id)
-                {
-                    inner
-                        .latest_history_by_device
-                        .insert(record.device_id, latest.clone());
-                } else {
-                    inner.latest_history_by_device.remove(&record.device_id);
-                }
+                inner.latest_history_by_device.remove(&record.device_id);
             }
         }
     }
-    Ok(changed)
 }
 
 fn advance_simulator(inner: &mut Inner, now: DateTime<Utc>) {
@@ -2404,6 +2491,79 @@ fn prune_registry(inner: &mut Inner, now: DateTime<Utc>) {
             true
         }
     });
+}
+
+fn oldest_evictable_devices(inner: &Inner, incoming_logical_id: &str) -> Option<Vec<String>> {
+    let mut fresh_device_counts = HashMap::new();
+    for device in inner
+        .devices
+        .values()
+        .filter(|device| device.freshness == Freshness::Fresh)
+    {
+        if let Some(logical_id) = device.logical_id.as_deref() {
+            *fresh_device_counts.entry(logical_id).or_insert(0usize) += 1;
+        }
+    }
+    let enrolled_logical_ids: HashSet<_> = inner
+        .enrollments
+        .values()
+        .filter(|enrollment| !enrollment.is_simulated)
+        .map(|enrollment| enrollment.logical_id.as_str())
+        .collect();
+
+    let safe_candidate = inner
+        .devices
+        .iter()
+        .filter(|(_, device)| {
+            let Some(logical_id) = device.logical_id.as_deref() else {
+                return true;
+            };
+            if enrolled_logical_ids.contains(logical_id) {
+                return false;
+            }
+            if device.freshness != Freshness::Fresh {
+                return true;
+            }
+            logical_id != incoming_logical_id && fresh_device_counts.get(logical_id) == Some(&1)
+        })
+        .min_by_key(|(_, device)| device.last_seen_at)
+        .map(|(peripheral_id, _)| peripheral_id.clone());
+    if let Some(peripheral_id) = safe_candidate {
+        return Some(vec![peripheral_id]);
+    }
+
+    let mut ambiguous_groups: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (peripheral_id, device) in &inner.devices {
+        let Some(logical_id) = device.logical_id.as_deref() else {
+            continue;
+        };
+        if device.freshness == Freshness::Fresh
+            && logical_id != incoming_logical_id
+            && !enrolled_logical_ids.contains(logical_id)
+            && fresh_device_counts
+                .get(logical_id)
+                .is_some_and(|count| *count > 1)
+        {
+            ambiguous_groups
+                .entry(logical_id)
+                .or_default()
+                .push(peripheral_id);
+        }
+    }
+    ambiguous_groups
+        .into_iter()
+        .min_by_key(|(_, peripheral_ids)| {
+            peripheral_ids
+                .iter()
+                .filter_map(|peripheral_id| {
+                    inner
+                        .devices
+                        .get(*peripheral_id)
+                        .map(|device| device.last_seen_at)
+                })
+                .min()
+        })
+        .map(|(_, peripheral_ids)| peripheral_ids.into_iter().map(str::to_owned).collect())
 }
 
 fn logical_id_for_name(name: &str, namespace: &str) -> String {
@@ -3822,5 +3982,491 @@ fn command_status_text(status: CommandStatus) -> &'static str {
         CommandStatus::OutcomeUnknown => "outcome_unknown",
         CommandStatus::Expired => "expired",
         CommandStatus::Cancelled => "cancelled",
+    }
+}
+
+#[cfg(test)]
+mod security_hardening_tests {
+    use super::*;
+
+    fn observation(peripheral_id: &str, advertised_name: &str) -> BleObservation {
+        BleObservation {
+            peripheral_id: peripheral_id.to_owned(),
+            observed_address: None,
+            device_name: Some("S".into()),
+            rssi_dbm: -40,
+            manufacturer_payload: simulated_manufacturer_payload(advertised_name, 50, 50),
+        }
+    }
+
+    async fn fill_registry(state: &AppState) {
+        let mut inner = state.inner.lock().await;
+        let now = Utc::now();
+        for index in 0..MAX_DISCOVERED_DEVICES {
+            let key = format!("peripheral-{index}");
+            let mut device = make_simulated_device(now);
+            device.id = format!("device-{index}");
+            device.logical_id = Some(format!("soma-{index}"));
+            device.adapter_device_id = key.clone();
+            device.advertised_name = format!("Blind {index}");
+            device.last_seen_at = now - ChronoDuration::milliseconds(index as i64);
+            inner.devices.insert(key, device);
+        }
+    }
+
+    #[tokio::test]
+    async fn ble_registry_replaces_the_oldest_unambiguous_device_at_capacity() {
+        let state = AppState::new();
+        fill_registry(&state).await;
+
+        state
+            .store_ble_observation(observation("peripheral-overflow", "Overflow blind"))
+            .await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.devices.len(), MAX_DISCOVERED_DEVICES);
+        assert!(inner.devices.contains_key("peripheral-overflow"));
+        assert!(!inner.devices.contains_key("peripheral-1023"));
+    }
+
+    #[tokio::test]
+    async fn ble_registry_preserves_stale_enrolled_devices_at_capacity() {
+        let state = AppState::new();
+        fill_registry(&state).await;
+        {
+            let mut inner = state.inner.lock().await;
+            let stale_enrolled = inner.devices.get_mut("peripheral-1023").unwrap();
+            stale_enrolled.last_seen_at = Utc::now() - ChronoDuration::seconds(61);
+            stale_enrolled.freshness = Freshness::Stale;
+            inner.enrollments.insert(
+                "enrollment-1023".into(),
+                Enrollment {
+                    id: "enrollment-1023".into(),
+                    label: "Blind 1023".into(),
+                    advertised_name: "Blind 1023".into(),
+                    logical_id: "soma-1023".into(),
+                    is_simulated: false,
+                    created_at: Utc::now(),
+                },
+            );
+        }
+
+        state
+            .store_ble_observation(observation("peripheral-overflow", "Overflow blind"))
+            .await;
+
+        let inner = state.inner.lock().await;
+        assert!(inner.devices.contains_key("peripheral-1023"));
+        assert!(inner.devices.contains_key("peripheral-overflow"));
+        assert!(!inner.devices.contains_key("peripheral-1022"));
+    }
+
+    #[tokio::test]
+    async fn ble_registry_rejects_a_new_peripheral_claiming_a_retained_enrolled_identity() {
+        let state = AppState::new();
+        fill_registry(&state).await;
+        let logical_id = logical_id_for_name("Enrolled blind", "soma");
+        {
+            let mut inner = state.inner.lock().await;
+            let existing = inner.devices.get_mut("peripheral-0").unwrap();
+            existing.logical_id = Some(logical_id.clone());
+            existing.advertised_name = "Enrolled blind".into();
+            inner.enrollments.insert(
+                "enrollment-0".into(),
+                Enrollment {
+                    id: "enrollment-0".into(),
+                    label: "Enrolled blind".into(),
+                    advertised_name: "Enrolled blind".into(),
+                    logical_id,
+                    is_simulated: false,
+                    created_at: Utc::now(),
+                },
+            );
+        }
+
+        state
+            .store_ble_observation(observation("peripheral-impersonator", "Enrolled blind"))
+            .await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.devices.len(), MAX_DISCOVERED_DEVICES);
+        assert!(inner.devices.contains_key("peripheral-0"));
+        assert!(!inner.devices.contains_key("peripheral-impersonator"));
+    }
+
+    #[tokio::test]
+    async fn ble_registry_rebinds_a_stale_enrolled_identity_to_a_new_peripheral_id() {
+        let state = AppState::new();
+        fill_registry(&state).await;
+        let logical_id = logical_id_for_name("Enrolled blind", "soma");
+        {
+            let mut inner = state.inner.lock().await;
+            let existing = inner.devices.get_mut("peripheral-0").unwrap();
+            existing.logical_id = Some(logical_id.clone());
+            existing.advertised_name = "Enrolled blind".into();
+            existing.last_seen_at = Utc::now() - ChronoDuration::seconds(61);
+            existing.freshness = Freshness::Stale;
+            existing.is_simulated = false;
+            existing.source = Source::BleAdvertisement;
+            inner.enrollments.insert(
+                "enrollment-0".into(),
+                Enrollment {
+                    id: "enrollment-0".into(),
+                    label: "Enrolled blind".into(),
+                    advertised_name: "Enrolled blind".into(),
+                    logical_id,
+                    is_simulated: false,
+                    created_at: Utc::now(),
+                },
+            );
+        }
+
+        state
+            .store_ble_observation(observation("peripheral-rotated", "Enrolled blind"))
+            .await;
+
+        let inner = state.inner.lock().await;
+        assert!(!inner.devices.contains_key("peripheral-0"));
+        assert!(inner.devices.contains_key("peripheral-rotated"));
+        assert_eq!(
+            physical_target(&inner, "enrollment-0").unwrap().0,
+            "peripheral-rotated"
+        );
+        assert_eq!(
+            managed_device(&inner, inner.enrollments["enrollment-0"].clone()).availability,
+            "ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn ble_registry_rebinds_stale_enrolled_device_when_every_slot_is_enrolled() {
+        let state = AppState::new();
+        fill_registry(&state).await;
+        let target_name = "Blind 1023";
+        let target_logical_id = logical_id_for_name(target_name, "soma");
+        {
+            let mut inner = state.inner.lock().await;
+            for index in 0..MAX_DISCOVERED_DEVICES {
+                let key = format!("peripheral-{index}");
+                let device = &inner.devices[&key];
+                let enrollment = Enrollment {
+                    id: format!("enrollment-{index}"),
+                    label: device.advertised_name.clone(),
+                    advertised_name: device.advertised_name.clone(),
+                    logical_id: device.logical_id.clone().unwrap(),
+                    is_simulated: false,
+                    created_at: Utc::now(),
+                };
+                inner.enrollments.insert(enrollment.id.clone(), enrollment);
+            }
+            let target = inner.devices.get_mut("peripheral-1023").unwrap();
+            target.logical_id = Some(target_logical_id.clone());
+            target.advertised_name = target_name.into();
+            target.last_seen_at = Utc::now() - ChronoDuration::seconds(61);
+            target.freshness = Freshness::Stale;
+            target.is_simulated = false;
+            target.source = Source::BleAdvertisement;
+            let target_enrollment = inner.enrollments.get_mut("enrollment-1023").unwrap();
+            target_enrollment.logical_id = target_logical_id;
+            target_enrollment.advertised_name = target_name.into();
+        }
+
+        state
+            .store_ble_observation(observation("peripheral-rotated", target_name))
+            .await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.devices.len(), MAX_DISCOVERED_DEVICES);
+        assert!(!inner.devices.contains_key("peripheral-1023"));
+        assert!(inner.devices.contains_key("peripheral-rotated"));
+        assert_eq!(
+            physical_target(&inner, "enrollment-1023").unwrap().0,
+            "peripheral-rotated"
+        );
+    }
+
+    #[tokio::test]
+    async fn ble_registry_still_refreshes_known_devices_at_capacity() {
+        let state = AppState::new();
+        fill_registry(&state).await;
+
+        state
+            .store_ble_observation(observation("peripheral-0", "Updated blind"))
+            .await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.devices.len(), MAX_DISCOVERED_DEVICES);
+        assert_eq!(
+            inner.devices["peripheral-0"].advertised_name,
+            "Updated blind"
+        );
+        assert_eq!(inner.history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn ble_registry_keeps_existing_candidates_when_a_new_device_shares_their_name() {
+        let state = AppState::new();
+        fill_registry(&state).await;
+        let logical_id = logical_id_for_name("Shared name", "soma");
+        {
+            let mut inner = state.inner.lock().await;
+            let existing = inner.devices.get_mut("peripheral-0").unwrap();
+            existing.logical_id = Some(logical_id.clone());
+            existing.advertised_name = "Shared name".into();
+        }
+
+        state
+            .store_ble_observation(observation("peripheral-shared", "Shared name"))
+            .await;
+
+        let inner = state.inner.lock().await;
+        assert!(inner.devices.contains_key("peripheral-0"));
+        assert!(inner.devices.contains_key("peripheral-shared"));
+        assert_eq!(
+            inner
+                .devices
+                .values()
+                .filter(|device| device.logical_id.as_deref() == Some(logical_id.as_str()))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn ble_registry_drops_an_unenrolled_ambiguous_group_as_a_unit() {
+        let state = AppState::new();
+        fill_registry(&state).await;
+        {
+            let mut inner = state.inner.lock().await;
+            for device in inner.devices.values_mut() {
+                device.logical_id = Some("soma-ambiguous".into());
+                device.advertised_name = "Ambiguous".into();
+            }
+        }
+
+        state
+            .store_ble_observation(observation("peripheral-overflow", "Overflow blind"))
+            .await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.devices.len(), 1);
+        assert!(inner.devices.contains_key("peripheral-overflow"));
+        assert!(
+            inner
+                .devices
+                .values()
+                .all(|device| device.logical_id.as_deref() != Some("soma-ambiguous"))
+        );
+    }
+
+    #[tokio::test]
+    async fn ble_registry_preserves_enrolled_ambiguous_groups_at_capacity() {
+        let state = AppState::new();
+        fill_registry(&state).await;
+        {
+            let mut inner = state.inner.lock().await;
+            for device in inner.devices.values_mut() {
+                device.logical_id = Some("soma-enrolled-ambiguous".into());
+                device.advertised_name = "Enrolled ambiguous".into();
+            }
+            inner.enrollments.insert(
+                "enrollment-ambiguous".into(),
+                Enrollment {
+                    id: "enrollment-ambiguous".into(),
+                    label: "Enrolled ambiguous".into(),
+                    advertised_name: "Enrolled ambiguous".into(),
+                    logical_id: "soma-enrolled-ambiguous".into(),
+                    is_simulated: false,
+                    created_at: Utc::now(),
+                },
+            );
+        }
+
+        state
+            .store_ble_observation(observation("peripheral-overflow", "Overflow blind"))
+            .await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(inner.devices.len(), MAX_DISCOVERED_DEVICES);
+        assert!(!inner.devices.contains_key("peripheral-overflow"));
+        assert_eq!(
+            inner
+                .devices
+                .values()
+                .filter(|device| {
+                    device.logical_id.as_deref() == Some("soma-enrolled-ambiguous")
+                })
+                .count(),
+            MAX_DISCOVERED_DEVICES
+        );
+    }
+
+    #[tokio::test]
+    async fn history_pruning_preserves_latest_index_for_retained_device_records() {
+        let state = AppState::new();
+        let mut inner = state.inner.lock().await;
+        let now = Utc::now();
+        for cursor in 1..=50_001 {
+            let device_id = if cursor == 50_001 {
+                "device-1".to_string()
+            } else {
+                format!("device-{cursor}")
+            };
+            let record = HistoryObservation {
+                cursor,
+                device_id,
+                logical_id: Some(format!("soma-{cursor}")),
+                observed_at: now - ChronoDuration::seconds(cursor as i64),
+                rssi_dbm: -40,
+                position_status: PositionStatus::Observed,
+                position: None,
+            };
+            inner
+                .latest_history_by_device
+                .insert(record.device_id.clone(), record.clone());
+            inner.history.push_back(record);
+        }
+
+        prune_history(&mut inner);
+
+        assert_eq!(inner.history.len(), 50_000);
+        assert_eq!(inner.history.front().unwrap().cursor, 2);
+        assert_eq!(
+            inner
+                .latest_history_by_device
+                .get("device-1")
+                .map(|record| record.cursor),
+            Some(50_001)
+        );
+        assert!(
+            inner
+                .history
+                .iter()
+                .any(|record| record.device_id == "device-1" && record.cursor == 50_001)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_state_writes_use_private_permissions_and_replace_destination_symlinks() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let sentinel = directory.path().join("sentinel");
+        fs::write(&sentinel, b"keep me private").unwrap();
+        std::os::unix::fs::symlink(&sentinel, &path).unwrap();
+
+        atomic_write(&path, b"state").unwrap();
+
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep me private");
+        assert_eq!(fs::read(&path).unwrap(), b"state");
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
+        assert_eq!(
+            fs::metadata(&path).unwrap().mode() & 0o777,
+            0o600,
+            "state file must only be readable and writable by its owner"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_append_tightens_permissions_of_existing_files() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.jsonl");
+        fs::write(&path, b"old\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        append_and_sync(&path, b"new\n").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"old\nnew\n");
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_read_tightens_permissions_of_existing_files() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.jsonl");
+        fs::write(&path, b"").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(read_history(&path).unwrap().is_empty());
+
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_open_does_not_change_directory_permissions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(open_private_file(&path, false).is_err());
+
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_state_load_does_not_follow_symlink_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let sentinel = directory.path().join("sentinel");
+        let state = AppState::new();
+        let contents = serde_json::to_vec(&*state.inner.lock().await).unwrap();
+        fs::write(&sentinel, &contents).unwrap();
+        std::os::unix::fs::symlink(&sentinel, &path).unwrap();
+        let mut state = state;
+        state.data_path = Some(path.clone());
+
+        assert!(state.load_durable_state().await.is_err());
+
+        assert_eq!(fs::read(&sentinel).unwrap(), contents);
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_append_does_not_follow_symlink_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let sentinel = directory.path().join("sentinel");
+        fs::write(&sentinel, b"keep me private\n").unwrap();
+        std::os::unix::fs::symlink(&sentinel, &path).unwrap();
+
+        assert!(append_and_sync(&path, b"attacker data\n").is_err());
+
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep me private\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn history_repair_does_not_follow_symlink_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.jsonl");
+        let sentinel = directory.path().join("sentinel");
+        fs::write(&sentinel, b"preserve this incomplete journal").unwrap();
+        std::os::unix::fs::symlink(&sentinel, &path).unwrap();
+
+        assert!(read_history(&path).is_err());
+
+        assert_eq!(
+            fs::read(&sentinel).unwrap(),
+            b"preserve this incomplete journal"
+        );
     }
 }
