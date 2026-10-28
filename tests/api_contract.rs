@@ -83,6 +83,16 @@ async fn device_list_uses_closed_percent_and_supports_conditional_reads() {
     assert_eq!(body["meta"]["count"], 1);
     assert_eq!(body["data"][0]["is_simulated"], true);
     assert_eq!(body["data"][0]["position"]["current_closed_percent"], 100);
+    let payload = hex::decode(
+        body["data"][0]["manufacturer_payload_hex"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let advertisement = somaris::ble::parse_soma_payload(&payload).unwrap();
+    assert_eq!(advertisement.advertised_name, "Hallway Blinds0");
+    assert_eq!(advertisement.current_closed_percent, 100);
+    assert_eq!(advertisement.target_closed_percent, 100);
     let etag = headers.get(header::ETAG).unwrap().to_str().unwrap();
 
     let (status, _, _) = request(
@@ -97,7 +107,7 @@ async fn device_list_uses_closed_percent_and_supports_conditional_reads() {
 }
 
 #[tokio::test]
-async fn commands_are_idempotent_and_acknowledgement_updates_simulated_target() {
+async fn commands_are_idempotent_and_acknowledgement_does_not_claim_observed_movement() {
     let app = router(AppState::new());
     let (status, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
@@ -159,60 +169,9 @@ async fn commands_are_idempotent_and_acknowledgement_updates_simulated_target() 
     assert_eq!(final_command["write_state"], "acknowledged");
 
     let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
-    assert_eq!(
-        devices.unwrap()["data"][0]["position"]["target_closed_percent"],
-        0
-    );
-}
-
-#[tokio::test]
-async fn simulator_reports_ack_separately_then_advances_observed_position() {
-    let state = AppState::new();
-    state.spawn_background_tasks();
-    let app = router(state);
-    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
-    let observed_id = devices.unwrap()["data"][0]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let (_, _, enrollment) = request(
-        &app,
-        Method::POST,
-        "/api/control/v1/devices",
-        &[],
-        Some(json!({"observed_device_id": observed_id, "label": "Moving blind"})),
-    )
-    .await;
-    let managed_id = enrollment.unwrap()["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let (status, _, accepted) = request(
-        &app,
-        Method::POST,
-        &format!("/api/control/v1/devices/{managed_id}/commands"),
-        &[("idempotency-key", "open-moving")],
-        Some(json!({"action": "open"})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
-    let command_id = accepted.unwrap()["data"]["id"].as_str().unwrap().to_owned();
-    let command = wait_for_command(&app, &command_id).await;
-    assert_eq!(command["status"], "write_acknowledged");
-
-    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
     let position = &devices.unwrap()["data"][0]["position"];
     assert_eq!(position["target_closed_percent"], 0);
-    let initial_current = position["current_closed_percent"].as_u64().unwrap();
-    assert!(initial_current > 0);
-
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
-    let moved_current = devices.unwrap()["data"][0]["position"]["current_closed_percent"]
-        .as_u64()
-        .unwrap();
-    assert!(moved_current < initial_current);
-    assert!(moved_current > 0);
+    assert_eq!(position["current_closed_percent"], 100);
 }
 
 #[tokio::test]
@@ -271,16 +230,6 @@ async fn history_is_explicitly_unavailable_when_not_configured() {
 }
 
 #[tokio::test]
-async fn api_contract_is_served_with_somaris_branding() {
-    let app = router(AppState::new());
-    let (status, _, body) = request(&app, Method::GET, "/openapi.json", &[], None).await;
-    assert_eq!(status, StatusCode::OK);
-    let body = body.unwrap();
-    assert_eq!(body["info"]["title"], "Somaris API");
-    assert!(body["paths"]["/api/v1/devices"].is_object());
-}
-
-#[tokio::test]
 async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
     let app = router(AppState::new());
     let expected: &[(&str, &[&str])] = &[
@@ -311,6 +260,7 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
     let (status, _, contract) = request(&app, Method::GET, "/openapi.json", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     let contract = contract.unwrap();
+    assert_eq!(contract["info"]["title"], "Somaris API");
 
     for (path, methods) in expected {
         let path_item = &contract["paths"][*path];
@@ -330,15 +280,25 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
                 "options" => Method::OPTIONS,
                 other => panic!("unexpected method in route inventory: {other}"),
             };
-            let (status, headers, _) = request(&app, method, &uri, &[], None).await;
+            let (status, headers, body) = request(&app, method, &uri, &[], None).await;
+            assert_ne!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "documented method was not registered: {method_name} {uri}"
+            );
             let content_type = headers
                 .get(header::CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default();
-            assert!(
-                status != StatusCode::NOT_FOUND || content_type.starts_with("application/json"),
-                "documented route did not resolve: {method_name} {uri}"
-            );
+            if status == StatusCode::NOT_FOUND {
+                assert!(
+                    content_type.contains("application/json")
+                        && body
+                            .as_ref()
+                            .is_some_and(|body| body["error"]["code"].is_string()),
+                    "documented route did not resolve: {method_name} {uri}"
+                );
+            }
         }
     }
 
