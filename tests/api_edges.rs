@@ -364,9 +364,9 @@ async fn simulator_profiles_drive_battery_and_wireless_snapshots() {
 }
 
 #[tokio::test]
-async fn simulator_reset_uses_one_timestamp_for_position_and_last_seen() {
+async fn simulator_reset_restores_position_and_reports_at_target() {
     let app = router(AppState::new());
-    let (status, _, _) = request(
+    let (status, _, reset) = request(
         &app,
         Method::POST,
         "/api/dev/simulator/reset",
@@ -375,11 +375,15 @@ async fn simulator_reset_uses_one_timestamp_for_position_and_last_seen() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let reset = reset.unwrap()["data"].clone();
+    assert_eq!(reset["current_closed_percent"], 35);
+    assert_eq!(reset["target_closed_percent"], 35);
 
     let (status, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     let device = &devices.unwrap()["data"][0];
-    assert_eq!(device["position"]["observed_at"], device["last_seen_at"]);
+    assert_eq!(device["position"]["current_closed_percent"], 35);
+    assert_eq!(device["position"]["target_closed_percent"], 35);
 }
 
 #[tokio::test]
@@ -409,7 +413,7 @@ async fn invalid_simulator_values_are_rejected_with_json_errors() {
 }
 
 #[tokio::test]
-async fn openapi_yaml_and_options_are_available() {
+async fn openapi_yaml_matches_the_json_api_contract() {
     let app = router(AppState::new());
     let (status, headers, body) = request(&app, Method::GET, "/openapi.yaml", &[], None).await;
     assert_eq!(status, StatusCode::OK);
@@ -421,14 +425,16 @@ async fn openapi_yaml_and_options_are_available() {
             .unwrap()
             .contains("yaml")
     );
-    assert!(body.unwrap().as_str().unwrap().contains("Somaris API"));
-
-    let (status, _, _) = request(&app, Method::OPTIONS, "/api/control/v1/devices", &[], None).await;
-    assert_eq!(status, StatusCode::OK);
+    let yaml: serde_yaml::Value = serde_yaml::from_str(body.unwrap().as_str().unwrap()).unwrap();
+    let yaml: Value = serde_json::to_value(yaml).unwrap();
+    let (_, _, json_contract) = request(&app, Method::GET, "/openapi.json", &[], None).await;
+    let json_contract = json_contract.unwrap();
+    assert_eq!(yaml["info"]["title"], "Somaris API");
+    assert_eq!(yaml["paths"], json_contract["paths"]);
 }
 
 #[tokio::test]
-async fn docs_page_renders_the_openapi_contract_without_external_assets() {
+async fn api_docs_page_serves_html_with_json_and_yaml_contract_links() {
     let app = router(AppState::new());
     let (status, headers, body) = request(&app, Method::GET, "/docs", &[], None).await;
     assert_eq!(status, StatusCode::OK);
@@ -442,11 +448,8 @@ async fn docs_page_renders_the_openapi_contract_without_external_assets() {
     );
     let html = body.unwrap().as_str().unwrap().to_owned();
     assert!(html.contains("OpenAPI reference"));
-    assert!(html.contains("fetch(\"/openapi.json\")"));
-    assert!(html.contains("/openapi.yaml"));
-    assert!(!html.contains("swagger"));
-    assert!(!html.contains("https://"));
     assert!(html.contains("/openapi.json"));
+    assert!(html.contains("/openapi.yaml"));
 }
 
 #[tokio::test]

@@ -50,8 +50,8 @@ fn mock_router(requests: Requests) -> Router {
         .with_state(requests)
 }
 
-#[tokio::test]
-async fn client_defaults_to_thirty_seconds_and_validates_tls_by_default() {
+#[test]
+fn client_uses_a_finite_timeout_and_validates_tls_by_default() {
     let client = RemoteApiClient::new("https://example.invalid/api").unwrap();
     assert_eq!(client.options().timeout.as_secs(), 30);
     assert!(client.options().reject_unauthorized);
