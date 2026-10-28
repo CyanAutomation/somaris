@@ -7,7 +7,16 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
+
+# Compile dependencies in a layer keyed only by the manifests. Application
+# source changes then reuse the expensive release dependency build.
+RUN mkdir -p src \
+    && printf 'pub fn dependency_warmup() {}\n' > src/lib.rs \
+    && printf 'fn main() {}\n' > src/main.rs
+RUN cargo build --locked --release --bin somaris
+
 COPY openapi.json ./openapi.json
+RUN rm -rf src
 COPY src ./src
 
 RUN cargo build --locked --release --bin somaris

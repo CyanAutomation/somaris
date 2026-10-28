@@ -236,7 +236,7 @@ async fn batches_are_idempotent_and_report_child_command_results() {
 async fn history_can_be_enabled_and_paged_from_a_persistent_file() {
     let directory = tempfile::tempdir().unwrap();
     let history_path = directory.path().join("history.jsonl");
-    let app = router(AppState::with_history_path(&history_path));
+    let mut app = router(AppState::with_history_path(&history_path));
 
     let (status, _, first_page) = request(
         &app,
@@ -260,6 +260,27 @@ async fn history_can_be_enabled_and_paged_from_a_persistent_file() {
     assert_eq!(status, StatusCode::OK);
     assert!(history_path.exists());
 
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&history_path)
+        .unwrap()
+        .write_all(b"{\"partial\"")
+        .unwrap();
+    app = router(AppState::with_history_path(&history_path));
+
+    for position in [20, 40] {
+        let (status, _, _) = request(
+            &app,
+            Method::POST,
+            "/api/dev/simulator/reset",
+            &[],
+            Some(json!({"position_closed_percent": position})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
     let (status, _, page) = request(
         &app,
         Method::GET,
@@ -272,6 +293,38 @@ async fn history_can_be_enabled_and_paged_from_a_persistent_file() {
     let page = page.unwrap();
     assert_eq!(page["data"][0]["position"]["current_closed_percent"], 0);
     assert_eq!(page["meta"]["next_cursor"], 1);
+    let saved_lines = std::fs::read_to_string(&history_path).unwrap();
+    assert_eq!(saved_lines.lines().count(), 3);
+}
+
+#[tokio::test]
+async fn history_etag_ignores_the_response_generation_timestamp() {
+    let directory = tempfile::tempdir().unwrap();
+    let history_path = directory.path().join("history.jsonl");
+    let app = router(AppState::with_history_path(&history_path));
+    let (status, headers, _) = request(
+        &app,
+        Method::GET,
+        "/api/v1/history?after=0&limit=10",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = headers.get(header::ETAG).unwrap().to_str().unwrap();
+    let (status, headers, _) = request(
+        &app,
+        Method::GET,
+        "/api/v1/history?after=0&limit=10",
+        &[("if-none-match", etag)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-cache"
+    );
 }
 
 #[tokio::test]
@@ -317,7 +370,7 @@ async fn conditional_get_accepts_weak_form_of_its_etag() {
         format!("W/{etag}")
     };
 
-    let (status, _, _) = request(
+    let (status, headers, _) = request(
         &app,
         Method::GET,
         "/api/v1/devices",
@@ -326,6 +379,84 @@ async fn conditional_get_accepts_weak_form_of_its_etag() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-cache"
+    );
+}
+
+#[tokio::test]
+async fn mutable_api_gets_have_explicit_cache_policies_and_command_etags() {
+    let app = router(AppState::new());
+    let (status, headers, _) = request(&app, Method::GET, "/api/v1/health", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+
+    let (status, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let device_id = devices.unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _, enrollment) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": device_id, "label": "Test"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let managed_id = enrollment.unwrap()["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _, command) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "cache-test")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = command.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    let path = format!("/api/control/v1/commands/{command_id}");
+    let (status, headers, _) = request(&app, Method::GET, &path, &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = headers.get(header::ETAG).unwrap().to_str().unwrap();
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-cache"
+    );
+    let (status, headers, _) =
+        request(&app, Method::GET, &path, &[("if-none-match", etag)], None).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "private, no-cache"
+    );
+}
+
+#[tokio::test]
+async fn static_api_documents_are_cacheable() {
+    let app = router(AppState::new());
+    for path in ["/docs", "/openapi.json", "/openapi.yaml"] {
+        let (status, headers, _) = request(&app, Method::GET, path, &[], None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=3600"
+        );
+        let etag = headers.get(header::ETAG).unwrap().to_str().unwrap();
+        let (status, headers, _) =
+            request(&app, Method::GET, path, &[("if-none-match", etag)], None).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=3600"
+        );
+    }
 }
 
 #[tokio::test]

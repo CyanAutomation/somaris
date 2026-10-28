@@ -31,7 +31,20 @@ async fn mock_handler(
     requests
         .lock()
         .await
-        .push((method.clone(), path.clone(), headers, body));
+        .push((method.clone(), path.clone(), headers.clone(), body));
+
+    if method == "GET"
+        && path == "/api/v1/diagnostics"
+        && headers
+            .get("if-none-match")
+            .is_some_and(|value| value == "\"v1\"")
+    {
+        return axum::http::Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("etag", "\"v1\"")
+            .body(Body::empty())
+            .unwrap();
+    }
 
     if method == "DELETE" {
         return (StatusCode::NO_CONTENT, Body::empty()).into_response();
@@ -41,7 +54,16 @@ async fn mock_handler(
     } else {
         json!({"ok": true})
     };
-    Json(response).into_response()
+    if path == "/api/v1/diagnostics" {
+        axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .header("etag", "\"v1\"")
+            .header("content-type", "application/json")
+            .body(Body::from(response.to_string()))
+            .unwrap()
+    } else {
+        Json(response).into_response()
+    }
 }
 
 fn mock_router(requests: Requests) -> Router {
@@ -78,6 +100,20 @@ async fn telemetry_client_uses_documented_v1_paths() {
     assert_eq!(requests[0].1, "/api/v1/devices/Device%20A");
     assert_eq!(requests[1].1, "/api/v1/devices");
     assert_eq!(requests[2].1, "/api/v1/diagnostics");
+}
+
+#[tokio::test]
+async fn telemetry_client_revalidates_cached_etag_responses() {
+    let requests: Requests = Arc::default();
+    let client = test_client(requests.clone()).await;
+    let first = client.get_diagnostics().await.unwrap();
+    let second = client.get_diagnostics().await.unwrap();
+    assert_eq!(first, second);
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].2.get("if-none-match").is_none());
+    assert_eq!(requests[1].2.get("if-none-match").unwrap(), "\"v1\"");
 }
 
 #[tokio::test]
