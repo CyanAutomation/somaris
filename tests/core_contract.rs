@@ -37,6 +37,15 @@ impl CharacteristicReader for MockReader {
     }
 }
 
+struct HangingReader;
+
+#[async_trait]
+impl CharacteristicReader for HangingReader {
+    async fn read_characteristic(&self, _uuid: u16) -> Result<String, String> {
+        std::future::pending().await
+    }
+}
+
 #[test]
 fn controller_wire_positions_and_dashboard_positions_have_explicit_conventions() {
     assert_eq!(open_percent_from_wire_byte(0x00), 0);
@@ -49,7 +58,7 @@ fn controller_wire_positions_and_dashboard_positions_have_explicit_conventions()
 }
 
 #[test]
-fn controller_commands_keep_the_tested_opcodes() {
+fn controller_command_encodings_match_the_device_protocol() {
     assert_eq!(encode_controller_command(ControllerCommand::Open)[0], 0x01);
     assert_eq!(encode_controller_command(ControllerCommand::Close)[0], 0x02);
     assert_eq!(encode_controller_command(ControllerCommand::Stop)[0], 0x03);
@@ -57,7 +66,19 @@ fn controller_commands_keep_the_tested_opcodes() {
         encode_controller_command(ControllerCommand::SetPosition(50)),
         [0x10, 0x80]
     );
+    assert_eq!(
+        encode_service_action(ServiceAction::Open),
+        [0x1a, 0x01, 0x00]
+    );
+    assert_eq!(
+        encode_service_action(ServiceAction::Close),
+        [0x1a, 0x01, 0x64]
+    );
     assert_eq!(encode_service_action(ServiceAction::Stop), [0x00]);
+}
+
+#[test]
+fn controller_commands_use_the_supported_gatt_service_characteristics() {
     assert_eq!(
         OPEN_CLOSE_SERVICE_UUID,
         "00001890-b87f-490c-92cb-11ba5ea5167c"
@@ -71,15 +92,6 @@ fn controller_commands_keep_the_tested_opcodes() {
         STOP_CHARACTERISTIC_UUID,
         "00001530-b87f-490c-92cb-11ba5ea5167c"
     );
-    assert_eq!(
-        encode_service_action(ServiceAction::Open),
-        [0x1a, 0x01, 0x00]
-    );
-    assert_eq!(
-        encode_service_action(ServiceAction::Close),
-        [0x1a, 0x01, 0x64]
-    );
-    assert_eq!(encode_service_action(ServiceAction::Stop), [0x00]);
 }
 
 #[test]
@@ -202,16 +214,22 @@ async fn device_info_reads_are_shared_while_in_flight() {
     assert_eq!(reader.reads.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn device_info_read_timeout_names_the_characteristic() {
+    let timed = DeviceInfo::new(Some(Arc::new(HangingReader)), Duration::from_millis(10));
+    let read = tokio::spawn(async move { timed.get_device_version().await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    let error = read.await.unwrap().unwrap_err();
+    assert!(error.contains("Timed out reading characteristic 0x2a26 after 10ms"));
+}
+
 #[tokio::test]
-async fn device_info_read_timeout_and_controller_metadata_are_explicit() {
+async fn controller_metadata_normalizes_fields_and_reads_missing_firmware_version() {
     let reader = Arc::new(MockReader {
         reads: AtomicUsize::new(0),
-        delay: Duration::from_millis(30),
+        delay: Duration::ZERO,
     });
-    let timed = DeviceInfo::new(Some(reader.clone()), Duration::from_millis(1));
-    let error = timed.get_device_version().await.unwrap_err();
-    assert!(error.contains("Timed out reading characteristic 0x2a26 after 1ms"));
-
     let info = DeviceInfo::new(Some(reader), Duration::from_secs(1));
     let details = info
         .get_controller_info(&json!({
