@@ -20,6 +20,8 @@ Set `SOMARIS_ALLOWED_ORIGINS` to a comma-separated list of exact HTTP or HTTPS o
 
 The HTML API reference is available at `/docs`; the machine-readable contract is served at `/openapi.json` and `/openapi.yaml`. Control requests require an `Idempotency-Key`; command acceptance is asynchronous, so clients poll the returned command resource. A write acknowledgement does not confirm that a physical blind moved.
 
+Live API responses are not stored by shared caches. Conditional reads use private revalidation with ETags, and the built-in HTTP and MCP clients reuse an ETag response when the data has not changed. The static API reference is cacheable for one hour and returns an ETag. When history is enabled, new samples are appended and synced in batches; the retained history is compacted periodically.
+
 ### MCP
 
 Somaris also provides a local stdio MCP server. Keep the HTTP service running, then configure an MCP client to launch `somaris mcp`. The MCP process forwards tool calls to the HTTP service, so it shares its device observations, queue, and persistent journal without starting a second Bluetooth scanner. `SOMARIS_API_URL` selects the API base URL and defaults to `http://127.0.0.1:8080`; it can point to another Somaris service on a trusted LAN.

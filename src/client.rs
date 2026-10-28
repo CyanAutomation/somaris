@@ -1,9 +1,13 @@
-use std::time::Duration;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use reqwest::{Client, Method};
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 use url::Url;
+
+const CONDITIONAL_CACHE_LIMIT: usize = 128;
+type ConditionalCache = Arc<Mutex<HashMap<String, (String, Value)>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientOptions {
@@ -37,6 +41,7 @@ pub struct RemoteApiClient {
     base_url: Url,
     client: Client,
     options: ClientOptions,
+    conditional_cache: ConditionalCache,
 }
 
 impl RemoteApiClient {
@@ -70,6 +75,7 @@ impl RemoteApiClient {
             base_url,
             client,
             options,
+            conditional_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -246,30 +252,80 @@ impl RemoteApiClient {
         request: reqwest::RequestBuilder,
         context: &str,
     ) -> Result<Value, String> {
-        let response = request
-            .send()
+        let mut request = request
+            .build()
+            .map_err(|error| format!("{context}: {error}"))?;
+        let is_get = request.method() == Method::GET;
+        let cache_key = request.url().as_str().to_owned();
+        if is_get
+            && let Some(etag) = self
+                .conditional_cache
+                .lock()
+                .await
+                .get(&cache_key)
+                .map(|(etag, _)| etag.clone())
+        {
+            request.headers_mut().insert(
+                reqwest::header::IF_NONE_MATCH,
+                etag.parse()
+                    .map_err(|error| format!("{context}: {error}"))?,
+            );
+        }
+        let response = self
+            .client
+            .execute(request)
             .await
             .map_err(|error| format!("{context}: {error}"))?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| format!("{context}: {error}"))?;
-        if !status.is_success() {
-            let detail = String::from_utf8_lossy(&bytes);
-            let detail = detail.trim();
-            return Err(if detail.is_empty() {
-                format!("{context}: HTTP {status}")
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return self
+                .conditional_cache
+                .lock()
+                .await
+                .get(&cache_key)
+                .map(|(_, value)| value.clone())
+                .ok_or_else(|| format!("{context}: received 304 without a cached response"));
+        }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let value = parse_response(response, context).await?;
+        if is_get {
+            let mut cache = self.conditional_cache.lock().await;
+            if let Some(etag) = etag {
+                if cache.len() >= CONDITIONAL_CACHE_LIMIT && !cache.contains_key(&cache_key) {
+                    cache.clear();
+                }
+                cache.insert(cache_key, (etag, value.clone()));
             } else {
-                format!("{context}: HTTP {status}: {detail}")
-            });
+                cache.remove(&cache_key);
+            }
         }
-        if bytes.is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_slice(&bytes)
-            .map_err(|error| format!("{context}: invalid JSON response: {error}"))
+        Ok(value)
     }
+}
+
+async fn parse_response(response: reqwest::Response, context: &str) -> Result<Value, String> {
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("{context}: {error}"))?;
+    if !status.is_success() {
+        let detail = String::from_utf8_lossy(&bytes);
+        let detail = detail.trim();
+        return Err(if detail.is_empty() {
+            format!("{context}: HTTP {status}")
+        } else {
+            format!("{context}: HTTP {status}: {detail}")
+        });
+    }
+    if bytes.is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{context}: invalid JSON response: {error}"))
 }
 
 fn append_segment(mut url: Url, segment: &str) -> Result<Url, String> {
