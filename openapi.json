@@ -969,6 +969,24 @@
         }
       }
     },
+    "/docs": {
+      "get": {
+        "operationId": "getApiDocs",
+        "summary": "View the HTML API reference",
+        "responses": {
+          "200": {
+            "description": "A basic HTML listing of the operations in the Somaris OpenAPI contract.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/openapi.json": {
       "get": {
         "operationId": "getOpenApiJson",
