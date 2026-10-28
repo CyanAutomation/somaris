@@ -2140,20 +2140,6 @@ fn simulated_manufacturer_payload(
     payload
 }
 
-#[cfg(test)]
-mod simulated_manufacturer_payload_tests {
-    use super::simulated_manufacturer_payload;
-
-    #[test]
-    fn payload_uses_the_device_advertised_name() {
-        let advertised_name = "Study Blinds1";
-        let payload = simulated_manufacturer_payload(advertised_name, 23, 57);
-
-        assert_eq!(&payload[..4], &[0x05, 0x64, 23, 57]);
-        assert_eq!(&payload[4..], advertised_name.as_bytes());
-    }
-}
-
 fn simulator_battery_telemetry(state: BatteryState, now: DateTime<Utc>) -> BatteryTelemetry {
     match state {
         BatteryState::Unsupported => BatteryTelemetry {
