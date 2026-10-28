@@ -3,7 +3,7 @@
 //! Keeping this adapter as an HTTP client means MCP and HTTP requests use the
 //! same running service, BLE adapter, command queue, and durable journal.
 
-use std::env;
+use std::{collections::HashMap, env, sync::Arc};
 
 use reqwest::{Client, Method};
 use rmcp::{
@@ -20,12 +20,16 @@ use rmcp::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::Mutex;
 use url::Url;
+
+const CONDITIONAL_CACHE_LIMIT: usize = 128;
 
 #[derive(Clone)]
 struct SomarisMcp {
     api_base: String,
     client: Client,
+    conditional_cache: Arc<Mutex<HashMap<String, (String, String)>>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -103,6 +107,7 @@ impl SomarisMcp {
         Self {
             api_base,
             client: Client::new(),
+            conditional_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -136,7 +141,21 @@ impl SomarisMcp {
             Ok(url) => url,
             Err(error) => return error,
         };
+        let is_get = method == Method::GET;
+        let cache_key = url.as_str().to_owned();
         let mut request = self.client.request(method, url);
+        let cached_etag = if is_get {
+            self.conditional_cache
+                .lock()
+                .await
+                .get(&cache_key)
+                .map(|(etag, _)| etag.clone())
+        } else {
+            None
+        };
+        if let Some(etag) = cached_etag {
+            request = request.header("If-None-Match", etag);
+        }
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -146,8 +165,38 @@ impl SomarisMcp {
         match request.send().await {
             Ok(response) => {
                 let status = response.status();
+                if status == reqwest::StatusCode::NOT_MODIFIED {
+                    return self
+                        .conditional_cache
+                        .lock()
+                        .await
+                        .get(&cache_key)
+                        .map(|(_, response)| response.clone())
+                        .unwrap_or_else(|| "HTTP 304 without a cached response".into());
+                }
+                let etag = response
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
                 match response.text().await {
-                    Ok(body) => format!("HTTP {status}\n{body}"),
+                    Ok(body) => {
+                        let value = format!("HTTP {status}\n{body}");
+                        if is_get {
+                            let mut cache = self.conditional_cache.lock().await;
+                            if let Some(etag) = etag {
+                                if cache.len() >= CONDITIONAL_CACHE_LIMIT
+                                    && !cache.contains_key(&cache_key)
+                                {
+                                    cache.clear();
+                                }
+                                cache.insert(cache_key, (etag, value.clone()));
+                            } else {
+                                cache.remove(&cache_key);
+                            }
+                        }
+                        value
+                    }
                     Err(error) => format!("HTTP {status}; could not read response: {error}"),
                 }
             }
@@ -399,12 +448,41 @@ impl ServerHandler for SomarisMcp {
         let url = self
             .url(&["openapi.json"], &[])
             .map_err(|error| rmcp::ErrorData::internal_error(error, None))?;
-        let response = self
-            .client
-            .get(url)
+        let resource_uri = request.uri;
+        let cache_key = url.as_str().to_owned();
+        let cached_etag = self
+            .conditional_cache
+            .lock()
+            .await
+            .get(&cache_key)
+            .map(|(etag, _)| etag.clone());
+        let mut request = self.client.get(url);
+        if let Some(etag) = cached_etag {
+            request = request.header("If-None-Match", etag);
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            let cached = self
+                .conditional_cache
+                .lock()
+                .await
+                .get(&cache_key)
+                .map(|(_, response)| response.clone())
+                .and_then(|response| response.split_once('\n').map(|(_, body)| body.to_owned()))
+                .ok_or_else(|| {
+                    rmcp::ErrorData::internal_error(
+                        "API contract returned 304 without a cached body.",
+                        None,
+                    )
+                })?;
+            return Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(cached, resource_uri).with_mime_type("application/json"),
+            ])
+            .into());
+        }
         if !response.status().is_success() {
             return Err(rmcp::ErrorData::internal_error(
                 format!(
@@ -414,12 +492,24 @@ impl ServerHandler for SomarisMcp {
                 None,
             ));
         }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let text = response
             .text()
             .await
             .map_err(|error| rmcp::ErrorData::internal_error(error.to_string(), None))?;
+        if let Some(etag) = etag {
+            let mut cache = self.conditional_cache.lock().await;
+            if cache.len() >= CONDITIONAL_CACHE_LIMIT && !cache.contains_key(&cache_key) {
+                cache.clear();
+            }
+            cache.insert(cache_key, (etag, format!("HTTP 200\n{text}")));
+        }
         Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(text, request.uri).with_mime_type("application/json"),
+            ResourceContents::text(text, resource_uri).with_mime_type("application/json"),
         ])
         .into())
     }
@@ -437,6 +527,41 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::SomarisMcp;
+    use axum::{
+        Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::Response,
+        routing::get,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::net::TcpListener;
+
+    async fn conditional_handler(
+        State(calls): State<Arc<AtomicUsize>>,
+        headers: HeaderMap,
+    ) -> Response {
+        calls.fetch_add(1, Ordering::SeqCst);
+        if headers
+            .get("if-none-match")
+            .is_some_and(|value| value == "\"v1\"")
+        {
+            return Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("etag", "\"v1\"")
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("etag", "\"v1\"")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"data":{"status":"healthy"}}"#))
+            .unwrap()
+    }
 
     #[test]
     fn api_urls_encode_ids_and_query_values_as_single_components() {
@@ -451,5 +576,39 @@ mod tests {
             url.as_str(),
             "http://localhost:8080/api/control/v1/commands/blind%2Fa%20b?device_id=Hallway+blind"
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_client_revalidates_cached_etag_responses() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/api/v1/diagnostics", get(conditional_handler))
+            .with_state(calls.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mcp = SomarisMcp::new(format!("http://{address}"));
+        let first = mcp
+            .call(
+                reqwest::Method::GET,
+                &["api", "v1", "diagnostics"],
+                &[],
+                None,
+                None,
+            )
+            .await;
+        let second = mcp
+            .call(
+                reqwest::Method::GET,
+                &["api", "v1", "diagnostics"],
+                &[],
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(first, second);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.abort();
     }
 }
