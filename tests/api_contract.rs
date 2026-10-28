@@ -31,7 +31,11 @@ async fn request(
     let status = response.status();
     let headers = response.headers().clone();
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    let value = if bytes.is_empty() {
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("json"));
+    let value = if bytes.is_empty() || !is_json {
         None
     } else {
         Some(serde_json::from_slice(&bytes).unwrap())
@@ -274,6 +278,95 @@ async fn api_contract_is_served_with_somaris_branding() {
     let body = body.unwrap();
     assert_eq!(body["info"]["title"], "Somaris API");
     assert!(body["paths"]["/api/v1/devices"].is_object());
+}
+
+#[tokio::test]
+async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
+    let app = router(AppState::new());
+    let expected: &[(&str, &[&str])] = &[
+        ("/api/v1/health", &["get", "options"]),
+        ("/api/v1/ready", &["get", "options"]),
+        ("/api/v1/diagnostics", &["get", "options"]),
+        ("/api/v1/devices", &["get", "options"]),
+        ("/api/v1/devices/{id}", &["get", "options"]),
+        ("/api/v1/history", &["get", "options"]),
+        ("/api/dev/simulator", &["get", "options"]),
+        ("/api/dev/simulator/scenario", &["put", "options"]),
+        ("/api/dev/simulator/reset", &["post", "options"]),
+        ("/api/control/v1/devices", &["get", "post", "options"]),
+        ("/api/control/v1/devices/{id}", &["delete", "options"]),
+        (
+            "/api/control/v1/devices/{id}/commands",
+            &["post", "options"],
+        ),
+        ("/api/control/v1/devices/{id}/toggle", &["post", "options"]),
+        ("/api/control/v1/batches", &["post", "options"]),
+        ("/api/control/v1/batches/{id}", &["get", "options"]),
+        ("/api/control/v1/queue", &["get", "options"]),
+        ("/api/control/v1/commands/{id}", &["get", "options"]),
+        ("/openapi.json", &["get"]),
+        ("/openapi.yaml", &["get"]),
+        ("/docs", &["get"]),
+    ];
+    let (status, _, contract) = request(&app, Method::GET, "/openapi.json", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let contract = contract.unwrap();
+
+    for (path, methods) in expected {
+        let path_item = &contract["paths"][*path];
+        assert!(path_item.is_object(), "missing OpenAPI path {path}");
+        for method in *methods {
+            assert!(
+                path_item.get(method).is_some(),
+                "missing OpenAPI operation {method} {path}"
+            );
+            let uri = path.replace("{id}", "contract-probe");
+            let method_name = method.to_ascii_uppercase();
+            let method = match *method {
+                "get" => Method::GET,
+                "post" => Method::POST,
+                "put" => Method::PUT,
+                "delete" => Method::DELETE,
+                "options" => Method::OPTIONS,
+                other => panic!("unexpected method in route inventory: {other}"),
+            };
+            let (status, headers, _) = request(&app, method, &uri, &[], None).await;
+            let content_type = headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert!(
+                status != StatusCode::NOT_FOUND || content_type.starts_with("application/json"),
+                "documented route did not resolve: {method_name} {uri}"
+            );
+        }
+    }
+
+    for (path, path_item) in contract["paths"].as_object().unwrap() {
+        let Some((_, expected_methods)) =
+            expected.iter().find(|(known, _)| *known == path.as_str())
+        else {
+            panic!("OpenAPI documents a route missing from the route inventory: {path}");
+        };
+        assert!(path_item.is_object());
+        let mut documented_methods: Vec<_> = path_item
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|key| matches!(key.as_str(), "get" | "post" | "put" | "delete" | "options"))
+            .map(String::as_str)
+            .collect();
+        let mut expected_methods: Vec<_> = expected_methods.to_vec();
+        documented_methods.sort_unstable();
+        expected_methods.sort_unstable();
+        assert_eq!(
+            documented_methods, expected_methods,
+            "method drift on {path}"
+        );
+    }
+
+    let (status, _, _) = request(&app, Method::GET, "/openapi.yaml", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
