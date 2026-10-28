@@ -4,8 +4,8 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -19,7 +19,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{
         Path as RoutePath, Query, State,
         rejection::{JsonRejection, QueryRejection},
@@ -42,6 +42,10 @@ use url::Url;
 use uuid::Uuid;
 
 const OPENAPI_JSON: &str = include_str!("../openapi.json");
+static OPENAPI_JSON_ETAG: OnceLock<String> = OnceLock::new();
+static DOCS_ETAG: OnceLock<String> = OnceLock::new();
+static OPENAPI_YAML: OnceLock<String> = OnceLock::new();
+static OPENAPI_YAML_ETAG: OnceLock<String> = OnceLock::new();
 const DOCS_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
@@ -256,6 +260,8 @@ pub struct AppState {
     history_path: Option<PathBuf>,
     history_persist_lock: Arc<Mutex<()>>,
     history_revision: Arc<AtomicU64>,
+    history_persisted_cursor: Arc<AtomicU64>,
+    history_persisted_count: Arc<AtomicUsize>,
     data_path: Option<PathBuf>,
 }
 
@@ -270,6 +276,8 @@ struct Inner {
     batches: HashMap<String, Batch>,
     batch_idempotency: HashMap<String, String>,
     history: Vec<HistoryObservation>,
+    #[serde(skip)]
+    latest_history_by_device: HashMap<String, HistoryObservation>,
     next_cursor: u64,
     scanner: ScannerCounters,
     #[serde(skip)]
@@ -331,6 +339,12 @@ impl ScannerCounters {
 }
 
 impl AppState {
+    fn pending_history(&self, history: &[HistoryObservation]) -> Vec<HistoryObservation> {
+        let cursor = self.history_persisted_cursor.load(Ordering::Acquire);
+        let first = history.partition_point(|record| record.cursor <= cursor);
+        history[first..].to_vec()
+    }
+
     pub fn new() -> Self {
         Self::configured(true, None, None)
     }
@@ -412,6 +426,7 @@ impl AppState {
             batches: HashMap::new(),
             batch_idempotency: HashMap::new(),
             history: Vec::new(),
+            latest_history_by_device: HashMap::new(),
             next_cursor: 1,
             scanner: ScannerCounters::unavailable(),
             devices: HashMap::new(),
@@ -424,6 +439,13 @@ impl AppState {
                 .map(|record| record.cursor.saturating_add(1))
                 .unwrap_or(1);
         }
+        inner.latest_history_by_device = inner
+            .history
+            .iter()
+            .map(|record| (record.device_id.clone(), record.clone()))
+            .collect();
+        let history_persisted_cursor = inner.history.last().map_or(0, |record| record.cursor);
+        let history_persisted_count = inner.history.len();
         let queue_config = QueueConfig::default();
         Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -438,6 +460,8 @@ impl AppState {
             history_path,
             history_persist_lock: Arc::new(Mutex::new(())),
             history_revision: Arc::new(AtomicU64::new(0)),
+            history_persisted_cursor: Arc::new(AtomicU64::new(history_persisted_cursor)),
+            history_persisted_count: Arc::new(AtomicUsize::new(history_persisted_count)),
             data_path,
         }
     }
@@ -478,6 +502,11 @@ impl AppState {
             );
         }
         *guard = persisted;
+        guard.latest_history_by_device = guard
+            .history
+            .iter()
+            .map(|record| (record.device_id.clone(), record.clone()))
+            .collect();
         self.persist(&guard)
             .await
             .map_err(|_| io::Error::other("Could not persist recovered Somaris state."))?;
@@ -495,6 +524,17 @@ impl AppState {
             .map(|record| record.cursor.saturating_add(1))
             .unwrap_or(1);
         inner.history = history;
+        inner.latest_history_by_device = inner
+            .history
+            .iter()
+            .map(|record| (record.device_id.clone(), record.clone()))
+            .collect();
+        self.history_persisted_cursor.store(
+            inner.history.last().map_or(0, |record| record.cursor),
+            Ordering::Release,
+        );
+        self.history_persisted_count
+            .store(inner.history.len(), Ordering::Release);
         Ok(())
     }
 
@@ -518,26 +558,65 @@ impl AppState {
         let Some(path) = &self.history_path else {
             return Ok(());
         };
+        // Coalesce nearby scanner and simulator updates. A newer revision owns
+        // the flush and carries every not-yet-persisted cursor.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let _persist_guard = self.history_persist_lock.lock().await;
         if self.history_revision.load(Ordering::Acquire) != revision {
             return Ok(());
         }
-        let lines = history
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ())?
-            .join("\n");
-        let bytes = if lines.is_empty() {
-            Vec::new()
-        } else {
-            format!("{lines}\n").into_bytes()
-        };
+        let persisted_cursor = self.history_persisted_cursor.load(Ordering::Acquire);
+        let first_pending = history.partition_point(|record| record.cursor <= persisted_cursor);
+        let pending = &history[first_pending..];
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        for record in pending {
+            serde_json::to_writer(&mut bytes, record).map_err(|_| ())?;
+            bytes.push(b'\n');
+        }
         let path = path.clone();
-        tokio::task::spawn_blocking(move || atomic_write(&path, &bytes))
+        let append_path = path.clone();
+        tokio::task::spawn_blocking(move || append_and_sync(&append_path, &bytes))
             .await
             .map_err(|_| ())?
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        let final_cursor = pending
+            .last()
+            .map_or(persisted_cursor, |record| record.cursor);
+        let persisted_count = self
+            .history_persisted_count
+            .fetch_add(pending.len(), Ordering::AcqRel)
+            + pending.len();
+        self.history_persisted_cursor
+            .store(final_cursor, Ordering::Release);
+
+        // Keep an append-only hot path, and compact only after a bounded amount
+        // of history has accumulated beyond the in-memory retention window.
+        if persisted_count > 51_000 {
+            let compact_path = path.clone();
+            let compacted_count = tokio::task::spawn_blocking(move || {
+                let mut records = read_history(&compact_path)?;
+                if records.len() > 50_000 {
+                    let remove = records.len() - 50_000;
+                    records.drain(0..remove);
+                    let mut compacted = Vec::new();
+                    for record in &records {
+                        serde_json::to_writer(&mut compacted, record).map_err(io::Error::other)?;
+                        compacted.push(b'\n');
+                    }
+                    atomic_write(&compact_path, &compacted)?;
+                }
+                Ok::<usize, io::Error>(records.len())
+            })
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+            self.history_persisted_count
+                .store(compacted_count, Ordering::Release);
+        }
+        Ok(())
     }
 
     async fn resume_queued_commands(&self) {
@@ -572,7 +651,7 @@ impl AppState {
                     let recorded = record_history(&mut inner).unwrap_or(false);
                     if recorded {
                         let revision = state.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
-                        Some((inner.history.clone(), revision))
+                        Some((state.pending_history(&inner.history), revision))
                     } else {
                         None
                     }
@@ -775,7 +854,7 @@ impl AppState {
             prune_registry(&mut inner, now);
             if record_history(&mut inner).unwrap_or(false) {
                 let revision = self.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
-                Some((inner.history.clone(), revision))
+                Some((self.pending_history(&inner.history), revision))
             } else {
                 None
             }
@@ -1006,6 +1085,7 @@ async fn enforce_cors_contract(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
+    let request_path = request.uri().path().to_owned();
     let is_preflight = request.method() == axum::http::Method::OPTIONS
         && request
             .headers()
@@ -1048,36 +1128,76 @@ async fn enforce_cors_contract(
     if is_preflight && response.status() == StatusCode::OK {
         *response.status_mut() = StatusCode::NO_CONTENT;
     }
+    if request_path.starts_with("/api/") && !response.headers().contains_key(header::CACHE_CONTROL)
+    {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     response
 }
 
-async fn openapi_json() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-        OPENAPI_JSON,
+async fn openapi_json(headers: HeaderMap) -> Response {
+    static_response(
+        &headers,
+        OPENAPI_JSON.as_bytes(),
+        "application/json; charset=utf-8",
+        OPENAPI_JSON_ETAG.get_or_init(|| strong_etag(OPENAPI_JSON.as_bytes())),
     )
 }
 
-async fn api_docs() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        DOCS_HTML,
+async fn api_docs(headers: HeaderMap) -> Response {
+    static_response(
+        &headers,
+        DOCS_HTML.as_bytes(),
+        "text/html; charset=utf-8",
+        DOCS_ETAG.get_or_init(|| strong_etag(DOCS_HTML.as_bytes())),
     )
 }
 
-async fn openapi_yaml() -> Response {
-    let value: Value = match serde_json::from_str(OPENAPI_JSON) {
-        Ok(value) => value,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    match serde_yaml::to_string(&value) {
-        Ok(yaml) => (
-            [(header::CONTENT_TYPE, "application/yaml; charset=utf-8")],
-            yaml,
-        )
-            .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+async fn openapi_yaml(headers: HeaderMap) -> Response {
+    let yaml = OPENAPI_YAML.get_or_init(|| {
+        serde_json::from_str::<Value>(OPENAPI_JSON)
+            .ok()
+            .and_then(|value| serde_yaml::to_string(&value).ok())
+            .unwrap_or_default()
+    });
+    if yaml.is_empty() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    static_response(
+        &headers,
+        yaml.as_bytes(),
+        "application/yaml; charset=utf-8",
+        OPENAPI_YAML_ETAG.get_or_init(|| strong_etag(yaml.as_bytes())),
+    )
+}
+
+fn strong_etag(bytes: &[u8]) -> String {
+    format!("\"{}\"", hex::encode(Sha256::digest(bytes)))
+}
+
+fn static_response(
+    headers: &HeaderMap,
+    bytes: &'static [u8],
+    content_type: &'static str,
+    etag: &str,
+) -> Response {
+    if etag_matches(headers, etag) {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::ETAG, etag)
+        .header(header::CACHE_CONTROL, "public, max-age=3600")
+        .body(Body::from(Bytes::from_static(bytes)))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn health(State(state): State<AppState>) -> Response {
@@ -1112,7 +1232,7 @@ async fn ready(State(state): State<AppState>) -> Response {
     (status, Json(envelope(data, None))).into_response()
 }
 
-async fn diagnostics(State(state): State<AppState>) -> Response {
+async fn diagnostics(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let mut inner = state.inner.lock().await;
     prune_registry(&mut inner, Utc::now());
     let retained = inner.devices.len() + usize::from(inner.simulator_enabled);
@@ -1145,7 +1265,13 @@ async fn diagnostics(State(state): State<AppState>) -> Response {
             stale_device_count: stale as u64,
         },
     };
-    Json(envelope(data, None)).into_response()
+    let validator = DiagnosticsValidator {
+        service_started_at: data.service_started_at,
+        history_enabled: data.history_enabled,
+        scanner: &data.scanner,
+        registry: &data.registry,
+    };
+    conditional_json(&headers, validator, envelope(&data, None))
 }
 
 async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1238,10 +1364,12 @@ async fn get_history(
         .last()
         .map(|record| record.cursor)
         .unwrap_or(0);
-    let records: Vec<_> = inner
+    let after = query.after.unwrap_or(0);
+    let first = inner
         .history
+        .partition_point(|record| record.cursor <= after);
+    let records: Vec<_> = inner.history[first..]
         .iter()
-        .filter(|record| record.cursor > query.after.unwrap_or(0))
         .filter(|record| since.is_none_or(|since| record.observed_at >= since))
         .filter(|record| {
             query
@@ -1256,9 +1384,11 @@ async fn get_history(
         .last()
         .map(|record| record.cursor)
         .unwrap_or(query.after.unwrap_or(0));
-    let has_more = inner.history.iter().any(|record| {
-        record.cursor > next_cursor
-            && since.is_none_or(|since| record.observed_at >= since)
+    let more_start = inner
+        .history
+        .partition_point(|record| record.cursor <= next_cursor);
+    let has_more = inner.history[more_start..].iter().any(|record| {
+        since.is_none_or(|since| record.observed_at >= since)
             && query
                 .device_id
                 .as_deref()
@@ -1274,10 +1404,17 @@ async fn get_history(
             has_more,
         },
     };
-    conditional_json(&headers, data.clone(), data)
+    let validator = HistoryValidator {
+        records: &data.data,
+        count: data.meta.count,
+        next_cursor: data.meta.next_cursor,
+        latest_cursor: data.meta.latest_cursor,
+        has_more: data.meta.has_more,
+    };
+    conditional_json(&headers, validator, &data)
 }
 
-async fn get_simulator(State(state): State<AppState>) -> Response {
+async fn get_simulator(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let inner = state.inner.lock().await;
     if !inner.simulator_enabled {
         return error_response(
@@ -1286,7 +1423,8 @@ async fn get_simulator(State(state): State<AppState>) -> Response {
             "The simulator is disabled.",
         );
     }
-    Json(envelope(simulator_status(&inner), None)).into_response()
+    let data = simulator_status(&inner);
+    conditional_json(&headers, data.clone(), envelope(data, None))
 }
 
 async fn set_simulator_scenario(
@@ -1394,8 +1532,9 @@ async fn reset_simulator(
     } else {
         state.history_revision.load(Ordering::Acquire)
     };
+    let pending_history = state.pending_history(&inner.history);
     if state
-        .persist_history(&inner.history, history_revision)
+        .persist_history(&pending_history, history_revision)
         .await
         .is_err()
     {
@@ -1564,6 +1703,14 @@ struct Diagnostics {
     registry: RegistryDiagnostics,
 }
 
+#[derive(Serialize)]
+struct DiagnosticsValidator<'a> {
+    service_started_at: DateTime<Utc>,
+    history_enabled: bool,
+    scanner: &'a ScannerDiagnostics,
+    registry: &'a RegistryDiagnostics,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScannerDiagnostics {
     status: String,
@@ -1635,6 +1782,15 @@ struct HistoryMeta {
 struct HistoryData {
     data: Vec<HistoryObservation>,
     meta: HistoryMeta,
+}
+
+#[derive(Serialize)]
+struct HistoryValidator<'a> {
+    records: &'a [HistoryObservation],
+    count: u64,
+    next_cursor: u64,
+    latest_cursor: u64,
+    has_more: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1912,19 +2068,11 @@ fn conditional_json<T: Serialize, R: Serialize>(
     // validator covers only semantic data. It is therefore a weak validator.
     let opaque_etag = format!("\"{}\"", hex::encode(Sha256::digest(serialized)));
     let etag = format!("W/{opaque_etag}");
-    let matches = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.split(',').any(|candidate| {
-                let candidate = candidate.trim();
-                candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == opaque_etag
-            })
-        });
-    if matches {
+    if etag_matches(headers, &etag) {
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, "private, no-cache")
             .body(Body::empty())
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
@@ -1932,7 +2080,24 @@ fn conditional_json<T: Serialize, R: Serialize>(
     if let Ok(value) = HeaderValue::from_str(&etag) {
         response.headers_mut().insert(header::ETAG, value);
     }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
     response
+}
+
+fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let opaque_etag = etag.strip_prefix("W/").unwrap_or(etag);
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == opaque_etag
+            })
+        })
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -1954,11 +2119,40 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn append_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let existed = path.exists();
+    {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_data()?;
+    }
+    if !existed {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn read_history(path: &Path) -> io::Result<Vec<HistoryObservation>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content = fs::read_to_string(path)?;
+    let mut content = fs::read_to_string(path)?;
+    if !content.is_empty() && !content.ends_with('\n') {
+        let valid_len = content.rfind('\n').map_or(0, |index| index + 1);
+        content.truncate(valid_len);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)?
+            .set_len(valid_len as u64)?;
+    }
     content
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -2045,11 +2239,7 @@ fn record_history(inner: &mut Inner) -> Result<bool, String> {
                 position.target_closed_percent,
             )
         });
-        let latest = inner
-            .history
-            .iter()
-            .rev()
-            .find(|record| record.device_id == device.id);
+        let latest = inner.latest_history_by_device.get(&device.id);
         let same_position = latest.is_some_and(|last| {
             last.position.as_ref().map(|position| {
                 (
@@ -2078,12 +2268,37 @@ fn record_history(inner: &mut Inner) -> Result<bool, String> {
                 target_closed_percent: position.target_closed_percent,
             }),
         });
+        if let Some(record) = inner.history.last() {
+            inner
+                .latest_history_by_device
+                .insert(record.device_id.clone(), record.clone());
+        }
         inner.next_cursor = inner.next_cursor.saturating_add(1);
         changed = true;
     }
     if inner.history.len() > 50_000 {
         let remove = inner.history.len() - 50_000;
-        inner.history.drain(0..remove);
+        let removed: Vec<_> = inner.history.drain(0..remove).collect();
+        for record in removed {
+            if inner
+                .latest_history_by_device
+                .get(&record.device_id)
+                .is_some_and(|latest| latest.cursor == record.cursor)
+            {
+                if let Some(latest) = inner
+                    .history
+                    .iter()
+                    .rev()
+                    .find(|candidate| candidate.device_id == record.device_id)
+                {
+                    inner
+                        .latest_history_by_device
+                        .insert(record.device_id, latest.clone());
+                } else {
+                    inner.latest_history_by_device.remove(&record.device_id);
+                }
+            }
+        }
     }
     Ok(changed)
 }
@@ -2235,7 +2450,7 @@ fn device_snapshot(inner: &Inner) -> Device {
     device
 }
 
-async fn list_managed_devices(State(state): State<AppState>) -> Response {
+async fn list_managed_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let mut inner = state.inner.lock().await;
     prune_registry(&mut inner, Utc::now());
     let mut devices: Vec<_> = inner
@@ -2245,7 +2460,11 @@ async fn list_managed_devices(State(state): State<AppState>) -> Response {
         .map(|enrollment| managed_device(&inner, enrollment))
         .collect();
     devices.sort_by(|left, right| left.enrollment.label.cmp(&right.enrollment.label));
-    Json(envelope(devices.clone(), Some(devices.len() as u64))).into_response()
+    conditional_json(
+        &headers,
+        devices.clone(),
+        envelope(devices.clone(), Some(devices.len() as u64)),
+    )
 }
 
 async fn enroll_device(
@@ -2579,10 +2798,14 @@ async fn queue_batch(
     (StatusCode::ACCEPTED, Json(envelope(batch, None))).into_response()
 }
 
-async fn get_batch(State(state): State<AppState>, RoutePath(id): RoutePath<String>) -> Response {
+async fn get_batch(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+) -> Response {
     let inner = state.inner.lock().await;
     match inner.batches.get(&id) {
-        Some(batch) => Json(envelope(batch.clone(), None)).into_response(),
+        Some(batch) => conditional_json(&headers, batch.clone(), envelope(batch.clone(), None)),
         None => error_response(
             StatusCode::NOT_FOUND,
             "batch_not_found",
@@ -2591,10 +2814,16 @@ async fn get_batch(State(state): State<AppState>, RoutePath(id): RoutePath<Strin
     }
 }
 
-async fn get_command(State(state): State<AppState>, RoutePath(id): RoutePath<String>) -> Response {
+async fn get_command(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    headers: HeaderMap,
+) -> Response {
     let inner = state.inner.lock().await;
     match inner.commands.get(&id) {
-        Some(command) => Json(envelope(command.clone(), None)).into_response(),
+        Some(command) => {
+            conditional_json(&headers, command.clone(), envelope(command.clone(), None))
+        }
         None => error_response(
             StatusCode::NOT_FOUND,
             "command_not_found",
@@ -2603,7 +2832,7 @@ async fn get_command(State(state): State<AppState>, RoutePath(id): RoutePath<Str
     }
 }
 
-async fn get_queue(State(state): State<AppState>) -> Response {
+async fn get_queue(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let inner = state.inner.lock().await;
     let pending: Vec<_> = inner
         .commands
@@ -2629,7 +2858,7 @@ async fn get_queue(State(state): State<AppState>) -> Response {
         adapter_concurrency: state.queue_config.adapter_concurrency as u64,
         adapter_scan_window_ms: state.queue_config.adapter_scan_window_ms,
     };
-    Json(envelope(data, None)).into_response()
+    conditional_json(&headers, data.clone(), envelope(data, None))
 }
 
 #[derive(Debug)]
@@ -3194,8 +3423,9 @@ async fn process_command(state: AppState, command_id: String) {
             state.history_revision.fetch_add(1, Ordering::AcqRel);
         }
         let history_revision = state.history_revision.load(Ordering::Acquire);
+        let pending_history = state.pending_history(&inner.history);
         if state
-            .persist_history(&inner.history, history_revision)
+            .persist_history(&pending_history, history_revision)
             .await
             .is_err()
         {

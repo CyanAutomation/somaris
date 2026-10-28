@@ -46,6 +46,21 @@ impl CharacteristicReader for HangingReader {
     }
 }
 
+struct FailOnceReader {
+    reads: AtomicUsize,
+}
+
+#[async_trait]
+impl CharacteristicReader for FailOnceReader {
+    async fn read_characteristic(&self, _uuid: u16) -> Result<String, String> {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err("temporary read failure".into())
+        } else {
+            Ok("2.1.0".into())
+        }
+    }
+}
+
 #[test]
 fn controller_wire_positions_and_dashboard_positions_have_explicit_conventions() {
     assert_eq!(open_percent_from_wire_byte(0x00), 0);
@@ -212,6 +227,30 @@ async fn device_info_reads_are_shared_while_in_flight() {
     assert_eq!(first.as_deref(), Ok("2.1.0"));
     assert_eq!(second.as_deref(), Ok("2.1.0"));
     assert_eq!(reader.reads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn device_info_retries_failed_reads_instead_of_caching_the_error() {
+    let reader = Arc::new(FailOnceReader {
+        reads: AtomicUsize::new(0),
+    });
+    let info = DeviceInfo::new(Some(reader.clone()), Duration::from_secs(1));
+    assert!(info.get_device_version().await.is_err());
+    assert_eq!(info.get_device_version().await.as_deref(), Ok("2.1.0"));
+    assert_eq!(reader.reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn device_info_success_cache_expires_after_one_hour() {
+    let reader = Arc::new(MockReader {
+        reads: AtomicUsize::new(0),
+        delay: Duration::ZERO,
+    });
+    let info = DeviceInfo::new(Some(reader.clone()), Duration::from_secs(1));
+    info.get_device_version().await.unwrap();
+    tokio::time::advance(Duration::from_secs(60 * 60 + 1)).await;
+    info.get_device_version().await.unwrap();
+    assert_eq!(reader.reads.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(start_paused = true)]

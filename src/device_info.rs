@@ -7,8 +7,14 @@ use tokio::sync::{Mutex, OnceCell};
 
 use crate::telemetry::normalize_reason_codes;
 
-type CachedRead = Arc<OnceCell<Result<String, String>>>;
+type CachedRead = Arc<OnceCell<CachedValue>>;
 type ReadCache = Arc<Mutex<HashMap<u16, CachedRead>>>;
+const DEVICE_INFO_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+
+struct CachedValue {
+    result: Result<String, String>,
+    expires_at: tokio::time::Instant,
+}
 
 #[async_trait]
 pub trait CharacteristicReader: Send + Sync {
@@ -92,24 +98,47 @@ impl DeviceInfo {
         };
         let cell = {
             let mut reads = self.reads.lock().await;
+            if reads
+                .get(&uuid)
+                .and_then(|cell| cell.get())
+                .is_some_and(|cached| cached.expires_at <= tokio::time::Instant::now())
+            {
+                reads.remove(&uuid);
+            }
             reads
                 .entry(uuid)
                 .or_insert_with(|| Arc::new(OnceCell::new()))
                 .clone()
         };
         let timeout = self.read_timeout;
-        cell.get_or_init(|| async move {
-            match tokio::time::timeout(timeout, reader.read_characteristic(uuid)).await {
-                Ok(result) => result,
-                Err(_) => Err(format!(
-                    "Timed out reading characteristic 0x{uuid:04x} after {}ms",
-                    timeout.as_millis()
-                )),
+        let result = cell
+            .get_or_init(|| async move {
+                let result =
+                    match tokio::time::timeout(timeout, reader.read_characteristic(uuid)).await {
+                        Ok(result) => result,
+                        Err(_) => Err(format!(
+                            "Timed out reading characteristic 0x{uuid:04x} after {}ms",
+                            timeout.as_millis()
+                        )),
+                    };
+                CachedValue {
+                    result,
+                    expires_at: tokio::time::Instant::now() + DEVICE_INFO_CACHE_TTL,
+                }
+            })
+            .await
+            .result
+            .clone();
+        if result.is_err() {
+            let mut reads = self.reads.lock().await;
+            if reads
+                .get(&uuid)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &cell))
+            {
+                reads.remove(&uuid);
             }
-        })
-        .await
-        .clone()
-        .map_err(|error| format!("Failed to read {field}: {error}"))
+        }
+        result.map_err(|error| format!("Failed to read {field}: {error}"))
     }
 }
 
