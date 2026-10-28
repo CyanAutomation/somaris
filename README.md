@@ -22,7 +22,11 @@ The machine-readable contract is served at `/openapi.json` and `/openapi.yaml`. 
 
 ## Container image
 
-The GitHub Actions workflow tests pull requests targeting `main` and builds their Docker image without publishing. When changes reach `main`, it publishes `cyanautomation/somaris:latest` and a commit tag.
+The GitHub Actions workflow tests pull requests targeting `main` and builds the Docker image for `linux/amd64` and `linux/arm64` without publishing. When changes reach `main`, it publishes both architectures under `cyanautomation/somaris:latest` and a commit tag. Docker selects the matching image automatically, so a Raspberry Pi running 64-bit Raspberry Pi OS can use the regular `docker pull cyanautomation/somaris` command. 32-bit Raspberry Pi OS (`linux/arm/v7`) is not currently supported.
+
+```sh
+docker pull cyanautomation/somaris
+```
 
 ```sh
 docker run --detach \
