@@ -4302,14 +4302,19 @@ mod security_hardening_tests {
     }
 
     #[tokio::test]
-    async fn history_pruning_removes_old_records_and_their_latest_index_entries() {
+    async fn history_pruning_preserves_latest_index_for_retained_device_records() {
         let state = AppState::new();
         let mut inner = state.inner.lock().await;
         let now = Utc::now();
         for cursor in 1..=50_001 {
+            let device_id = if cursor == 50_001 {
+                "device-1".to_string()
+            } else {
+                format!("device-{cursor}")
+            };
             let record = HistoryObservation {
                 cursor,
-                device_id: format!("device-{cursor}"),
+                device_id,
                 logical_id: Some(format!("soma-{cursor}")),
                 observed_at: now - ChronoDuration::seconds(cursor as i64),
                 rssi_dbm: -40,
@@ -4326,25 +4331,37 @@ mod security_hardening_tests {
 
         assert_eq!(inner.history.len(), 50_000);
         assert_eq!(inner.history.front().unwrap().cursor, 2);
-        assert!(!inner.latest_history_by_device.contains_key("device-1"));
-        assert!(inner.latest_history_by_device.contains_key("device-50001"));
+        assert_eq!(
+            inner
+                .latest_history_by_device
+                .get("device-1")
+                .map(|record| record.cursor),
+            Some(50_001)
+        );
+        assert!(
+            inner
+                .history
+                .iter()
+                .any(|record| record.device_id == "device-1" && record.cursor == 50_001)
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn atomic_state_writes_use_private_permissions_and_do_not_follow_temp_symlinks() {
+    fn atomic_state_writes_use_private_permissions_and_replace_destination_symlinks() {
         use std::os::unix::fs::MetadataExt;
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.json");
         let sentinel = directory.path().join("sentinel");
-        let temporary = directory.path().join("state.json.tmp");
         fs::write(&sentinel, b"keep me private").unwrap();
-        std::os::unix::fs::symlink(&sentinel, &temporary).unwrap();
+        std::os::unix::fs::symlink(&sentinel, &path).unwrap();
 
         atomic_write(&path, b"state").unwrap();
 
         assert_eq!(fs::read(&sentinel).unwrap(), b"keep me private");
+        assert_eq!(fs::read(&path).unwrap(), b"state");
+        assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
         assert_eq!(
             fs::metadata(&path).unwrap().mode() & 0o777,
             0o600,

@@ -28,6 +28,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Set up Rust
+        uses: actions-rust-lang/setup-rust-toolchain@fb51252c7ba57d633bc668f941da052e410add48 # v1.13.0
+        with:
+          toolchain: 1.99.1
+          components: clippy, rustfmt
+          cache: false
+          rustflags: ""
+
       - name: Install native dependencies
         run: |
           sudo apt-get update
@@ -40,9 +48,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-1.99.1-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-1.99.1-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -63,6 +71,9 @@ jobs:
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@fb51252c7ba57d633bc668f941da052e410add48 # v1.13.0
+        with:
+          toolchain: 1.99.1
+          rustflags: ""
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.1 --locked
