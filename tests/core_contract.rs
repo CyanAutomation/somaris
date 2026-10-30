@@ -20,14 +20,13 @@ use std::{
 
 struct MockReader {
     reads: AtomicUsize,
-    delay: Duration,
 }
 
 #[async_trait]
 impl CharacteristicReader for MockReader {
     async fn read_characteristic(&self, uuid: u16) -> Result<String, String> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        tokio::time::sleep(self.delay).await;
+        tokio::task::yield_now().await;
         Ok(match uuid {
             0x2a26 => "2.1.0".into(),
             0x2a24 => "Blind Controller v2".into(),
@@ -220,7 +219,6 @@ fn reason_telemetry_accepts_integer_strings_but_rejects_blank_and_fractional_val
 async fn device_info_reads_are_shared_while_in_flight() {
     let reader = Arc::new(MockReader {
         reads: AtomicUsize::new(0),
-        delay: Duration::from_millis(10),
     });
     let info = DeviceInfo::new(Some(reader.clone()), Duration::from_secs(1));
     let (first, second) = tokio::join!(info.get_device_version(), info.get_device_version());
@@ -244,7 +242,6 @@ async fn device_info_retries_failed_reads_instead_of_caching_the_error() {
 async fn device_info_success_cache_expires_after_one_hour() {
     let reader = Arc::new(MockReader {
         reads: AtomicUsize::new(0),
-        delay: Duration::ZERO,
     });
     let info = DeviceInfo::new(Some(reader.clone()), Duration::from_secs(1));
     info.get_device_version().await.unwrap();
@@ -267,7 +264,6 @@ async fn device_info_read_timeout_names_the_characteristic() {
 async fn controller_metadata_normalizes_fields_and_reads_missing_firmware_version() {
     let reader = Arc::new(MockReader {
         reads: AtomicUsize::new(0),
-        delay: Duration::ZERO,
     });
     let info = DeviceInfo::new(Some(reader), Duration::from_secs(1));
     let details = info

@@ -3999,6 +3999,16 @@ mod security_hardening_tests {
         }
     }
 
+    #[test]
+    fn simulator_advertisements_follow_the_device_name_and_position_contract() {
+        let payload = simulated_manufacturer_payload("Study Blinds1", 23, 57);
+        let decoded = parse_soma_payload(&payload).unwrap();
+
+        assert_eq!(decoded.advertised_name, "Study Blinds1");
+        assert_eq!(decoded.current_closed_percent, 23);
+        assert_eq!(decoded.target_closed_percent, 57);
+    }
+
     async fn fill_registry(state: &AppState) {
         let mut inner = state.inner.lock().await;
         let now = Utc::now();

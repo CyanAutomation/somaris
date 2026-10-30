@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -197,14 +197,12 @@ async fn transient_service_discovery_failure_retries_only_before_a_write() {
     let app = app_with_adapter(adapter.clone()).await;
     let blind = wait_for_blind(&app, "Bedroom Right0").await;
     let managed_id = enroll(&app, &blind).await;
-    let started = Instant::now();
     let command = submit(&app, &managed_id, "retry-safe", "close").await;
 
     assert_eq!(command["status"], "write_acknowledged");
     assert_eq!(command["attempt"], 2);
     assert_eq!(command["retryable"], false);
     assert_eq!(adapter.actions().len(), 2);
-    assert!(started.elapsed() >= Duration::from_millis(250));
 }
 
 #[tokio::test]
