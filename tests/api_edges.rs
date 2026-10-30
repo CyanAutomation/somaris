@@ -103,7 +103,7 @@ async fn wait_for_batch(app: &Router, batch_id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn prewrite_failure_is_retryable_but_write_errors_are_uncertain() {
+async fn simulator_prewrite_failure_is_retryable() {
     let app = router(AppState::new());
     let managed_id = enroll_device(&app, "Test window").await;
     let (status, _, _) = request(
@@ -130,7 +130,13 @@ async fn prewrite_failure_is_retryable_but_write_errors_are_uncertain() {
     assert_eq!(command["status"], "connection_failed");
     assert_eq!(command["write_state"], "not_sent");
     assert_eq!(command["retryable"], true);
+    assert_eq!(command["attempt"], 1);
+}
 
+#[tokio::test]
+async fn simulator_write_error_is_uncertain_and_not_retryable() {
+    let app = router(AppState::new());
+    let managed_id = enroll_device(&app, "Test window").await;
     let (status, _, _) = request(
         &app,
         Method::PUT,
@@ -154,6 +160,7 @@ async fn prewrite_failure_is_retryable_but_write_errors_are_uncertain() {
     assert_eq!(command["status"], "write_failed");
     assert_eq!(command["write_state"], "possibly_sent");
     assert_eq!(command["retryable"], false);
+    assert_eq!(command["attempt"], 1);
 }
 
 #[tokio::test]
