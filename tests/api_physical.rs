@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -20,7 +20,7 @@ use somaris::{
     ble::{BleAdapter, BleFailure, BleFailureStage, BleObservation},
     controller::ServiceAction,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tower::ServiceExt;
 
 #[derive(Default)]
@@ -30,6 +30,9 @@ struct FakeBleAdapter {
     actions: Mutex<Vec<(String, String, ServiceAction)>>,
     scan_active: AtomicBool,
     gatt_overlapped_scan: AtomicBool,
+    completed_scans: AtomicUsize,
+    scans_at_write: Mutex<Vec<usize>>,
+    scan_finished: Notify,
 }
 
 impl FakeBleAdapter {
@@ -50,6 +53,9 @@ impl FakeBleAdapter {
             actions: Mutex::default(),
             scan_active: AtomicBool::default(),
             gatt_overlapped_scan: AtomicBool::default(),
+            completed_scans: AtomicUsize::default(),
+            scans_at_write: Mutex::default(),
+            scan_finished: Notify::default(),
         }
     }
 
@@ -59,6 +65,10 @@ impl FakeBleAdapter {
 
     fn gatt_overlapped_scan(&self) -> bool {
         self.gatt_overlapped_scan.load(Ordering::SeqCst)
+    }
+
+    fn scans_at_write(&self) -> Vec<usize> {
+        self.scans_at_write.lock().unwrap().clone()
     }
 }
 
@@ -78,6 +88,8 @@ impl BleAdapter for FakeBleAdapter {
         }
         tokio::time::sleep(window).await;
         self.scan_active.store(false, Ordering::SeqCst);
+        self.completed_scans.fetch_add(1, Ordering::SeqCst);
+        self.scan_finished.notify_one();
         Ok(())
     }
 
@@ -90,6 +102,10 @@ impl BleAdapter for FakeBleAdapter {
         if self.scan_active.load(Ordering::SeqCst) {
             self.gatt_overlapped_scan.store(true, Ordering::SeqCst);
         }
+        self.scans_at_write
+            .lock()
+            .unwrap()
+            .push(self.completed_scans.load(Ordering::SeqCst));
         self.actions.lock().unwrap().push((
             peripheral_id.to_owned(),
             expected_name.to_owned(),
@@ -237,6 +253,12 @@ async fn gatt_commands_wait_until_the_adapter_scan_window_ends() {
 
     assert_eq!(command["status"], "write_acknowledged");
     assert!(!adapter.gatt_overlapped_scan());
+    let scans_at_write = adapter.scans_at_write();
+    assert_eq!(scans_at_write.len(), 1, "the command issued one GATT write");
+    assert!(
+        scans_at_write.iter().all(|completed| *completed > 0),
+        "the GATT write must wait until a scan window has ended"
+    );
 }
 
 #[tokio::test]
@@ -303,49 +325,54 @@ async fn scanner_keeps_blinds_separate_by_opaque_adapter_identifier() {
         blind("Bedroom Right0", "corebluetooth-id-bedroom"),
         blind("Hallway Blinds0", "corebluetooth-id-hallway"),
     ]));
-    let app = app_with_adapter(adapter).await;
+    let app = app_with_adapter(adapter.clone()).await;
 
-    let mut names = Vec::new();
-    for _ in 0..100 {
-        let (_, response) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
-        names = response.unwrap()["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|device| device["source"] == "ble_advertisement")
-            .map(|device| device["advertised_name"].as_str().unwrap().to_owned())
-            .collect();
-        if names.len() == 2 {
-            break;
+    let names = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (_, response) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+            let mut names: Vec<String> = response.unwrap()["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|device| device["source"] == "ble_advertisement")
+                .map(|device| device["advertised_name"].as_str().unwrap().to_owned())
+                .collect();
+            if names.len() == 2 {
+                names.sort();
+                break names;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    names.sort();
+    })
+    .await
+    .expect("scanner should publish both observed blinds");
     assert_eq!(names, ["Bedroom Right0", "Hallway Blinds0"]);
 }
 
 #[tokio::test]
 async fn scanner_yield_keeps_api_ready_while_adapter_is_available() {
     let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
-    let app = app_with_adapter(adapter).await;
+    let app = app_with_adapter(adapter.clone()).await;
     let _ = wait_for_blind(&app, "Bedroom Right0").await;
 
-    let mut saw_yield = false;
-    for _ in 0..200 {
-        let (_, diagnostics) = request(&app, Method::GET, "/api/v1/diagnostics", &[], None).await;
-        let scanner = diagnostics.unwrap()["data"]["scanner"].clone();
-        if scanner["adapter_available"] == true && scanner["scan_active"] == false {
-            assert_eq!(scanner["retry_count"], 0);
-            assert_eq!(scanner["error_count"], 0);
-            let (status, readiness) = request(&app, Method::GET, "/api/v1/ready", &[], None).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(readiness.unwrap()["data"]["status"], "healthy");
-            saw_yield = true;
-            break;
+    let scanner = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            adapter.scan_finished.notified().await;
+            let (_, diagnostics) =
+                request(&app, Method::GET, "/api/v1/diagnostics", &[], None).await;
+            let scanner = diagnostics.unwrap()["data"]["scanner"].clone();
+            if scanner["adapter_available"] == true && scanner["scan_active"] == false {
+                break scanner;
+            }
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    assert!(saw_yield, "scanner should report its bounded scan yield");
+    })
+    .await
+    .expect("scanner should expose an adapter yield between bounded scan windows");
+    assert_eq!(scanner["retry_count"], 0);
+    assert_eq!(scanner["error_count"], 0);
+    let (status, readiness) = request(&app, Method::GET, "/api/v1/ready", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(readiness.unwrap()["data"]["status"], "healthy");
 }
 
 async fn app_with_adapter(adapter: Arc<FakeBleAdapter>) -> Router {
@@ -361,19 +388,22 @@ async fn app_with_adapter(adapter: Arc<FakeBleAdapter>) -> Router {
 }
 
 async fn wait_for_blind(app: &Router, name: &str) -> Value {
-    for _ in 0..100 {
-        let (_, response) = request(app, Method::GET, "/api/v1/devices", &[], None).await;
-        if let Some(blind) = response.unwrap()["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|device| device["advertised_name"] == name)
-        {
-            return blind.clone();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (_, response) = request(app, Method::GET, "/api/v1/devices", &[], None).await;
+            if let Some(blind) = response.unwrap()["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|device| device["advertised_name"] == name)
+            {
+                break blind.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    panic!("scanner did not publish {name}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("scanner did not publish {name} within two seconds"))
 }
 
 async fn enroll(app: &Router, blind: &Value) -> String {

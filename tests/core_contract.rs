@@ -72,14 +72,27 @@ fn controller_wire_positions_and_dashboard_positions_have_explicit_conventions()
 }
 
 #[test]
-fn controller_command_encodings_match_the_device_protocol() {
-    assert_eq!(encode_controller_command(ControllerCommand::Open)[0], 0x01);
-    assert_eq!(encode_controller_command(ControllerCommand::Close)[0], 0x02);
-    assert_eq!(encode_controller_command(ControllerCommand::Stop)[0], 0x03);
+fn legacy_controller_commands_encode_the_documented_operation_bytes() {
+    assert_eq!(
+        encode_controller_command(ControllerCommand::Open),
+        [0x01, 0x00, 0x00]
+    );
+    assert_eq!(
+        encode_controller_command(ControllerCommand::Close),
+        [0x02, 0x00, 0x00]
+    );
+    assert_eq!(
+        encode_controller_command(ControllerCommand::Stop),
+        [0x03, 0x00, 0x00]
+    );
     assert_eq!(
         encode_controller_command(ControllerCommand::SetPosition(50)),
         [0x10, 0x80]
     );
+}
+
+#[test]
+fn service_actions_encode_the_documented_gatt_payloads() {
     assert_eq!(
         encode_service_action(ServiceAction::Open),
         [0x1a, 0x01, 0x00]
@@ -92,7 +105,7 @@ fn controller_command_encodings_match_the_device_protocol() {
 }
 
 #[test]
-fn controller_commands_use_the_supported_gatt_service_characteristics() {
+fn controller_uses_the_expected_gatt_service_and_characteristic_uuids() {
     assert_eq!(
         OPEN_CLOSE_SERVICE_UUID,
         "00001890-b87f-490c-92cb-11ba5ea5167c"
