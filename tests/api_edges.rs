@@ -484,10 +484,17 @@ async fn simulator_profiles_drive_battery_and_wireless_snapshots() {
 
     let (status, _, simulator) = request(&app, Method::GET, "/api/dev/simulator", &[], None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(simulator.unwrap()["data"]["connection_delay_ms"], 80);
+    let simulator = simulator.unwrap()["data"].clone();
+    assert_eq!(simulator["wireless_profile"], "hallway_observed");
+    assert_eq!(simulator["battery_state"], "observed_sample");
+    assert_eq!(simulator["connection_delay_ms"], 80);
     let (status, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(devices.unwrap()["data"][0]["battery"]["voltage_mv"], 4230);
+    let device = &devices.unwrap()["data"][0];
+    assert_eq!(device["battery"]["status"], "observed");
+    assert_eq!(device["battery"]["voltage_mv"], 4230);
+    assert_eq!(device["battery"]["percent_estimate"], 100);
+    assert_eq!(device["battery"]["source"], "simulator");
 
     let (status, _, reset) = request(
         &app,
