@@ -388,19 +388,22 @@ async fn app_with_adapter(adapter: Arc<FakeBleAdapter>) -> Router {
 }
 
 async fn wait_for_blind(app: &Router, name: &str) -> Value {
-    for _ in 0..100 {
-        let (_, response) = request(app, Method::GET, "/api/v1/devices", &[], None).await;
-        if let Some(blind) = response.unwrap()["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|device| device["advertised_name"] == name)
-        {
-            return blind.clone();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let (_, response) = request(app, Method::GET, "/api/v1/devices", &[], None).await;
+            if let Some(blind) = response.unwrap()["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|device| device["advertised_name"] == name)
+            {
+                break blind.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    panic!("scanner did not publish {name}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("scanner did not publish {name} within two seconds"))
 }
 
 async fn enroll(app: &Router, blind: &Value) -> String {
