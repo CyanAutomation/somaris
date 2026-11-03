@@ -46,3 +46,16 @@ test('enrollment errors survive successful and failed service refreshes until re
  assert.equal(state.enrollmentError, null);
  assert.equal(state.serviceError, null);
 });
+
+test('battery display shows estimated percentage and retains cached and unavailable states', async () => {
+ const {batteryDisplay} = await import('../app.mjs');
+ const observed = batteryDisplay({status:'observed', percent_estimate:76, voltage_mv:3980});
+ assert.match(observed, /Battery ~76%/);
+ assert.match(observed, /Battery voltage: 3980 mV/);
+ assert.match(observed, /<details class="battery-info">/);
+ assert.doesNotMatch(observed, /cached/);
+ assert.match(batteryDisplay({status:'unavailable', percent_estimate:0, voltage_mv:3600}), /Battery ~0% · cached/);
+ assert.match(batteryDisplay({status:'observed', percent_estimate:100}), /Battery ~100%/);
+ assert.match(batteryDisplay({status:'observed', voltage_mv:4120}), /Battery unavailable/);
+ assert.match(batteryDisplay(null), /Battery unavailable/);
+});
