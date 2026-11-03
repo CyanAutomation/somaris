@@ -1072,6 +1072,9 @@ pub fn router(state: AppState) -> Router {
         ])
         .expose_headers([header::ETAG]);
     Router::new()
+        .route("/", get(ui_index))
+        .route("/ui/style.css", get(ui_style))
+        .route("/ui/app.mjs", get(ui_app))
         .route("/api/v1/health", get(health).options(preflight))
         .route("/api/v1/ready", get(ready).options(preflight))
         .route("/api/v1/diagnostics", get(diagnostics).options(preflight))
@@ -1128,6 +1131,27 @@ pub fn router(state: AppState) -> Router {
             allowed_origins,
             enforce_cors_contract,
         ))
+}
+
+async fn ui_index() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../ui/index.html"),
+    )
+}
+
+async fn ui_style() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../ui/style.css"),
+    )
+}
+
+async fn ui_app() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/app.mjs"),
+    )
 }
 
 async fn preflight() -> StatusCode {
