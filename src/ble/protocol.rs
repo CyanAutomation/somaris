@@ -5,7 +5,8 @@ pub const SOMA_MANUFACTURER_ID: u16 = 0x0370;
 /// Payload version observed in the documented SOMA V2 advertisements.
 pub const SOMA_PAYLOAD_VERSION: u8 = 0x05;
 /// Vendor GATT characteristic used for the BA71 voltage reading.
-pub const BA71_CHARACTERISTIC_UUID: &str = "0000ba71-b87f-490c-92cb-11ba5ea5167c";
+pub const BA71_CHARACTERISTIC_UUID: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0000ba71_b87f_490c_92cb_11ba5ea5167c);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSomaAdvertisement {
