@@ -47,7 +47,7 @@ docker pull cyanautomation/somaris
 ```sh
 docker run --detach \
   --name somaris \
-  --publish 8080:8080 \
+  --publish 127.0.0.1:8080:8080 \
   --volume somaris-data:/data \
   cyanautomation/somaris:latest
 ```
