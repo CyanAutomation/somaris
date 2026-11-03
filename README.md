@@ -52,7 +52,7 @@ docker run --detach \
   cyanautomation/somaris:latest
 ```
 
-The container listens on port `8080` and stores persistent service state in `/data`.
+The container listens on port `8080` and stores persistent service state in `/data`. Docker checks `/api/v1/health` inside the container and reports the container as healthy when the HTTP service responds. This is a liveness check: Bluetooth can be degraded while the container is healthy. Use `/api/v1/ready` to monitor Bluetooth adapter availability. If you change the container's `SOMARIS_LISTEN` address or port, set `SOMARIS_HEALTH_URL` to a URL reachable inside the container (for example, `http://127.0.0.1:8081/api/v1/health`). Docker's health status alone does not restart an unhealthy container.
 
 For a local Compose setup, copy the environment template and start the service:
 
