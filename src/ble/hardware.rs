@@ -3,7 +3,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use btleplug::{
     api::{
-        Central, CentralEvent, CharPropFlags, Manager as _, Peripheral as _, ScanFilter, WriteType,
+        Central, CentralEvent, CharPropFlags, Characteristic, Manager as _, Peripheral as _,
+        ScanFilter, WriteType,
     },
     platform::{Adapter, Manager, Peripheral},
 };
@@ -514,16 +515,10 @@ impl BleAdapter for BtleplugAdapter {
         let peripheral = self
             .connect_and_discover(peripheral_id, expected_name)
             .await?;
-        let characteristic_uuid = Uuid::from_u128(
-            (BA71_CHARACTERISTIC_UUID as u128) << 96 | 0x0000_1000_8000_0080_5f9b_34fb,
-        );
         let characteristic = peripheral
             .characteristics()
             .into_iter()
-            .find(|characteristic| {
-                characteristic.uuid == characteristic_uuid
-                    && characteristic.properties.contains(CharPropFlags::READ)
-            });
+            .find(is_battery_characteristic);
         let Some(characteristic) = characteristic else {
             Self::disconnect(&peripheral).await;
             return Err(BleFailure::before_write(
@@ -549,5 +544,35 @@ impl BleAdapter for BtleplugAdapter {
             }
             Ok(Ok(value)) => Ok(value),
         }
+    }
+}
+
+fn is_battery_characteristic(characteristic: &Characteristic) -> bool {
+    characteristic.uuid == BA71_CHARACTERISTIC_UUID
+        && characteristic.properties.contains(CharPropFlags::READ)
+}
+
+#[cfg(test)]
+mod battery_tests {
+    use super::*;
+    use btleplug::api::Characteristic;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn finds_readable_soma_vendor_battery_characteristic() {
+        let make = |uuid: &str, properties| Characteristic {
+            uuid: Uuid::parse_str(uuid).unwrap(),
+            service_uuid: Uuid::parse_str("00001861-b87f-490c-92cb-11ba5ea5167c").unwrap(),
+            properties,
+            descriptors: BTreeSet::new(),
+        };
+        let vendor = make("0000ba71-b87f-490c-92cb-11ba5ea5167c", CharPropFlags::READ);
+        let sig_base = make("0000ba71-0000-1000-8000-00805f9b34fb", CharPropFlags::READ);
+        assert!(is_battery_characteristic(&vendor));
+        assert!(!is_battery_characteristic(&sig_base));
+        assert!(!is_battery_characteristic(&make(
+            "0000ba71-b87f-490c-92cb-11ba5ea5167c",
+            CharPropFlags::WRITE
+        )));
     }
 }
