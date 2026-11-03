@@ -27,7 +27,7 @@ RUN touch src/lib.rs src/main.rs \
 FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends -y ca-certificates libdbus-1-3 \
+    && apt-get install --no-install-recommends -y ca-certificates curl libdbus-1-3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home somaris \
     && mkdir /data \
@@ -40,7 +40,11 @@ USER somaris
 
 ENV SOMARIS_LISTEN=0.0.0.0:8080 \
     SOMARIS_DATA_DIR=/data \
+    SOMARIS_HEALTH_URL=http://127.0.0.1:8080/api/v1/health \
     RUST_LOG=info
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl --fail --silent --show-error --noproxy '*' --max-time 3 "$SOMARIS_HEALTH_URL" >/dev/null || exit 1
 
 EXPOSE 8080
 VOLUME ["/data"]
