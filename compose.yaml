@@ -1,7 +1,6 @@
 services:
   somaris:
-    build: .
-    image: somaris:local
+    image: cyanautomation/somaris:latest
     restart: unless-stopped
     ports:
       - "${SOMARIS_HOST_IP:-127.0.0.1}:${SOMARIS_HOST_PORT:-8080}:8080"
