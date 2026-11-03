@@ -2,7 +2,7 @@
 
 [![Publish Docker image](https://github.com/CyanAutomation/somaris/actions/workflows/publish-image.yml/badge.svg?branch=main)](https://github.com/CyanAutomation/somaris/actions/workflows/publish-image.yml)
 
-Somaris is a Rust service and API for Wazombi Labs smart blind motors. The initial implementation focuses on telemetry, simulator-backed control, command tracking, and API reliability. A dashboard can be added after the service contract is established.
+Somaris is a Rust service and API for Wazombi Labs smart blind motors. The initial implementation focuses on telemetry, simulator-backed control, command tracking, and API reliability. The built-in dashboard provides a browser interface for enrollment, blind control, telemetry, and service status.
 
 ## Run
 
@@ -15,6 +15,12 @@ The service listens on `127.0.0.1:8080` by default. Set `SOMARIS_LISTEN` to choo
 Persistent service state is stored in `data/state.json` by default. Set `SOMARIS_DATA_DIR` to change its directory. Set `SOMARIS_HISTORY_PATH` to enable a separate history journal. On Unix, these files are restricted to the service account. BLE discovery retains at most 1,024 recent physical devices. At capacity, it evicts the oldest safe entry or removes an un-enrolled ambiguous identity group together, while keeping enrolled candidates. A different peripheral ID cannot create a second fresh candidate for an already observed enrolled identity; it can refresh the identity once the retained observation is stale. Physical devices must be freshly observed and explicitly enrolled. The controller supports only open, close, stop, and toggle; percentage positioning and arbitrary GATT writes are not exposed. Battery voltage is cached from background BA71 reads for enrolled blinds. Control endpoints do not provide authentication, so keep the default loopback binding or place the service behind a trusted access boundary before exposing it to other machines.
 
 Set `SOMARIS_ALLOWED_ORIGINS` to a comma-separated list of exact HTTP or HTTPS origins for browser access. The default is an empty list. Queue defaults are 1,000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. BLE scanning yields the adapter between bounded 5-second scan windows so scans do not overlap GATT reads or writes; set `SOMARIS_ADAPTER_SCAN_WINDOW_MS` to tune the window from 100 to 10,000 milliseconds. The queue settings are `SOMARIS_COMMAND_MAX_OUTSTANDING`, `SOMARIS_COMMAND_MAX_QUEUED_PER_DEVICE`, `SOMARIS_ADAPTER_CONCURRENCY`, `SOMARIS_ADAPTER_SCAN_WINDOW_MS`, and `SOMARIS_COMMAND_QUEUE_WAIT_TIMEOUT_SECONDS`.
+
+## Dashboard
+
+Open `http://127.0.0.1:8080/` after starting Somaris (or use your configured address). Add a freshly discovered blind to control it; the simulator is available by default. The dashboard is included in the binary and container and uses the same-origin API. Position is last-reported telemetry, and a command acknowledgement does not confirm movement. Run the UI unit tests with `node --test ui/tests/*.test.mjs`.
+
+The dashboard and control API have no authentication. Keep the default loopback binding or put the service behind a trusted access boundary before exposing it.
 
 ## API
 
