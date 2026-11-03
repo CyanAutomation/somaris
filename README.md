@@ -53,3 +53,12 @@ docker run --detach \
 ```
 
 The container listens on port `8080` and stores persistent service state in `/data`.
+
+For a local Compose setup, copy the environment template and start the service:
+
+```sh
+cp .env.example .env
+docker compose up -d --build
+```
+
+The API is available at `http://127.0.0.1:8080` by default, and a named volume retains its state across container restarts. Edit `.env` to change the host address or port, simulator, logging, browser origins, queue settings, or optional history journal; then run `docker compose up -d` to apply the changes. The Compose template is intended for the simulator: physical Bluetooth requires a Linux host with BlueZ and additional host D-Bus access and permissions for the container.
