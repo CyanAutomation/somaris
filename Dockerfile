@@ -19,8 +19,10 @@ RUN cargo build --locked --release --bin somaris
 COPY openapi.json ./openapi.json
 RUN rm -rf src
 COPY src ./src
+COPY ui ./ui
 
-RUN cargo build --locked --release --bin somaris
+RUN touch src/lib.rs src/main.rs \
+    && cargo build --locked --release --bin somaris
 
 FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 
