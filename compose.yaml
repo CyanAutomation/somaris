@@ -2,6 +2,8 @@ services:
   somaris:
     image: cyanautomation/somaris:latest
     restart: unless-stopped
+    cap_drop:
+      - ALL
     ports:
       - "${SOMARIS_HOST_IP:-127.0.0.1}:${SOMARIS_HOST_PORT:-8080}:8080"
     environment:
@@ -16,6 +18,12 @@ services:
       - SOMARIS_COMMAND_QUEUE_WAIT_TIMEOUT_SECONDS=${SOMARIS_COMMAND_QUEUE_WAIT_TIMEOUT_SECONDS:-120}
     volumes:
       - somaris-data:/data
+      - type: bind
+        source: ${SOMARIS_DBUS_DIR:-/run/dbus}
+        target: /run/dbus
+        read_only: true
+        bind:
+          create_host_path: false
 
 volumes:
   somaris-data:

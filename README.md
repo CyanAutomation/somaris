@@ -58,7 +58,27 @@ For a local Compose setup, copy the environment template and start the service:
 
 ```sh
 cp .env.example .env
-docker compose up -d --build
+docker compose up -d
 ```
 
-The API is available at `http://127.0.0.1:8080` by default, and a named volume retains its state across container restarts. Edit `.env` to change the host address or port, simulator, logging, browser origins, queue settings, or optional history journal; then run `docker compose up -d` to apply the changes. The Compose template is intended for the simulator: physical Bluetooth requires a Linux host with BlueZ and additional host D-Bus access and permissions for the container.
+The API is available at `http://127.0.0.1:8080` by default, and a named volume retains its state across container restarts. Edit `.env` to change the host address or port, simulator, logging, browser origins, queue settings, or optional history journal; then run `docker compose up -d` to apply the changes.
+
+### Linux Bluetooth with Compose
+
+Compose mounts the host's `/run/dbus` directory read-only into the container, allowing Somaris to use the host system bus and BlueZ. The directory must already exist on the Docker daemon host; Compose will not create it. Set `SOMARIS_DBUS_DIR` in `.env` if that directory is elsewhere. The host must have a powered Bluetooth adapter, a running system D-Bus and BlueZ, and policies allowing the container's host-visible UID to use BlueZ. Docker Desktop runs its daemon in a Linux VM, so a desktop computer's native Bluetooth adapter is not made available by this mount.
+
+The image runs as UID `10001` and owns `/data` with that UID. On Agentlab, D-Bus rejected this UID until a matching host account existed. If the same issue occurs on a Linux host without user-namespace remapping, first check `getent passwd 10001` and `getent passwd somaris`. If both are unused, an administrator can create a locked, non-login account with no home directory (the host group name and nologin path can vary by distribution):
+
+```sh
+sudo useradd --system --uid 10001 --gid nogroup --no-create-home \
+  --home-dir /nonexistent --shell /usr/sbin/nologin somaris
+getent passwd 10001
+```
+
+Do not create a duplicate or reuse an unrelated account if the name or UID is already assigned. With rootless Docker or user-namespace remapping, determine the actual host-visible UID and its access rules instead. Agentlab's existing BlueZ policy allowed scanning without a custom rule; other hosts may require different D-Bus, BlueZ, or security policy. Diagnose the specific denial before changing permissions. Avoid running the container as root or granting privileged mode merely to access BlueZ.
+
+The mount exposes the host system bus to the container, subject to host policy. Read-only protects the mounted filesystem from modification; it does **not** make D-Bus messages read-only. A process in the container can call any host bus services its identity is authorized to use. The simulator can remain enabled while physical devices are tested; simulated devices are identified separately in the API.
+
+Check `docker compose logs somaris`, `/api/v1/health`, and `/api/v1/ready` when diagnosing startup. A healthy scanner shows adapter availability, not proof that a blind can connect or accept commands. Verify discovery, enrollment, GATT reads, and a supervised movement and stop with a physical blind. If a write's outcome is uncertain, check telemetry before retrying. If BlueZ or D-Bus restarts, check readiness and logs for recovery; recreate the container with `docker compose up -d --force-recreate` if it does not reconnect. Restarting the host system bus can affect other services.
+
+For simulator-only use on a host without `/run/dbus`, create an empty directory accessible to the Docker daemon, set `SOMARIS_DBUS_DIR` to its absolute path in `.env`, and start Compose normally. Somaris will serve the simulator but report Bluetooth as degraded and retry adapter startup. The directory must be available to the daemon, including through Docker Desktop file sharing when applicable. The standalone `docker run` example above has no D-Bus mount and is likewise simulator-oriented.
