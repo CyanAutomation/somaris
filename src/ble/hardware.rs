@@ -548,7 +548,7 @@ impl BleAdapter for BtleplugAdapter {
 }
 
 fn is_battery_characteristic(characteristic: &Characteristic) -> bool {
-    characteristic.uuid == Uuid::parse_str(BA71_CHARACTERISTIC_UUID).expect("valid BA71 UUID")
+    characteristic.uuid == BA71_CHARACTERISTIC_UUID
         && characteristic.properties.contains(CharPropFlags::READ)
 }
 
