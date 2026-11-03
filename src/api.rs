@@ -946,9 +946,7 @@ impl AppState {
                             return None;
                         }
                         let device = matches[0];
-                        let due = device.battery.last_attempt_at.is_none_or(|attempt| {
-                            now.signed_duration_since(attempt) >= ChronoDuration::hours(1)
-                        });
+                        let due = battery_read_due(&device.battery, now);
                         due.then(|| {
                             (
                                 enrollment.id.clone(),
@@ -1020,6 +1018,7 @@ impl AppState {
                 }
             },
             Err(failure) => {
+                tracing::warn!(device = %expected_name, stage = failure.stage.as_str(), "Battery telemetry attempt failed");
                 device.battery.status = if failure.stage == BleFailureStage::BatteryDiscovery {
                     BatteryStatus::Unsupported
                 } else {
@@ -1740,6 +1739,17 @@ struct BatteryTelemetry {
     failure_stage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<BatterySource>,
+}
+
+fn battery_read_due(battery: &BatteryTelemetry, now: DateTime<Utc>) -> bool {
+    let interval = if battery.status == BatteryStatus::Unavailable {
+        ChronoDuration::minutes(5)
+    } else {
+        ChronoDuration::hours(1)
+    };
+    battery
+        .last_attempt_at
+        .is_none_or(|attempt| now.signed_duration_since(attempt) >= interval)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4012,6 +4022,31 @@ fn command_status_text(status: CommandStatus) -> &'static str {
 #[cfg(test)]
 mod security_hardening_tests {
     use super::*;
+
+    #[test]
+    fn battery_retry_schedule_distinguishes_unavailable_from_success() {
+        let now = Utc::now();
+        let mut battery = simulator_battery_telemetry(BatteryState::Unavailable, now);
+        battery.last_attempt_at = None;
+        assert!(battery_read_due(&battery, now));
+        battery.last_attempt_at = Some(now);
+        assert!(!battery_read_due(
+            &battery,
+            now + ChronoDuration::minutes(4)
+        ));
+        assert!(battery_read_due(&battery, now + ChronoDuration::minutes(5)));
+        battery.status = BatteryStatus::Observed;
+        assert!(!battery_read_due(
+            &battery,
+            now + ChronoDuration::minutes(59)
+        ));
+        assert!(battery_read_due(&battery, now + ChronoDuration::hours(1)));
+        battery.status = BatteryStatus::Unsupported;
+        assert!(!battery_read_due(
+            &battery,
+            now + ChronoDuration::minutes(5)
+        ));
+    }
 
     fn observation(peripheral_id: &str, advertised_name: &str) -> BleObservation {
         BleObservation {
