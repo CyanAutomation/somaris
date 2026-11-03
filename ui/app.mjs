@@ -20,7 +20,7 @@ export function batteryDisplay(battery) {
   if (!Number.isInteger(battery?.percent_estimate) || battery.percent_estimate < 0 || battery.percent_estimate > 100) return '<span class="subtle">Battery unavailable</span>';
   const cached = battery.status !== 'observed' ? ' · cached' : '';
   const voltage = Number.isInteger(battery.voltage_mv) && battery.voltage_mv > 0 ? `Battery voltage: ${battery.voltage_mv} mV. ` : '';
-  return `<span class="battery-reading subtle">Battery ~${battery.percent_estimate}%${cached}<details class="battery-info"><summary aria-label="Battery information">i</summary><span class="battery-tooltip">${voltage}Percentage is an estimate based on voltage.</span></details></span>`;
+  return `<div class="battery-reading subtle">Battery ~${battery.percent_estimate}%${cached}<details class="battery-info"><summary aria-label="Battery information">i</summary><span class="battery-tooltip">${voltage}Percentage is an estimate based on voltage.</span></details></div>`;
 }
 const terminal = new Set(['write_acknowledged','connection_failed','write_failed','outcome_unknown','expired','cancelled']);
 const app = typeof document === 'undefined' ? null : document.querySelector('#app');
