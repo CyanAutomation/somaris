@@ -127,6 +127,36 @@ impl BleAdapter for FakeBleAdapter {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn enrolled_blind_battery_is_polled_and_reported() {
+    let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
+    let app = app_with_adapter(adapter).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    enroll(&app, &blind).await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let battery = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, response) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+            let devices = response.unwrap();
+            let battery = &devices["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|device| device["advertised_name"] == "Bedroom Right0")
+                .unwrap()["battery"];
+            if battery["status"] == "observed" {
+                break battery.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("battery reading should be reported");
+    assert_eq!(battery["voltage_mv"], 3980);
+    assert_eq!(battery["percent_estimate"], 76);
+    assert_eq!(battery["source"], "gatt_ba71");
+}
+
 #[tokio::test]
 async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
     let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
