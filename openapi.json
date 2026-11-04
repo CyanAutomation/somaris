@@ -1054,6 +1054,51 @@
         }
       }
     },
+    "/api/control/v1/audit-log": {
+      "get": {
+        "operationId": "getRecentActivity",
+        "summary": "Read the latest 30 changes and control outcomes",
+        "description": "Returns the most recent enrollment changes, command outcomes, batch outcomes, and simulator changes, newest first. This bounded activity log is stored with persistent service state and does not require SOMARIS_HISTORY_PATH. Caller identity is not available because the control API has no authentication.",
+        "responses": {
+          "200": {
+            "description": "Up to 30 recent activity entries.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/ConditionalCacheControl"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditLogEnvelope"
+                }
+              }
+            }
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightRecentActivity",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/api/control/v1/queue": {
       "get": {
         "operationId": "getBlindCommandQueue",
@@ -1716,6 +1761,98 @@
           "unavailable"
         ],
         "description": "Derived from reported current and target positions. It does not confirm physical motion or acknowledge a command."
+      },
+      "ActivityKind": {
+        "type": "string",
+        "enum": [
+          "enrollment_added",
+          "enrollment_removed",
+          "command",
+          "batch",
+          "simulator_settings_changed",
+          "simulator_reset"
+        ]
+      },
+      "AuditEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "occurred_at",
+          "kind"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Opaque entry ID; command and batch entries use their operation ID."
+          },
+          "occurred_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the change or operation was accepted."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ActivityKind"
+          },
+          "subject": {
+            "type": "string",
+            "description": "Device label or batch target summary."
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "open",
+              "close",
+              "stop"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "description": "Current or terminal command/batch status, when applicable."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Short setting summary or batch skip summary."
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When an asynchronous command or batch reached a terminal state."
+          }
+        }
+      },
+      "AuditLogEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "maxItems": 30,
+            "items": {
+              "$ref": "#/components/schemas/AuditEntry"
+            }
+          },
+          "meta": {
+            "type": "object",
+            "required": [
+              "generated_at",
+              "count"
+            ],
+            "properties": {
+              "generated_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 30
+              }
+            }
+          }
+        }
       },
       "HistoryObservation": {
         "type": "object",

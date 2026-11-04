@@ -125,6 +125,7 @@ const SECOND_SIMULATOR_NAME: &str = "Somaris Simulator 2";
 const MAX_COMMANDS: usize = 1000;
 const MAX_BATCHES: usize = 1000;
 const MAX_DISCOVERED_DEVICES: usize = 1024;
+const MAX_AUDIT_ENTRIES: usize = 30;
 const SCAN_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,6 +287,8 @@ struct Inner {
     command_idempotency: HashMap<String, String>,
     batches: HashMap<String, Batch>,
     batch_idempotency: HashMap<String, String>,
+    #[serde(default)]
+    audit_log: VecDeque<AuditEntry>,
     history: VecDeque<HistoryObservation>,
     #[serde(skip)]
     latest_history_by_device: HashMap<String, HistoryObservation>,
@@ -443,6 +446,7 @@ impl AppState {
             command_idempotency: HashMap::new(),
             batches: HashMap::new(),
             batch_idempotency: HashMap::new(),
+            audit_log: VecDeque::new(),
             history: VecDeque::new(),
             latest_history_by_device: HashMap::new(),
             next_cursor: 1,
@@ -511,6 +515,23 @@ impl AppState {
                 command.completed_at = Some(now);
             }
         }
+        let completed_commands: Vec<_> = persisted
+            .commands
+            .values()
+            .filter_map(|command| {
+                command.completed_at.map(|completed_at| {
+                    (
+                        command.id.clone(),
+                        command_status_text(command.status).to_owned(),
+                        completed_at,
+                    )
+                })
+            })
+            .collect();
+        for (id, status, completed_at) in completed_commands {
+            update_activity_status(&mut persisted, &id, &status, completed_at);
+        }
+        trim_audit_log(&mut persisted);
         if persisted.simulator_enabled {
             let primary_config = persisted.simulator_config;
             refresh_simulator_after_start(&mut persisted.simulator, &primary_config, now);
@@ -1107,6 +1128,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/devices", get(list_devices).options(preflight))
         .route("/api/v1/devices/{id}", get(get_device).options(preflight))
         .route("/api/v1/history", get(get_history).options(preflight))
+        .route(
+            "/api/control/v1/audit-log",
+            get(get_audit_log).options(preflight),
+        )
         .route("/api/dev/simulator", get(get_simulator).options(preflight))
         .route(
             "/api/dev/simulator/scenario",
@@ -1539,6 +1564,22 @@ async fn get_history(
     conditional_json(&headers, validator, &data)
 }
 
+async fn get_audit_log(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let inner = state.inner.lock().await;
+    let entries: Vec<_> = inner
+        .audit_log
+        .iter()
+        .rev()
+        .take(MAX_AUDIT_ENTRIES)
+        .cloned()
+        .collect();
+    conditional_json(
+        &headers,
+        entries.clone(),
+        envelope(entries.clone(), Some(entries.len() as u64)),
+    )
+}
+
 async fn get_simulator(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let inner = state.inner.lock().await;
     if !inner.simulator_enabled {
@@ -1641,6 +1682,31 @@ async fn set_simulator_scenario_for(
         config.battery_state = battery_state;
         device.battery = simulator_battery_telemetry(battery_state, Utc::now());
     }
+    let subject = device.advertised_name.clone();
+    let detail = [
+        request
+            .scenario
+            .map(|value| format!("Scenario: {}", serialized_variant(value))),
+        request
+            .wireless_profile
+            .map(|value| format!("Wireless profile: {}", serialized_variant(value))),
+        request
+            .battery_state
+            .map(|value| format!("Battery: {}", serialized_variant(value))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
+    record_activity(
+        &mut inner,
+        None,
+        ActivityKind::SimulatorSettingsChanged,
+        Some(subject),
+        None,
+        None,
+        Some(detail),
+    );
     if state.persist(&inner).await.is_err() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1707,6 +1773,7 @@ async fn reset_simulator_for(
     device.position = Some(position_value(position, position, now, Source::Simulator));
     device.movement_status = MovementStatus::AtTarget;
     device.last_seen_at = now;
+    let subject = device.advertised_name.clone();
     let history_changed = match record_history(&mut inner) {
         Ok(changed) => changed,
         Err(record) => {
@@ -1717,6 +1784,15 @@ async fn reset_simulator_for(
             );
         }
     };
+    record_activity(
+        &mut inner,
+        None,
+        ActivityKind::SimulatorReset,
+        Some(subject),
+        None,
+        None,
+        Some(format!("Reset to {position}% closed")),
+    );
     let history_revision = if history_changed {
         state.history_revision.fetch_add(1, Ordering::AcqRel) + 1
     } else {
@@ -1940,6 +2016,34 @@ struct ScannerDiagnostics {
 struct RegistryDiagnostics {
     retained_device_count: u64,
     stale_device_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ActivityKind {
+    EnrollmentAdded,
+    EnrollmentRemoved,
+    Command,
+    Batch,
+    SimulatorSettingsChanged,
+    SimulatorReset,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditEntry {
+    id: String,
+    occurred_at: DateTime<Utc>,
+    kind: ActivityKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<Action>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2668,6 +2772,62 @@ fn prune_history(inner: &mut Inner) {
     }
 }
 
+fn record_activity(
+    inner: &mut Inner,
+    id: Option<String>,
+    kind: ActivityKind,
+    subject: Option<String>,
+    action: Option<Action>,
+    status: Option<String>,
+    detail: Option<String>,
+) {
+    inner.audit_log.push_back(AuditEntry {
+        id: id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        occurred_at: Utc::now(),
+        kind,
+        subject,
+        action,
+        status,
+        detail,
+        completed_at: None,
+    });
+    trim_audit_log(inner);
+}
+
+fn serialized_variant<T: Serialize>(value: T) -> String {
+    match serde_json::to_value(value) {
+        Ok(Value::String(value)) => value,
+        _ => "unknown".into(),
+    }
+}
+
+fn update_activity_status(inner: &mut Inner, id: &str, status: &str, completed_at: DateTime<Utc>) {
+    set_activity_status(inner, id, status, Some(completed_at));
+}
+
+fn set_activity_status(
+    inner: &mut Inner,
+    id: &str,
+    status: &str,
+    completed_at: Option<DateTime<Utc>>,
+) {
+    if let Some(entry) = inner
+        .audit_log
+        .iter_mut()
+        .rev()
+        .find(|entry| entry.id == id)
+    {
+        entry.status = Some(status.to_owned());
+        entry.completed_at = completed_at;
+    }
+}
+
+fn trim_audit_log(inner: &mut Inner) {
+    while inner.audit_log.len() > MAX_AUDIT_ENTRIES {
+        inner.audit_log.pop_front();
+    }
+}
+
 fn advance_simulator(device: &mut Device, config: &SimulatorConfig, now: DateTime<Utc>) {
     let Some((current, target)) = device.position.as_mut().map(|position| {
         if position.current_closed_percent < position.target_closed_percent {
@@ -2998,6 +3158,15 @@ async fn enroll_device(
     inner
         .enrollments
         .insert(enrollment.id.clone(), enrollment.clone());
+    record_activity(
+        &mut inner,
+        None,
+        ActivityKind::EnrollmentAdded,
+        Some(enrollment.label.clone()),
+        None,
+        None,
+        None,
+    );
     if state.persist(&inner).await.is_err() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3033,7 +3202,19 @@ async fn remove_enrollment(
             "The enrollment has queued or running commands.",
         );
     }
-    inner.enrollments.remove(&id);
+    let enrollment = inner
+        .enrollments
+        .remove(&id)
+        .expect("the enrollment was checked above");
+    record_activity(
+        &mut inner,
+        None,
+        ActivityKind::EnrollmentRemoved,
+        Some(enrollment.label),
+        None,
+        None,
+        None,
+    );
     if state.persist(&inner).await.is_err() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3226,6 +3407,16 @@ async fn queue_batch(
             targets,
             skipped,
         };
+        record_activity(
+            &mut inner,
+            Some(batch.id.clone()),
+            ActivityKind::Batch,
+            Some(format!("{} ready blinds", batch.target_count)),
+            Some(batch.action),
+            Some(batch.status.clone()),
+            (batch.skipped_count > 0)
+                .then(|| format!("{} unavailable blinds skipped", batch.skipped_count)),
+        );
         inner.batch_idempotency.insert(key_id, batch.id.clone());
         inner.batches.insert(batch.id.clone(), batch.clone());
         if state.persist(&inner).await.is_err() {
@@ -3479,6 +3670,7 @@ async fn submit_command(
             "The simulated device is unavailable.",
         ));
     }
+    let subject = enrollment.label.clone();
     let managed = managed_device(&inner, enrollment);
     if managed.availability != "ready" {
         let (code, message) = if managed.availability == "ambiguous" {
@@ -3523,6 +3715,7 @@ async fn submit_command(
         ));
     }
     if action == Action::Stop {
+        let mut cancelled = Vec::new();
         for command in inner.commands.values_mut().filter(|command| {
             command.managed_device_id == managed_device_id
                 && command.status == CommandStatus::Queued
@@ -3532,6 +3725,13 @@ async fn submit_command(
             command.completed_at = Some(Utc::now());
             command.error_code = Some("preempted_by_stop".into());
             command.retryable = false;
+            cancelled.push((
+                command.id.clone(),
+                command.completed_at.unwrap_or_else(Utc::now),
+            ));
+        }
+        for (id, completed_at) in cancelled {
+            update_activity_status(&mut inner, &id, "cancelled", completed_at);
         }
     }
     let mut command = make_command(
@@ -3546,6 +3746,15 @@ async fn submit_command(
     }
     inner.command_idempotency.insert(key_id, command.id.clone());
     inner.commands.insert(command.id.clone(), command.clone());
+    record_activity(
+        &mut inner,
+        Some(command.id.clone()),
+        ActivityKind::Command,
+        Some(subject),
+        Some(action),
+        Some(command_status_text(command.status).to_owned()),
+        None,
+    );
     if state.persist(&inner).await.is_err() {
         return Err(ApiFailure::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3748,8 +3957,10 @@ async fn process_command(state: AppState, command_id: String) {
         }
         if Utc::now() >= command.expires_at {
             command.status = CommandStatus::Expired;
-            command.completed_at = Some(Utc::now());
+            let completed_at = Utc::now();
+            command.completed_at = Some(completed_at);
             command.retryable = true;
+            update_activity_status(&mut inner, &command_id, "expired", completed_at);
             let _ = state.persist(&inner).await;
             return;
         }
@@ -3766,6 +3977,7 @@ async fn process_command(state: AppState, command_id: String) {
         let write_delay_ms = config
             .as_ref()
             .map_or(0, |config| config.write_response_delay_ms);
+        set_activity_status(&mut inner, &command_id, "connecting", None);
         let _ = state.persist(&inner).await;
         (
             action,
@@ -3864,6 +4076,18 @@ async fn process_command(state: AppState, command_id: String) {
                 command.retryable = false;
             }
         }
+    }
+    if let Some((status, completed_at)) = inner
+        .commands
+        .get(&command_id)
+        .and_then(|command| command.completed_at.map(|at| (command.status, at)))
+    {
+        update_activity_status(
+            &mut inner,
+            &command_id,
+            command_status_text(status),
+            completed_at,
+        );
     }
     if inner.simulator_enabled
         && matches!(
@@ -4098,6 +4322,18 @@ async fn process_physical_command(state: &AppState, command_id: &str, action: Ac
             command.failure_stage = Some(failure.stage.as_str().into());
         }
     }
+    if let Some((status, completed_at)) = inner
+        .commands
+        .get(command_id)
+        .and_then(|command| command.completed_at.map(|at| (command.status, at)))
+    {
+        update_activity_status(
+            &mut inner,
+            command_id,
+            command_status_text(status),
+            completed_at,
+        );
+    }
     if state.persist(&inner).await.is_err() {
         tracing::warn!(%command_id, "Physical command result could not be persisted.");
     }
@@ -4126,6 +4362,7 @@ async fn complete_physical_failure(
     command.failure_stage = Some(failure.stage.as_str().into());
     command.write_state = WriteState::NotSent;
     command.retryable = failure.retryable_before_write;
+    update_activity_status(&mut inner, command_id, "connection_failed", now);
     if state.persist(&inner).await.is_err() {
         tracing::warn!(%command_id, "Physical command failure could not be persisted.");
     }
@@ -4144,6 +4381,7 @@ async fn process_batch(state: AppState, batch_id: String) {
             .iter()
             .filter_map(|target| target.command_id.clone())
             .collect::<Vec<_>>();
+        set_activity_status(&mut inner, &batch_id, "running", None);
         let _ = state.persist(&inner).await;
         ids
     };
@@ -4151,7 +4389,7 @@ async fn process_batch(state: AppState, batch_id: String) {
         process_command(state.clone(), command_id.clone()).await;
         let mut inner = state.inner.lock().await;
         let command = inner.commands.get(&command_id).cloned();
-        if let Some(batch) = inner.batches.get_mut(&batch_id) {
+        let completed_batch = if let Some(batch) = inner.batches.get_mut(&batch_id) {
             if let Some(target) = batch
                 .targets
                 .iter_mut()
@@ -4198,8 +4436,19 @@ async fn process_batch(state: AppState, batch_id: String) {
                 };
                 batch.completed_at = Some(Utc::now());
             }
-            let _ = state.persist(&inner).await;
+            (batch.pending_count == 0).then(|| {
+                (
+                    batch.status.clone(),
+                    batch.completed_at.unwrap_or_else(Utc::now),
+                )
+            })
+        } else {
+            None
+        };
+        if let Some((status, completed_at)) = completed_batch {
+            update_activity_status(&mut inner, &batch_id, &status, completed_at);
         }
+        let _ = state.persist(&inner).await;
     }
 }
 
