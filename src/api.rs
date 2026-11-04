@@ -1122,6 +1122,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(ui_index))
         .route("/ui/style.css", get(ui_style))
         .route("/ui/components.css", get(ui_components_style))
+        .route("/ui/panel.css", get(ui_panel_style))
         .route("/ui/app.mjs", get(ui_app))
         .route("/ui/components.mjs", get(ui_components))
         .route("/api/v1/health", get(health).options(preflight))
@@ -1216,6 +1217,13 @@ async fn ui_components_style() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("../ui/components.css"),
+    )
+}
+
+async fn ui_panel_style() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../ui/panel.css"),
     )
 }
 

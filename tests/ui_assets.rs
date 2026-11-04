@@ -10,9 +10,10 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
     for (path, content_type, marker) in [
         ("/", "text/html", "id=\"display-mode\""),
         ("/ui/app.mjs", "text/javascript", "resolveDisplayMode"),
-        ("/ui/style.css", "text/css", "data-display-mode=\"panel\""),
+        ("/ui/style.css", "text/css", ".app-shell"),
         ("/ui/components.mjs", "text/javascript", "blindState"),
         ("/ui/components.css", "text/css", "icon-action"),
+        ("/ui/panel.css", "text/css", "card--panel"),
     ] {
         let response = router(AppState::new())
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())

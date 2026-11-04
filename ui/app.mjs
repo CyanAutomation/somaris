@@ -83,12 +83,13 @@ function notice(message, dismissAction) { return message ? `<div class="notice" 
 function availability(value) { return ({ready:['Ready',''],stale:['Stale','warn'],not_seen:['Not seen','warn'],ambiguous:['Ambiguous','bad']})[value] || ['Unavailable','warn']; }
 function card(device) {
  const e=device.enrollment, o=observationFor(device,state.observations), [label,tone]=availability(device.availability), p=device.position?.current_closed_percent;
+ const panelMode=document.documentElement.dataset.displayMode==='panel';
  const command=state.commands[e.id]; const [message,msgTone]=command ? commandMessage(command) : ['', ''];
  const lines=Number.isInteger(p) ? Math.max(1, Math.round(p/100*11)) : 0;
  const disabled=!!state.serviceError||device.availability!=='ready';
  const controlsMarkup=renderBlindActions({
   deviceId:e.id, blindLabel:e.label,
-  panelMode:document.documentElement.dataset.displayMode==='panel',
+  panelMode,
   disabled, busy:state.busy.has(e.id),
  });
  const messageMarkup=message?`<p class="message ${msgTone}" role="status">${esc(message)}</p>`:'';
@@ -98,7 +99,7 @@ function card(device) {
   id:e.id, label:e.label, isSimulated:e.is_simulated, lastSeen:relative(device.last_seen_at),
   availabilityLabel:label, availabilityTone:tone,
   positionPercent:p, movementStatus:o?.movement_status, blindLines:lines,
-  controlsMarkup, messageMarkup:`${messageMarkup}${availabilityMessage}`, footerMarkup,
+  controlsMarkup, messageMarkup:`${messageMarkup}${availabilityMessage}`, footerMarkup, panelMode,
  });
 }
 function activityPanel() {
