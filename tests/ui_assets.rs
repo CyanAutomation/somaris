@@ -12,7 +12,7 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
         ("/ui/app.mjs", "text/javascript", "resolveDisplayMode"),
         ("/ui/style.css", "text/css", ".app-shell"),
         ("/ui/components.mjs", "text/javascript", "blindState"),
-        ("/ui/components.css", "text/css", "icon-action"),
+        ("/ui/components.css", "text/css", ".ui-icon"),
         ("/ui/panel.css", "text/css", "card--panel"),
     ] {
         let response = router(AppState::new())
@@ -27,6 +27,9 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
                 .starts_with(content_type)
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains(marker));
+        assert!(
+            String::from_utf8_lossy(&body).contains(marker),
+            "{path} did not contain expected marker {marker}"
+        );
     }
 }
