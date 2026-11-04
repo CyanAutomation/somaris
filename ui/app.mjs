@@ -28,6 +28,23 @@ export function displayPreferenceFrom(search, saved) {
   if (displayModes.has(requested)) return requested;
   return displayModes.has(saved) ? saved : 'auto';
 }
+export function resolveActionFocus({
+  focusedAction = null,
+  pendingConfirmationId = null,
+  confirmingRemovalId = null,
+  availableActions = [],
+}) {
+  if (pendingConfirmationId && pendingConfirmationId === confirmingRemovalId) {
+    const cancelAction = `remove-cancel:${encodeURIComponent(pendingConfirmationId)}`;
+    if (availableActions.includes(cancelAction)) return cancelAction;
+  }
+  if (focusedAction && availableActions.includes(focusedAction)) return focusedAction;
+  if (focusedAction?.startsWith('remove-cancel:')) {
+    const removeAction = `remove:${focusedAction.slice('remove-cancel:'.length)}`;
+    if (availableActions.includes(removeAction)) return removeAction;
+  }
+  return null;
+}
 function storedDisplayPreference() {
   let saved;
   try {
@@ -74,7 +91,7 @@ export function batteryDisplay(battery) {
 }
 const terminal = new Set(['write_acknowledged','connection_failed','write_failed','outcome_unknown','expired','cancelled']);
 const app = typeof document === 'undefined' ? null : document.querySelector('#app');
-const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, serviceError:null, enrollmentError:null, removalError:null, confirmingRemovalId:null, removingEnrollmentId:null, actionError:null, busy:new Set(), tokens:{}, simulators:null};
+const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, serviceError:null, enrollmentError:null, removalError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, actionError:null, busy:new Set(), tokens:{}, simulators:null};
 let displayPreference = storedDisplayPreference();
 const esc = escapeHtml;
 const relative = date => { if (!date) return 'Never seen'; const seconds = Math.max(0, Math.floor((Date.now()-new Date(date).getTime())/1000)); if (!Number.isFinite(seconds)) return 'Time unavailable'; if(seconds < 60) return 'Seen just now'; if(seconds < 3600) return `Seen ${Math.floor(seconds/60)} min ago`; if(seconds < 86400) return `Seen ${Math.floor(seconds/3600)} hr ago`; return `Seen ${Math.floor(seconds/86400)} days ago`; };
@@ -203,12 +220,14 @@ function render(){
   target.focus({preventScroll:true});
   return true;
  };
- if(focused && focusAction(focused)) return;
- if(state.confirmingRemovalId){
-  focusAction(`remove-cancel:${encodeURIComponent(state.confirmingRemovalId)}`);
- }else if(focused?.startsWith('remove-cancel:')){
-  focusAction(`remove:${focused.slice('remove-cancel:'.length)}`);
- }
+ const preferredAction=resolveActionFocus({
+  focusedAction:focused,
+  pendingConfirmationId:state.pendingRemovalFocusId,
+  confirmingRemovalId:state.confirmingRemovalId,
+  availableActions:actionTargets.map(el=>el.dataset.action),
+ });
+ state.pendingRemovalFocusId=null;
+ if(preferredAction)focusAction(preferredAction);
 }
 export async function refreshService(target, request) {
   try {
@@ -285,7 +304,7 @@ async function confirmEnrollmentRemoval(id){
  if(state.removingEnrollmentId===id)return;
  const removal=removeEnrolledBlind(state,api,()=>refreshService(state,api),id);
  render();
- if(await removal) location.hash='home';
+ if(await removal){ location.hash='home'; return; }
  render();
 }
 if(app){
@@ -318,6 +337,7 @@ if(app){
   else if(action==='dismiss-enrollment'){dismissEnrollmentError(state);render();}
   else if(action==='remove'){
    state.confirmingRemovalId=managedDeviceId;
+   state.pendingRemovalFocusId=managedDeviceId;
    state.removalError=null;
    render();
   }
@@ -325,6 +345,7 @@ if(app){
   else if(action==='remove-cancel'){
    if(state.removingEnrollmentId!==managedDeviceId){
     state.confirmingRemovalId=null;
+    state.pendingRemovalFocusId=null;
     state.removalError=null;
     render();
    }

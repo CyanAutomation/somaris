@@ -159,3 +159,19 @@ test('removal failures remain visible and keep the confirmation available for re
  assert.equal(state.removingEnrollmentId, null);
  assert.equal(refreshes, 1);
 });
+
+test('new removal confirmations take focus before surviving actions, then preserve or restore focus', async () => {
+ const {resolveActionFocus} = await import('../app.mjs');
+ const actions = ['dismiss-removal', 'remove:blind-1', 'remove-cancel:blind-1', 'remove-confirm:blind-1'];
+
+ assert.equal(resolveActionFocus({
+  focusedAction:'dismiss-removal', pendingConfirmationId:'blind-1',
+  confirmingRemovalId:'blind-1', availableActions:actions,
+ }), 'remove-cancel:blind-1');
+ assert.equal(resolveActionFocus({
+  focusedAction:'remove-confirm:blind-1', confirmingRemovalId:'blind-1', availableActions:actions,
+ }), 'remove-confirm:blind-1');
+ assert.equal(resolveActionFocus({
+  focusedAction:'remove-cancel:blind-1', availableActions:['remove:blind-1'],
+ }), 'remove:blind-1');
+});
