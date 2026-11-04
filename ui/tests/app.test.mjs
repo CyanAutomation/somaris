@@ -116,3 +116,62 @@ test('battery display shows estimated percentage and retains cached and unavaila
  assert.match(batteryDisplay({status:'observed', voltage_mv:4120}), /Battery unavailable/);
  assert.match(batteryDisplay(null), /Battery unavailable/);
 });
+
+test('removing an enrollment sends DELETE, clears local device state, and refreshes', async () => {
+ const {removeEnrolledBlind} = await import('../app.mjs');
+ const id = 'managed/a b';
+ const token = Symbol('command');
+ const state = {
+  managed:[{enrollment:{id}},{enrollment:{id:'other'}}],
+  commands:{[id]:{status:'write_acknowledged'}},
+  busy:new Set([id]), tokens:{[id]:token},
+  confirmingRemovalId:id, removalError:'old error',
+ };
+ const calls = [];
+ let refreshes = 0;
+ const request = async (...args) => { calls.push(args); };
+ const refresh = async () => { refreshes += 1; };
+
+ assert.equal(await removeEnrolledBlind(state, request, refresh, id), true);
+ assert.deepEqual(calls, [[`/api/control/v1/devices/${encodeURIComponent(id)}`, {method:'DELETE'}]]);
+ assert.deepEqual(state.managed, [{enrollment:{id:'other'}}]);
+ assert.equal(state.commands[id], undefined);
+ assert.equal(state.busy.has(id), false);
+ assert.equal(state.tokens[id], undefined);
+ assert.equal(state.confirmingRemovalId, null);
+ assert.equal(state.removingEnrollmentId, null);
+ assert.equal(state.removalError, null);
+ assert.equal(refreshes, 1);
+});
+
+test('removal failures remain visible and keep the confirmation available for retry', async () => {
+ const {removeEnrolledBlind} = await import('../app.mjs');
+ const id = 'managed-1';
+ const state = {managed:[{enrollment:{id}}], confirmingRemovalId:id, removalError:null};
+ let refreshes = 0;
+ const request = async () => { throw new Error('The enrollment has queued or running commands.'); };
+
+ assert.equal(await removeEnrolledBlind(state, request, async () => { refreshes += 1; }, id), false);
+ assert.match(state.removalError, /queued or running commands/);
+ assert.match(state.removalError, /refresh/i);
+ assert.equal(state.managed.length, 1);
+ assert.equal(state.confirmingRemovalId, id);
+ assert.equal(state.removingEnrollmentId, null);
+ assert.equal(refreshes, 1);
+});
+
+test('new removal confirmations take focus before surviving actions, then preserve or restore focus', async () => {
+ const {resolveActionFocus} = await import('../app.mjs');
+ const actions = ['dismiss-removal', 'remove:blind-1', 'remove-cancel:blind-1', 'remove-confirm:blind-1'];
+
+ assert.equal(resolveActionFocus({
+  focusedAction:'dismiss-removal', pendingConfirmationId:'blind-1',
+  confirmingRemovalId:'blind-1', availableActions:actions,
+ }), 'remove-cancel:blind-1');
+ assert.equal(resolveActionFocus({
+  focusedAction:'remove-confirm:blind-1', confirmingRemovalId:'blind-1', availableActions:actions,
+ }), 'remove-confirm:blind-1');
+ assert.equal(resolveActionFocus({
+  focusedAction:'remove-cancel:blind-1', availableActions:['remove:blind-1'],
+ }), 'remove:blind-1');
+});

@@ -11,6 +11,8 @@ import {
   renderButton,
   renderIconButton,
   renderAddBlindButton,
+  renderDestructiveButton,
+  renderConfirmationPanel,
   renderDeviceList,
   renderTopbarActions,
   renderHomeSupportingSections,
@@ -76,6 +78,33 @@ test('reusable icon button primitive provides consistent accessible icon control
   assert.match(markup, /data-action="refresh"/);
   assert.match(markup, /data-icon="refresh"/);
   assert.doesNotMatch(markup, /button-label/);
+});
+
+test('destructive action primitive provides a visible danger button with an icon', () => {
+  const markup = renderDestructiveButton({label:'Remove blind', action:'remove:blind-1'});
+  assert.match(markup, /class="button danger"/);
+  assert.match(markup, /data-action="remove:blind-1"/);
+  assert.match(markup, /data-icon="trash"/);
+  assert.match(markup, /<span class="button-label">Remove blind<\/span>/);
+  assert.match(renderDestructiveButton({label:'Remove <blind>', action:'remove:x', disabled:true}), /disabled/);
+});
+
+test('reusable confirmation panel escapes copy and composes cancel and destructive actions', () => {
+  const markup = renderConfirmationPanel({
+    title:'Remove <Hallway>?', message:'This removes <Hallway> from Somaris.',
+    confirmLabel:'Remove blind', confirmAction:'remove-confirm:blind-1',
+    cancelAction:'remove-cancel:blind-1',
+  });
+  assert.match(markup, /role="group" aria-label="Remove &lt;Hallway&gt;\?"/);
+  assert.match(markup, /This removes &lt;Hallway&gt; from Somaris\./);
+  assert.match(markup, /data-action="remove-cancel:blind-1"/);
+  assert.match(markup, /data-action="remove-confirm:blind-1"/);
+  assert.match(markup, /class="button danger"/);
+  const disabled = renderConfirmationPanel({
+    title:'Remove blind?', message:'Confirm removal.', confirmLabel:'Remove blind',
+    confirmAction:'remove-confirm:blind-1', cancelAction:'remove-cancel:blind-1', disabled:true,
+  });
+  assert.equal((disabled.match(/ disabled/g) || []).length, 2);
 });
 
 test('shared badge and device-card header primitives keep card markup consistent and escaped', () => {
