@@ -4,6 +4,8 @@ import {
   renderBlindCard,
   renderBlindStatus,
   renderButton,
+  renderDestructiveButton,
+  renderConfirmationPanel,
   renderDeviceList,
   renderTopbarActions,
   renderHomeSupportingSections,
@@ -72,7 +74,7 @@ export function batteryDisplay(battery) {
 }
 const terminal = new Set(['write_acknowledged','connection_failed','write_failed','outcome_unknown','expired','cancelled']);
 const app = typeof document === 'undefined' ? null : document.querySelector('#app');
-const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, serviceError:null, enrollmentError:null, actionError:null, busy:new Set(), tokens:{}, simulators:null};
+const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, serviceError:null, enrollmentError:null, removalError:null, confirmingRemovalId:null, removingEnrollmentId:null, actionError:null, busy:new Set(), tokens:{}, simulators:null};
 let displayPreference = storedDisplayPreference();
 const esc = escapeHtml;
 const relative = date => { if (!date) return 'Never seen'; const seconds = Math.max(0, Math.floor((Date.now()-new Date(date).getTime())/1000)); if (!Number.isFinite(seconds)) return 'Time unavailable'; if(seconds < 60) return 'Seen just now'; if(seconds < 3600) return `Seen ${Math.floor(seconds/60)} min ago`; if(seconds < 86400) return `Seen ${Math.floor(seconds/3600)} hr ago`; return `Seen ${Math.floor(seconds/86400)} days ago`; };
@@ -133,8 +135,9 @@ function back(){ return '<button class="text-button back" data-action="home">←
 function addPage(){ const available=state.observations.filter(o=>!state.managed.some(m=>m.enrollment.logical_id===o.logical_id && !!m.enrollment.is_simulated===!!o.is_simulated)); return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p>${notice(state.serviceError)}${notice(state.enrollmentError,'dismiss-enrollment')}<div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length?`<div class="stack">${available.map(o=>`<form class="panel device-row" data-enroll="${esc(o.id)}"><div><h3>${esc(o.advertised_name||o.device_name||'Unnamed blind')}</h3><p class="subtle">${o.is_simulated?'Simulator · ':''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field">Display name<input name="label" maxlength="64" required value="${esc(o.advertised_name||o.device_name||'Blind')}"></label></div><button class="button" ${o.freshness!=='fresh'?'disabled':''}>Add blind</button></form>`).join('')}</div>`:`<div class="panel empty"><div class="empty-icon">⌁</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available?'Keep your blind nearby and refresh in a moment.': 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${button('Refresh devices','refresh','secondary')}</div>`}`; }
 function detailPage(id){
  const d=state.managed.find(x=>x.enrollment.id===id);
- if(!d)return `${back()}<div class="notice">This blind is no longer enrolled.</div>`;
+ if(!d)return `${back()}${notice(state.serviceError)}${notice(state.removalError,'dismiss-removal')}<div class="notice">This blind is no longer enrolled.</div>`;
  const o=observationFor(d,state.observations);
+ const encodedId=encodeURIComponent(id);
  const fields=[
   {label:'Availability',value:availability(d.availability)[0]},
   {label:'Position',contentMarkup:renderBlindStatus({positionPercent:d.position?.current_closed_percent,movementStatus:o?.movement_status,compact:true})},
@@ -144,7 +147,17 @@ function detailPage(id){
   {label:'Battery voltage',value:o?.battery?.voltage_mv!=null?`${o.battery.voltage_mv} mV${o.battery.status!=='observed'?' (cached)':''}`:'Unavailable'},
   {label:'Source',value:d.enrollment.is_simulated?'Simulator':'Bluetooth'},
  ];
- return `${back()}<h1 class="page-title">${esc(d.enrollment.label)}</h1><p class="page-intro">The latest observations reported by your blind.</p>${renderInfoGrid(fields)}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>`;
+ const confirmationMarkup=state.confirmingRemovalId===id
+  ? renderConfirmationPanel({
+   title:`Remove ${d.enrollment.label}?`,
+   message:'This removes the enrollment from Somaris. It does not reset or change the physical blind, and the blind can be added again when it is nearby. Removal is blocked while a command is queued or running.',
+   confirmLabel:'Remove blind',
+   confirmAction:`remove-confirm:${encodedId}`,
+   cancelAction:`remove-cancel:${encodedId}`,
+   disabled:state.removingEnrollmentId===id,
+  })
+  : renderDestructiveButton({label:'Remove blind', action:`remove:${encodedId}`});
+ return `${back()}${notice(state.serviceError)}${notice(state.removalError,'dismiss-removal')}<h1 class="page-title">${esc(d.enrollment.label)}</h1><p class="page-intro">The latest observations reported by your blind.</p>${renderInfoGrid(fields)}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p><section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${confirmationMarkup}</section>`;
 }
 function simulatorControls(){
  if(!state.simulators?.length)return '';
@@ -183,7 +196,19 @@ function render(){
   const replacement=focusId ? document.getElementById(focusId) : focusLabel ? [...topActions.querySelectorAll('[aria-label]')].find(el=>el.getAttribute('aria-label')===focusLabel) : null;
   replacement?.focus({preventScroll:true});
  }
- if(focused) [...app.querySelectorAll('[data-action]')].find(el=>el.dataset.action===focused)?.focus({preventScroll:true});
+ const actionTargets=[...app.querySelectorAll('[data-action]')];
+ const focusAction=action=>{
+  const target=actionTargets.find(el=>el.dataset.action===action);
+  if(!target)return false;
+  target.focus({preventScroll:true});
+  return true;
+ };
+ if(focused && focusAction(focused)) return;
+ if(state.confirmingRemovalId){
+  focusAction(`remove-cancel:${encodeURIComponent(state.confirmingRemovalId)}`);
+ }else if(focused?.startsWith('remove-cancel:')){
+  focusAction(`remove:${focused.slice('remove-cancel:'.length)}`);
+ }
 }
 export async function refreshService(target, request) {
   try {
@@ -216,10 +241,53 @@ export async function enrollBlind(target, request, refreshData, observedDeviceId
   }
 }
 
+export async function removeEnrolledBlind(target, request, refreshData, managedDeviceId) {
+  if (target.removingEnrollmentId === managedDeviceId) return false;
+  target.removalError = null;
+  target.removingEnrollmentId = managedDeviceId;
+
+  try {
+    await request(`/api/control/v1/devices/${encodeURIComponent(managedDeviceId)}`, {method:'DELETE'});
+  } catch (error) {
+    try {
+      await refreshData();
+    } catch (refreshError) {
+      target.serviceError = `Could not refresh Somaris: ${refreshError.message}`;
+    }
+    const reason = String(error?.message || error).replace(/[.!?]+$/, '');
+    target.removalError = `Could not remove blind: ${reason}. Refresh the list and check the enrollment before retrying.`;
+    target.removingEnrollmentId = null;
+    return false;
+  }
+
+  if (Array.isArray(target.managed)) {
+    target.managed = target.managed.filter(device => device.enrollment.id !== managedDeviceId);
+  }
+  if (target.commands) delete target.commands[managedDeviceId];
+  target.busy?.delete(managedDeviceId);
+  if (target.tokens) delete target.tokens[managedDeviceId];
+  target.confirmingRemovalId = null;
+  target.removingEnrollmentId = null;
+
+  try {
+    await refreshData();
+  } catch (error) {
+    target.serviceError = `Could not refresh Somaris: ${error.message}`;
+  }
+  return true;
+}
+
 async function refresh(quiet=false){ await refreshService(state, api); if(!quiet || !app?.querySelector('input:focus, select:focus')) render(); }
 async function sendCommand(id,action){ if(state.busy.has(id) && action!=='stop') return; const token=Symbol(); state.busy.add(id); state.actionError=null; state.tokens[id]=token; state.commands[id]={status:'queued'}; render(); try { const key=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`; const command=await api(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify({action})}); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); pollCommand(id,command.id,token); } catch(e) { if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.actionError=`Command request failed: ${e.message}. Its outcome may be unknown; check telemetry before trying again.`; state.busy.delete(id); render(); } }
 async function pollCommand(id,commandId,token){ try { const command=await api(`/api/control/v1/commands/${encodeURIComponent(commandId)}`); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); if(!terminal.has(command.status)){ setTimeout(()=>pollCommand(id,commandId,token),1500); return; } state.busy.delete(id); await refresh(true); } catch(e){ if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.busy.delete(id); state.actionError=`Could not check command status: ${e.message}. Check telemetry before trying again.`; render(); } }
 async function simulatorReset(id){state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_closed_percent:100})}); await refresh();}catch(error){state.actionError=`Simulator reset failed: ${error.message}`; render();}}
+async function confirmEnrollmentRemoval(id){
+ if(state.removingEnrollmentId===id)return;
+ const removal=removeEnrolledBlind(state,api,()=>refreshService(state,api),id);
+ render();
+ if(await removal) location.hash='home';
+ render();
+}
 if(app){
  const topActions=document.querySelector('#top-actions');
  const actionRoot=document.querySelector('.app-shell');
@@ -242,11 +310,26 @@ if(app){
   const target=e.target.closest('[data-action]');
   if(!target)return;
   const [action,arg,id]=target.dataset.action.split(':');
+  const managedDeviceId=arg ? decodeURIComponent(arg) : '';
   if(action==='command')sendCommand(id,arg);
   else if(action==='details')location.hash=`details/${encodeURIComponent(arg)}`;
   else if(action==='refresh')refresh();
   else if(action==='sim-reset')simulatorReset(arg);
   else if(action==='dismiss-enrollment'){dismissEnrollmentError(state);render();}
+  else if(action==='remove'){
+   state.confirmingRemovalId=managedDeviceId;
+   state.removalError=null;
+   render();
+  }
+  else if(action==='remove-confirm')confirmEnrollmentRemoval(managedDeviceId);
+  else if(action==='remove-cancel'){
+   if(state.removingEnrollmentId!==managedDeviceId){
+    state.confirmingRemovalId=null;
+    state.removalError=null;
+    render();
+   }
+  }
+  else if(action==='dismiss-removal'){state.removalError=null;render();}
   else if(action==='dismiss-action'){state.actionError=null;render();}
   else location.hash=action;
  });
