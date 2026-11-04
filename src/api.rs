@@ -674,11 +674,10 @@ impl AppState {
                     let second_config = inner.simulator_two_config;
                     if let (Some(device), Some(config)) =
                         (inner.simulator_two.as_mut(), second_config.as_ref())
+                        && !config.telemetry_paused
                     {
-                        if !config.telemetry_paused {
-                            advance_simulator(device, config, now);
-                            device.last_seen_at = now;
-                        }
+                        advance_simulator(device, config, now);
+                        device.last_seen_at = now;
                     }
                     let recorded = record_history(&mut inner).unwrap_or(false);
                     if recorded {
@@ -2405,7 +2404,7 @@ fn read_history(path: &Path) -> io::Result<Vec<HistoryObservation>> {
 }
 
 fn make_simulated_device(id: &str, name: &str, now: DateTime<Utc>) -> Device {
-    let payload = simulated_manufacturer_payload(&name, 100, 100);
+    let payload = simulated_manufacturer_payload(name, 100, 100);
     let mut manufacturer_data = SOMA_MANUFACTURER_ID.to_le_bytes().to_vec();
     manufacturer_data.extend_from_slice(&payload);
     Device {
@@ -3739,8 +3738,8 @@ async fn process_command(state: AppState, command_id: String) {
             .get(&managed_device_id)
             .filter(|enrollment| enrollment.is_simulated)
             .and_then(|enrollment| simulator_id_for_logical_id(&inner, &enrollment.logical_id));
-        let config = simulator_id
-            .and_then(|id| simulator_by_id(&inner, id).map(|(_, config)| config.clone()));
+        let config =
+            simulator_id.and_then(|id| simulator_by_id(&inner, id).map(|(_, config)| *config));
         let Some(command) = inner.commands.get_mut(&command_id) else {
             return;
         };
