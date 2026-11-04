@@ -1,8 +1,12 @@
 .ui-icon{display:block;width:1.2em;height:1.2em;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .add-icon-button{display:inline-grid;place-items:center;width:56px;min-width:56px;height:56px;min-height:56px;padding:0;border-radius:50%;flex:none}
 .add-icon-button .ui-icon{width:28px;height:28px}
-.hero .add-icon-button{align-self:flex-start}
-html[data-display-mode="mobile"] .hero .add-icon-button{width:56px}
+.topbar-add{width:42px;min-width:42px;height:42px;min-height:42px;padding:0;border-radius:50%;flex:none}
+.topbar-add .ui-icon{width:24px;height:24px}
+.topbar-icon-button{display:grid;place-items:center;width:42px;min-width:42px;height:42px;min-height:42px;padding:0;border:1px solid var(--color-border);border-radius:50%;background:transparent;color:var(--color-text);flex:none}
+.topbar-icon-button:hover{background:var(--color-raised)}
+.topbar-icon-button .ui-icon{width:21px;height:21px}
+.topbar-device-count{color:var(--color-muted);font-size:13px;font-weight:700;white-space:nowrap}
 .controls .button{display:flex;align-items:center;justify-content:center;gap:8px}
 .blind-state{display:grid;gap:5px;min-width:0}
 .blind-state__label{font-size:clamp(26px,3vw,36px);font-weight:780;line-height:1;letter-spacing:-.04em}

@@ -3,9 +3,9 @@ import {
   renderBlindActions,
   renderBlindCard,
   renderBlindStatus,
-  renderAddBlindButton,
   renderButton,
   renderDeviceList,
+  renderTopbarActions,
   renderHomeSupportingSections,
   renderInfoGrid,
   movementStatusFromPositions,
@@ -73,6 +73,7 @@ export function batteryDisplay(battery) {
 const terminal = new Set(['write_acknowledged','connection_failed','write_failed','outcome_unknown','expired','cancelled']);
 const app = typeof document === 'undefined' ? null : document.querySelector('#app');
 const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, serviceError:null, enrollmentError:null, actionError:null, busy:new Set(), tokens:{}, simulators:null};
+let displayPreference = storedDisplayPreference();
 const esc = escapeHtml;
 const relative = date => { if (!date) return 'Never seen'; const seconds = Math.max(0, Math.floor((Date.now()-new Date(date).getTime())/1000)); if (!Number.isFinite(seconds)) return 'Time unavailable'; if(seconds < 60) return 'Seen just now'; if(seconds < 3600) return `Seen ${Math.floor(seconds/60)} min ago`; if(seconds < 86400) return `Seen ${Math.floor(seconds/3600)} hr ago`; return `Seen ${Math.floor(seconds/86400)} days ago`; };
 async function api(path, options) { const response = await fetch(path, {cache:'no-store', ...options}); const body = await response.json().catch(()=>({})); if(!response.ok) throw new Error(body.error?.message || body.message || `Request failed (${response.status})`); return body.data; }
@@ -111,13 +112,12 @@ function activityPanel() {
 }
 function home() {
  const panelMode = document.documentElement.dataset.displayMode === 'panel';
- const hero = panelMode ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${renderAddBlindButton({variant:'hero-add'})}</section>`;
- const add = panelMode ? renderAddBlindButton({variant:'secondary panel-add'}) : '';
+ const hero = panelMode ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div></section>`;
  const empty = panelMode
   ? `<div class="panel empty"><h3>No blinds yet</h3><p>Add a nearby blind to see its status and controls here.</p></div>`
-  : `<div class="panel empty"><div class="empty-icon">☼</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p>${renderAddBlindButton()}</div>`;
+  : `<div class="panel empty"><div class="empty-icon">☼</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p></div>`;
  const listMarkup=renderDeviceList({
-  count:state.managed.length, panelMode, addButton:add,
+  count:state.managed.length, panelMode,
   cardsMarkup:state.managed.map(card).join(''), emptyMarkup:empty,
  });
  const serviceMarkup=`<div class="section-heading" style="margin-top:35px"><h2>Somaris service</h2><button type="button" class="text-button" data-action="service">View service status &nbsp; ↗</button></div><p class="subtle">${esc(scannerSummary())}</p>`;
@@ -161,7 +161,30 @@ function simulatorControls(){
 }
 function servicePage(){ const s=state.diagnostics?.scanner; const fields=[['Service',state.serviceError?'Connection problem':'Connected'],['Bluetooth adapter',s?.adapter_available?'Available':'Unavailable'],['Scanner',s?.status||'Unavailable'],['Advertisements seen',s?.soma_advertisements_seen??'—'],['Last scanner error',s?.last_error_code||'None reported'],['Telemetry history',state.diagnostics?.history_enabled?'Enabled':'Not enabled'],['Simulators',state.simulators?.length??'Unavailable or disabled']].map(([label,value])=>({label,value})); return `${back()}<h1 class="page-title">Service status</h1><p class="page-intro">A closer look at the Somaris service and Bluetooth scanner.</p>${notice(state.serviceError)}${notice(state.actionError,'dismiss-action')}${renderInfoGrid(fields)}${simulatorControls()}`; }
 function page(){return location.hash.slice(1)||'home'}
-function render(){ if(!app)return; const focused=app.contains(document.activeElement) ? document.activeElement.dataset.action : null; const p=page(); app.innerHTML=p==='add'?addPage():p==='service'?servicePage():p.startsWith('details/')?detailPage(decodeURIComponent(p.slice(8))):home(); const indicator=document.querySelector('#service-status'); indicator.innerHTML=`<span class="status-dot ${state.serviceError?'bad':state.diagnostics?.scanner?.adapter_available?'good':''}"></span> ${state.serviceError?'Disconnected':state.diagnostics?.scanner?.adapter_available?'Connected':'Service degraded'}`; if(focused) [...app.querySelectorAll('[data-action]')].find(el=>el.dataset.action===focused)?.focus({preventScroll:true}); }
+function render(){
+ if(!app)return;
+ const focused=app.contains(document.activeElement) ? document.activeElement.dataset.action : null;
+ const p=page();
+ app.innerHTML=p==='add'?addPage():p==='service'?servicePage():p.startsWith('details/')?detailPage(decodeURIComponent(p.slice(8))):home();
+ const topActions=document.querySelector('#top-actions');
+ if(topActions){
+  const active=topActions.contains(document.activeElement) ? document.activeElement : null;
+  const focusId=active?.id || '';
+  const focusLabel=active?.getAttribute('aria-label') || '';
+  const menuWasOpen=!!topActions.querySelector('.display-menu')?.open;
+  topActions.innerHTML=renderTopbarActions({
+   blindCount:state.managed.length,
+   panelMode:document.documentElement.dataset.displayMode==='panel',
+   displayPreference,
+   serviceLabel:state.serviceError?'Disconnected':!state.diagnostics?'Connecting':state.diagnostics.scanner?.adapter_available?'Connected':'Service degraded',
+   serviceTone:state.serviceError?'bad':state.diagnostics?.scanner?.adapter_available?'good':'',
+  });
+  if(menuWasOpen) topActions.querySelector('.display-menu').open=true;
+  const replacement=focusId ? document.getElementById(focusId) : focusLabel ? [...topActions.querySelectorAll('[aria-label]')].find(el=>el.getAttribute('aria-label')===focusLabel) : null;
+  replacement?.focus({preventScroll:true});
+ }
+ if(focused) [...app.querySelectorAll('[data-action]')].find(el=>el.dataset.action===focused)?.focus({preventScroll:true});
+}
 export async function refreshService(target, request) {
   try {
     const [managed, observations, diagnostics, simulators, activity] = await Promise.all([
@@ -198,20 +221,35 @@ async function sendCommand(id,action){ if(state.busy.has(id) && action!=='stop')
 async function pollCommand(id,commandId,token){ try { const command=await api(`/api/control/v1/commands/${encodeURIComponent(commandId)}`); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); if(!terminal.has(command.status)){ setTimeout(()=>pollCommand(id,commandId,token),1500); return; } state.busy.delete(id); await refresh(true); } catch(e){ if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.busy.delete(id); state.actionError=`Could not check command status: ${e.message}. Check telemetry before trying again.`; render(); } }
 async function simulatorReset(id){state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_closed_percent:100})}); await refresh();}catch(error){state.actionError=`Simulator reset failed: ${error.message}`; render();}}
 if(app){
- let displayPreference = storedDisplayPreference();
- const displaySelector = document.querySelector('#display-mode');
+ const topActions=document.querySelector('#top-actions');
+ const actionRoot=document.querySelector('.app-shell');
  const applyDisplayMode = () => {
   const previous = document.documentElement.dataset.displayMode;
   document.documentElement.dataset.displayMode = resolveDisplayMode(displayPreference, window.innerWidth, window.innerHeight);
   return previous !== document.documentElement.dataset.displayMode;
  };
- displaySelector.value = displayPreference;
  applyDisplayMode();
- displaySelector.addEventListener('change', () => {
-  displayPreference = displaySelector.value;
+ render();
+ topActions.addEventListener('change', event => {
+  if(event.target.id !== 'display-mode') return;
+  displayPreference = event.target.value;
   try { globalThis.localStorage?.setItem('somaris-display-mode', displayPreference); } catch { /* The current selection still applies until the page reloads. */ }
   if (applyDisplayMode()) render();
  });
  window.addEventListener('resize', () => { if (applyDisplayMode()) render(); });
- window.addEventListener('hashchange',render); document.querySelector('#refresh').addEventListener('click',()=>refresh()); app.addEventListener('click', e=>{const target=e.target.closest('[data-action]'); if(!target)return; const [action,arg,id]=target.dataset.action.split(':'); if(action==='command')sendCommand(id,arg); else if(action==='details')location.hash=`details/${encodeURIComponent(arg)}`; else if(action==='refresh')refresh(); else if(action==='sim-reset')simulatorReset(arg); else if(action==='dismiss-enrollment'){dismissEnrollmentError(state);render();} else if(action==='dismiss-action'){state.actionError=null;render();} else location.hash=action;}); app.addEventListener('submit',async e=>{ if(e.target.matches('[data-simulator]')){e.preventDefault(); const values=Object.fromEntries(new FormData(e.target)); const id=e.target.dataset.simulator; state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/scenario`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)}); await refresh();}catch(error){state.actionError=`Simulator settings could not be saved: ${error.message}`; render();} return;} const form=e.target.closest('[data-enroll]'); if(!form)return; e.preventDefault(); const b=form.querySelector('button'); b.disabled=true; const id=form.dataset.enroll, label=new FormData(form).get('label').trim(); const added=await enrollBlind(state,api,()=>refreshService(state,api),id,label); if(added) location.hash='home'; render();}); refresh(); setInterval(()=>refresh(true),5000);
+ window.addEventListener('hashchange',render);
+ actionRoot.addEventListener('click', e=>{
+  const target=e.target.closest('[data-action]');
+  if(!target)return;
+  const [action,arg,id]=target.dataset.action.split(':');
+  if(action==='command')sendCommand(id,arg);
+  else if(action==='details')location.hash=`details/${encodeURIComponent(arg)}`;
+  else if(action==='refresh')refresh();
+  else if(action==='sim-reset')simulatorReset(arg);
+  else if(action==='dismiss-enrollment'){dismissEnrollmentError(state);render();}
+  else if(action==='dismiss-action'){state.actionError=null;render();}
+  else location.hash=action;
+ });
+ app.addEventListener('submit',async e=>{ if(e.target.matches('[data-simulator]')){e.preventDefault(); const values=Object.fromEntries(new FormData(e.target)); const id=e.target.dataset.simulator; state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/scenario`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)}); await refresh();}catch(error){state.actionError=`Simulator settings could not be saved: ${error.message}`; render();} return;} const form=e.target.closest('[data-enroll]'); if(!form)return; e.preventDefault(); const b=form.querySelector('button'); b.disabled=true; const id=form.dataset.enroll, label=new FormData(form).get('label').trim(); const added=await enrollBlind(state,api,()=>refreshService(state,api),id,label); if(added) location.hash='home'; render();});
+ refresh(); setInterval(()=>refresh(true),5000);
 }
