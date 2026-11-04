@@ -6,6 +6,8 @@ import {
   renderBlindActions,
   renderBlindCard,
   renderBlindStatus,
+  renderBadge,
+  renderDeviceCardHeader,
   renderButton,
   renderAddBlindButton,
   renderDeviceList,
@@ -64,6 +66,20 @@ test('shared button primitive escapes user text and supports icon-only accessibl
   assert.doesNotMatch(markup, /<span class="button-label">Open<\/span>/);
 });
 
+test('shared badge and device-card header primitives keep card markup consistent and escaped', () => {
+  assert.equal(renderBadge({label:'Ready', tone:''}), '<span class="badge">Ready</span>');
+  assert.equal(renderBadge({label:'Stale <blind>', tone:'warn'}), '<span class="badge warn">Stale &lt;blind&gt;</span>');
+
+  const header = renderDeviceCardHeader({
+    id:'blind-<1>', label:'Bedroom <Left>', availabilityLabel:'Ready',
+    availabilityTone:'', isSimulated:false, lastSeen:'Seen just now',
+  });
+  assert.match(header, /class="card-top device-card-header"/);
+  assert.match(header, /data-action="details:blind-&lt;1&gt;"/);
+  assert.match(header, /aria-label="View details for Bedroom &lt;Left&gt;"/);
+  assert.match(header, /class="badge">Ready<\/span>/);
+});
+
 test('add-blind action is a plus-only button with an accessible name and tooltip', () => {
   const markup = renderAddBlindButton({variant:'secondary panel-add'});
   assert.match(markup, /aria-label="Add a blind"/);
@@ -81,11 +97,22 @@ test('device card composes the state, named actions and reusable content areas',
     controlsMarkup:renderBlindActions({deviceId:'blind-1', blindLabel:'Bedroom Left', panelMode:true, disabled:false}),
     messageMarkup:'', footerMarkup:'', panelMode:true,
   });
-  assert.match(card, /class="card"/);
+  assert.match(card, /class="card card--panel"/);
   assert.match(card, /blind-state__label">Opening/);
   assert.match(card, /blind-state__percent">100% closed/);
   assert.match(card, /aria-label="Open Bedroom Left"/);
   assert.match(card, /Bedroom Left/);
+  assert.match(card, /blind-state--panel/);
+});
+
+test('regular device cards keep the shared components without panel-only variants', () => {
+  const card = renderBlindCard({
+    id:'blind-2', label:'Study', availabilityLabel:'Ready', positionPercent:25,
+    movementStatus:'at_target', controlsMarkup:'<div class="controls"></div>',
+  });
+  assert.match(card, /<article class="card">/);
+  assert.doesNotMatch(card, /card--panel|blind-state--panel/);
+  assert.match(card, /class="badge">Ready<\/span>/);
 });
 
 test('panel device list keeps count and add action without a visible section title', () => {

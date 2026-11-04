@@ -1,0 +1,232 @@
+html[data-display-mode="panel"],
+html[data-display-mode="panel"] body {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+html[data-display-mode="panel"] body {
+  height: 100vh;
+  height: 100dvh;
+}
+
+html[data-display-mode="panel"] .app-shell {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0 12px;
+}
+
+html[data-display-mode="panel"] .topbar {
+  height: 40px;
+  min-height: 40px;
+}
+
+html[data-display-mode="panel"] .brand {
+  gap: 8px;
+  font-size: 22px;
+}
+
+html[data-display-mode="panel"] .brand-mark {
+  width: 27px;
+  height: 27px;
+  padding: 6px;
+}
+
+html[data-display-mode="panel"] .top-actions {
+  gap: 6px;
+}
+
+html[data-display-mode="panel"] .service-status {
+  gap: 0;
+  font-size: 0;
+}
+
+html[data-display-mode="panel"] .service-status .status-dot {
+  width: 8px;
+  height: 8px;
+}
+
+html[data-display-mode="panel"] .icon-button {
+  width: 36px;
+  height: 36px;
+  font-size: 20px;
+}
+
+html[data-display-mode="panel"] #app {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 4px 0 6px;
+}
+
+html[data-display-mode="panel"] footer,
+html[data-display-mode="panel"] .hero {
+  display: none;
+}
+
+html[data-display-mode="panel"] .device-list-heading {
+  min-height: 40px;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+
+html[data-display-mode="panel"] .device-list-heading .count {
+  margin-left: auto;
+  font-size: 12px;
+}
+
+html[data-display-mode="panel"] .panel-add {
+  width: 40px;
+  min-width: 40px;
+  height: 40px;
+  min-height: 40px;
+  padding: 0;
+}
+
+html[data-display-mode="panel"] .panel-add .ui-icon {
+  width: 22px;
+  height: 22px;
+}
+
+html[data-display-mode="panel"] .device-list--panel .grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+html[data-display-mode="panel"] .card--panel {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  padding: 9px;
+  border-radius: 16px;
+}
+
+html[data-display-mode="panel"] .device-card-header {
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+}
+
+html[data-display-mode="panel"] .device-card-heading {
+  min-width: 0;
+  flex: 1;
+}
+
+html[data-display-mode="panel"] .device-card-heading > .subtle {
+  display: none;
+}
+
+html[data-display-mode="panel"] .device-card-header h3 {
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.15;
+}
+
+html[data-display-mode="panel"] .device-card-header .card-title {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+html[data-display-mode="panel"] .device-card-header .badge {
+  flex: none;
+  padding: 4px 6px;
+  font-size: 10px;
+}
+
+html[data-display-mode="panel"] .blind-display--panel {
+  min-height: 31px;
+  justify-content: flex-start;
+  gap: 6px;
+  margin: 4px 0 6px;
+}
+
+html[data-display-mode="panel"] .blind-state--panel {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 7px;
+  margin: 0;
+}
+
+html[data-display-mode="panel"] .blind-state--panel .blind-state__label {
+  font-size: 18px;
+  line-height: 1.05;
+}
+
+html[data-display-mode="panel"] .blind-state--panel .blind-state__percent {
+  font-size: 11px;
+  line-height: 1.1;
+}
+
+html[data-display-mode="panel"] .card--panel .blind-art,
+html[data-display-mode="panel"] .card--panel .card-foot {
+  display: none;
+}
+
+html[data-display-mode="panel"] .card--panel .controls {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+
+html[data-display-mode="panel"] .card--panel .controls .button.icon-action {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 6px 2px;
+  border-radius: 12px;
+}
+
+html[data-display-mode="panel"] .card--panel .controls .ui-icon {
+  width: 22px;
+  height: 22px;
+}
+
+html[data-display-mode="panel"] .card--panel .message {
+  margin: 6px 0 0;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+html[data-display-mode="panel"] .notice {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  font-size: 11px;
+}
+
+html[data-display-mode="panel"] .empty {
+  padding: 14px 12px;
+  text-align: left;
+}
+
+html[data-display-mode="panel"] .empty h3 {
+  margin-bottom: 4px;
+  font-size: 15px;
+}
+
+html[data-display-mode="panel"] .empty p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+html[data-display-mode="panel"] #app > .subtle {
+  display: none;
+}
+
+@media (max-width: 359px) {
+  html[data-display-mode="panel"] .device-list--panel .grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
