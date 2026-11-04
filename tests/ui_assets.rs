@@ -8,12 +8,15 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn dashboard_and_assets_are_served_with_correct_content_types() {
     for (path, content_type, marker) in [
-        ("/", "text/html", "id=\"display-mode\""),
+        ("/", "text/html", "rel=\"apple-touch-icon\""),
         ("/ui/app.mjs", "text/javascript", "resolveDisplayMode"),
         ("/ui/style.css", "text/css", ".app-shell"),
         ("/ui/components.mjs", "text/javascript", "blindState"),
         ("/ui/components.css", "text/css", ".ui-icon"),
         ("/ui/panel.css", "text/css", "card--panel"),
+        ("/ui/favicon.svg", "image/svg+xml", "#ff9638"),
+        ("/ui/favicon-32x32.png", "image/png", "IHDR"),
+        ("/ui/apple-touch-icon.png", "image/png", "IHDR"),
     ] {
         let response = router(AppState::new())
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
