@@ -264,6 +264,18 @@ impl SomarisMcp {
             .await
     }
 
+    #[tool(description = "Read the latest 30 enrollment, command, batch, and simulator changes.")]
+    async fn get_recent_activity(&self) -> String {
+        self.call(
+            Method::GET,
+            &["api", "control", "v1", "audit-log"],
+            &[],
+            None,
+            None,
+        )
+        .await
+    }
+
     #[tool(description = "List enrolled devices and their current control availability.")]
     async fn list_managed_devices(&self) -> String {
         self.call(

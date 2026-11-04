@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {commandMessage, escapeHtml, observationFor} from '../app.mjs';
+import {activityMessage, commandMessage, escapeHtml, observationFor} from '../app.mjs';
 
 test('command messages distinguish acknowledgement and uncertain outcomes',()=>{
  assert.match(commandMessage({status:'write_acknowledged'})[0],/acknowledged/i);
@@ -32,6 +32,24 @@ test('service refresh loads the simulator collection', async () => {
  assert.ok(calls.includes('/api/dev/simulators'));
  assert.deepEqual(state.simulators, simulators);
  assert.equal(state.serviceError, null);
+});
+
+test('service refresh loads recent activity and activity descriptions stay readable', async () => {
+ const {refreshService} = await import('../app.mjs');
+ const activity = [{kind:'command', action:'close', subject:'Study blind', status:'write_acknowledged'}];
+ const calls = [];
+ const request = async path => {
+  calls.push(path);
+  if (path === '/api/control/v1/audit-log') return activity;
+  if (path === '/api/v1/diagnostics') return {scanner:{adapter_available:true}};
+  return [];
+ };
+ const state = {};
+ await refreshService(state, request);
+ assert.ok(calls.includes('/api/control/v1/audit-log'));
+ assert.deepEqual(state.activity, activity);
+ assert.equal(activityMessage(activity[0]), 'Close command · write acknowledged · Study blind');
+ assert.equal(activityMessage({kind:'enrollment_removed', subject:'Study blind'}), 'Removed Study blind');
 });
 
 test('enrollment errors survive successful and failed service refreshes until retry or dismissal', async () => {
