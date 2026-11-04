@@ -80,17 +80,25 @@ async fn device_list_uses_closed_percent_and_supports_conditional_reads() {
     let (status, headers, body) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     let body = body.unwrap();
-    assert_eq!(body["meta"]["count"], 1);
-    assert_eq!(body["data"][0]["is_simulated"], true);
-    assert_eq!(body["data"][0]["position"]["current_closed_percent"], 100);
-    let payload = hex::decode(
-        body["data"][0]["manufacturer_payload_hex"]
-            .as_str()
-            .unwrap(),
-    )
-    .unwrap();
+    assert_eq!(body["meta"]["count"], 2);
+    let names: Vec<_> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|device| device["advertised_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Somaris Simulator 1", "Somaris Simulator 2"]);
+    let simulator = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "simulator-1")
+        .unwrap();
+    assert_eq!(simulator["is_simulated"], true);
+    assert_eq!(simulator["position"]["current_closed_percent"], 100);
+    let payload = hex::decode(simulator["manufacturer_payload_hex"].as_str().unwrap()).unwrap();
     let advertisement = somaris::ble::parse_soma_payload(&payload).unwrap();
-    assert_eq!(advertisement.advertised_name, "Hallway Blinds0");
+    assert_eq!(advertisement.advertised_name, "Somaris Simulator 1");
     assert_eq!(advertisement.current_closed_percent, 100);
     assert_eq!(advertisement.target_closed_percent, 100);
     let etag = headers.get(header::ETAG).unwrap().to_str().unwrap();
@@ -104,6 +112,123 @@ async fn device_list_uses_closed_percent_and_supports_conditional_reads() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn simulators_have_distinct_names_independent_settings_and_positions() {
+    let app = router(AppState::new());
+
+    let (status, _, listed) = request(&app, Method::GET, "/api/dev/simulators", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = listed.unwrap()["data"].clone();
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+    assert_eq!(listed[0]["id"], "simulator-1");
+    assert_eq!(listed[0]["advertised_name"], "Somaris Simulator 1");
+    assert_eq!(listed[1]["id"], "simulator-2");
+    assert_eq!(listed[1]["advertised_name"], "Somaris Simulator 2");
+
+    let (status, _, _) = request(
+        &app,
+        Method::POST,
+        "/api/dev/simulators/simulator-1/reset",
+        &[],
+        Some(json!({"position_closed_percent": 25})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = request(
+        &app,
+        Method::POST,
+        "/api/dev/simulators/simulator-2/reset",
+        &[],
+        Some(json!({"position_closed_percent": 65})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, scenario) = request(
+        &app,
+        Method::PUT,
+        "/api/dev/simulators/simulator-2/scenario",
+        &[],
+        Some(json!({"wireless_profile": "standard"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(scenario.unwrap()["data"]["wireless_profile"], "standard");
+
+    let (status, _, listed) = request(&app, Method::GET, "/api/dev/simulators", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = listed.unwrap()["data"].clone();
+    assert_eq!(listed[0]["current_closed_percent"], 25);
+    assert_eq!(listed[0]["wireless_profile"], "hallway_observed");
+    assert_eq!(listed[1]["current_closed_percent"], 65);
+    assert_eq!(listed[1]["wireless_profile"], "standard");
+
+    let (status, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let devices = devices.unwrap()["data"].clone();
+    for id in ["simulator-1", "simulator-2"] {
+        let device = devices
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|device| device["id"] == id)
+            .unwrap();
+        let (status, _, enrolled) = request(
+            &app,
+            Method::POST,
+            "/api/control/v1/devices",
+            &[],
+            Some(json!({
+                "observed_device_id": id,
+                "label": device["advertised_name"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(enrolled.unwrap()["data"]["is_simulated"], true);
+    }
+
+    let (status, _, managed) =
+        request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let managed = managed.unwrap()["data"].clone();
+    assert_eq!(managed.as_array().unwrap().len(), 2);
+    let first_id = managed[0]["enrollment"]["id"].as_str().unwrap();
+    let (status, _, command) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{first_id}/commands"),
+        &[("idempotency-key", "open-simulator-1")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = command.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&app, &command_id).await["status"],
+        "write_acknowledged"
+    );
+
+    let (status, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let devices = devices.unwrap()["data"].clone();
+    let first = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "simulator-1")
+        .unwrap();
+    let second = devices
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "simulator-2")
+        .unwrap();
+    assert_eq!(first["position"]["target_closed_percent"], 0);
+    assert_eq!(second["position"]["current_closed_percent"], 65);
+    assert_eq!(second["position"]["target_closed_percent"], 65);
 }
 
 #[tokio::test]
@@ -242,6 +367,9 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         ("/api/dev/simulator", &["get", "options"]),
         ("/api/dev/simulator/scenario", &["put", "options"]),
         ("/api/dev/simulator/reset", &["post", "options"]),
+        ("/api/dev/simulators", &["get", "options"]),
+        ("/api/dev/simulators/{id}/scenario", &["put", "options"]),
+        ("/api/dev/simulators/{id}/reset", &["post", "options"]),
         ("/api/control/v1/devices", &["get", "post", "options"]),
         ("/api/control/v1/devices/{id}", &["delete", "options"]),
         (
