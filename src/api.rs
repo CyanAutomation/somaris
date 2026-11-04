@@ -119,6 +119,9 @@ const DOCS_HTML: &str = r##"<!doctype html>
 </html>
 "##;
 const SIMULATOR_ID: &str = "simulator-1";
+const SECOND_SIMULATOR_ID: &str = "simulator-2";
+const SIMULATOR_NAME: &str = "Somaris Simulator 1";
+const SECOND_SIMULATOR_NAME: &str = "Somaris Simulator 2";
 const MAX_COMMANDS: usize = 1000;
 const MAX_BATCHES: usize = 1000;
 const MAX_DISCOVERED_DEVICES: usize = 1024;
@@ -274,6 +277,10 @@ struct Inner {
     simulator_enabled: bool,
     simulator: Device,
     simulator_config: SimulatorConfig,
+    #[serde(default)]
+    simulator_two: Option<Device>,
+    #[serde(default)]
+    simulator_two_config: Option<SimulatorConfig>,
     enrollments: HashMap<String, Enrollment>,
     commands: HashMap<String, Command>,
     command_idempotency: HashMap<String, String>,
@@ -288,7 +295,7 @@ struct Inner {
     devices: HashMap<String, Device>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct SimulatorConfig {
     scenario: SimulatorScenario,
     wireless_profile: WirelessProfile,
@@ -419,11 +426,18 @@ impl AppState {
         data_path: Option<PathBuf>,
     ) -> Self {
         let started_at = Utc::now();
-        let simulator = make_simulated_device(started_at);
+        let simulator = make_simulated_device(SIMULATOR_ID, SIMULATOR_NAME, started_at);
+        let simulator_two = Some(make_simulated_device(
+            SECOND_SIMULATOR_ID,
+            SECOND_SIMULATOR_NAME,
+            started_at,
+        ));
         let mut inner = Inner {
             simulator_enabled,
             simulator,
             simulator_config: SimulatorConfig::default(),
+            simulator_two,
+            simulator_two_config: Some(SimulatorConfig::default()),
             enrollments: HashMap::new(),
             commands: HashMap::new(),
             command_idempotency: HashMap::new(),
@@ -483,6 +497,7 @@ impl AppState {
         let mut persisted: Inner = serde_json::from_slice(&content)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let now = Utc::now();
+        initialize_simulators(&mut persisted, now);
         let mut guard = self.inner.lock().await;
         persisted.simulator_enabled = guard.simulator_enabled;
         persisted.scanner = ScannerCounters::unavailable();
@@ -497,15 +512,14 @@ impl AppState {
             }
         }
         if persisted.simulator_enabled {
-            persisted.simulator.freshness = Freshness::Fresh;
-            persisted.simulator.last_seen_at = Utc::now();
-            if let Some(position) = persisted.simulator.position.as_mut() {
-                position.observed_at = persisted.simulator.last_seen_at;
+            let primary_config = persisted.simulator_config;
+            refresh_simulator_after_start(&mut persisted.simulator, &primary_config, now);
+            let second_config = persisted.simulator_two_config;
+            if let (Some(device), Some(config)) =
+                (persisted.simulator_two.as_mut(), second_config.as_ref())
+            {
+                refresh_simulator_after_start(device, config, now);
             }
-            persisted.simulator.battery = simulator_battery_telemetry(
-                persisted.simulator_config.battery_state,
-                persisted.simulator.last_seen_at,
-            );
         }
         *guard = persisted;
         guard.latest_history_by_device = guard
@@ -648,12 +662,24 @@ impl AppState {
                 interval.tick().await;
                 let history = {
                     let mut inner = state.inner.lock().await;
-                    if !inner.simulator_enabled || inner.simulator_config.telemetry_paused {
+                    if !inner.simulator_enabled {
                         continue;
                     }
                     let now = Utc::now();
-                    advance_simulator(&mut inner, now);
-                    inner.simulator.last_seen_at = now;
+                    let primary_config = inner.simulator_config;
+                    if !primary_config.telemetry_paused {
+                        advance_simulator(&mut inner.simulator, &primary_config, now);
+                        inner.simulator.last_seen_at = now;
+                    }
+                    let second_config = inner.simulator_two_config;
+                    if let (Some(device), Some(config)) =
+                        (inner.simulator_two.as_mut(), second_config.as_ref())
+                    {
+                        if !config.telemetry_paused {
+                            advance_simulator(device, config, now);
+                            device.last_seen_at = now;
+                        }
+                    }
                     let recorded = record_history(&mut inner).unwrap_or(false);
                     if recorded {
                         let revision = state.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
@@ -902,8 +928,10 @@ impl AppState {
             let mut history_changed = record_history_for_device(&mut inner, &device);
             inner.devices.insert(observation.peripheral_id, device);
             if inner.simulator_enabled {
-                let simulator = device_snapshot(&inner);
-                history_changed |= record_history_for_device(&mut inner, &simulator);
+                let simulators = simulator_snapshots(&inner);
+                for simulator in &simulators {
+                    history_changed |= record_history_for_device(&mut inner, simulator);
+                }
             }
             prune_history(&mut inner);
             if history_changed {
@@ -1088,6 +1116,18 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/dev/simulator/reset",
             post(reset_simulator).options(preflight),
+        )
+        .route(
+            "/api/dev/simulators",
+            get(list_simulators).options(preflight),
+        )
+        .route(
+            "/api/dev/simulators/{id}/scenario",
+            put(set_named_simulator_scenario).options(preflight),
+        )
+        .route(
+            "/api/dev/simulators/{id}/reset",
+            post(reset_named_simulator).options(preflight),
         )
         .route(
             "/api/control/v1/devices",
@@ -1312,7 +1352,12 @@ async fn ready(State(state): State<AppState>) -> Response {
 async fn diagnostics(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let mut inner = state.inner.lock().await;
     prune_registry(&mut inner, Utc::now());
-    let retained = inner.devices.len() + usize::from(inner.simulator_enabled);
+    let retained = inner.devices.len()
+        + if inner.simulator_enabled {
+            simulator_count(&inner)
+        } else {
+            0
+        };
     let stale = inner
         .devices
         .values()
@@ -1356,7 +1401,7 @@ async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Resp
     prune_registry(&mut inner, Utc::now());
     let mut devices: Vec<_> = inner.devices.values().cloned().collect();
     if inner.simulator_enabled {
-        devices.push(device_snapshot(&inner));
+        devices.extend(simulator_snapshots(&inner));
     }
     devices.sort_by_key(|device| std::cmp::Reverse(device.last_seen_at));
     conditional_json(
@@ -1374,8 +1419,10 @@ async fn get_device(
     let inner = state.inner.lock().await;
     let Some(device) = inner
         .simulator_enabled
-        .then(|| device_snapshot(&inner))
-        .filter(|device| device.id == id)
+        .then(|| simulator_snapshots(&inner))
+        .into_iter()
+        .flatten()
+        .find(|device| device.id == id)
         .or_else(|| {
             inner
                 .devices
@@ -1502,12 +1549,47 @@ async fn get_simulator(State(state): State<AppState>, headers: HeaderMap) -> Res
             "The simulator is disabled.",
         );
     }
-    let data = simulator_status(&inner);
+    let data = simulator_by_id(&inner, SIMULATOR_ID)
+        .map(|(device, config)| simulator_status(device, config))
+        .expect("the primary simulator is configured");
     conditional_json(&headers, data.clone(), envelope(data, None))
+}
+
+async fn list_simulators(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let inner = state.inner.lock().await;
+    if !inner.simulator_enabled {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "simulator_disabled",
+            "The simulator is disabled.",
+        );
+    }
+    let simulators = simulator_statuses(&inner);
+    conditional_json(
+        &headers,
+        simulators.clone(),
+        envelope(simulators.clone(), Some(simulators.len() as u64)),
+    )
 }
 
 async fn set_simulator_scenario(
     State(state): State<AppState>,
+    payload: Result<Json<SimulatorScenarioRequest>, JsonRejection>,
+) -> Response {
+    set_simulator_scenario_for(state, SIMULATOR_ID, payload).await
+}
+
+async fn set_named_simulator_scenario(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    payload: Result<Json<SimulatorScenarioRequest>, JsonRejection>,
+) -> Response {
+    set_simulator_scenario_for(state, &id, payload).await
+}
+
+async fn set_simulator_scenario_for(
+    state: AppState,
+    id: &str,
     payload: Result<Json<SimulatorScenarioRequest>, JsonRejection>,
 ) -> Response {
     let request = match parse_json(payload) {
@@ -1532,29 +1614,33 @@ async fn set_simulator_scenario(
             "The simulator is disabled.",
         );
     }
+    let Some((device, config)) = simulator_by_id_mut(&mut inner, id) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "simulator_not_found",
+            "The simulator was not found.",
+        );
+    };
     if let Some(scenario) = request.scenario {
-        inner.simulator_config.scenario = scenario;
+        config.scenario = scenario;
         if scenario == SimulatorScenario::Normal {
-            inner.simulator_config.telemetry_paused = false;
+            config.telemetry_paused = false;
         } else if scenario == SimulatorScenario::TelemetryPaused {
-            inner.simulator_config.telemetry_paused = true;
+            config.telemetry_paused = true;
         }
     }
     if let Some(profile) = request.wireless_profile {
-        inner.simulator_config.wireless_profile = profile;
-        (
-            inner.simulator_config.connection_delay_ms,
-            inner.simulator_config.write_response_delay_ms,
-        ) = match profile {
+        config.wireless_profile = profile;
+        (config.connection_delay_ms, config.write_response_delay_ms) = match profile {
             WirelessProfile::Standard => (0, 0),
             WirelessProfile::HallwayObserved => (80, 72),
             WirelessProfile::HallwaySlowLink => (702, 72),
         };
-        inner.simulator.rssi_dbm = simulator_rssi(profile, Utc::now());
+        device.rssi_dbm = simulator_rssi(profile, Utc::now());
     }
     if let Some(battery_state) = request.battery_state {
-        inner.simulator_config.battery_state = battery_state;
-        inner.simulator.battery = simulator_battery_telemetry(battery_state, Utc::now());
+        config.battery_state = battery_state;
+        device.battery = simulator_battery_telemetry(battery_state, Utc::now());
     }
     if state.persist(&inner).await.is_err() {
         return error_response(
@@ -1563,11 +1649,30 @@ async fn set_simulator_scenario(
             "Simulator settings may have changed; refresh simulator status.",
         );
     }
-    Json(envelope(simulator_status(&inner), None)).into_response()
+    let data = simulator_by_id(&inner, id)
+        .map(|(device, config)| simulator_status(device, config))
+        .expect("the simulator remains configured after updating it");
+    Json(envelope(data, None)).into_response()
 }
 
 async fn reset_simulator(
     State(state): State<AppState>,
+    payload: Result<Json<SimulatorResetRequest>, JsonRejection>,
+) -> Response {
+    reset_simulator_for(state, SIMULATOR_ID, payload).await
+}
+
+async fn reset_named_simulator(
+    State(state): State<AppState>,
+    RoutePath(id): RoutePath<String>,
+    payload: Result<Json<SimulatorResetRequest>, JsonRejection>,
+) -> Response {
+    reset_simulator_for(state, &id, payload).await
+}
+
+async fn reset_simulator_for(
+    state: AppState,
+    id: &str,
     payload: Result<Json<SimulatorResetRequest>, JsonRejection>,
 ) -> Response {
     let request = match parse_json(payload) {
@@ -1582,6 +1687,13 @@ async fn reset_simulator(
             "The simulator is disabled.",
         );
     }
+    let Some((device, config)) = simulator_by_id_mut(&mut inner, id) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "simulator_not_found",
+            "The simulator was not found.",
+        );
+    };
     let position = request.position_closed_percent.unwrap_or(100);
     if position > 100 {
         return error_response(
@@ -1590,12 +1702,12 @@ async fn reset_simulator(
             "position_closed_percent must be from 0 to 100.",
         );
     }
-    inner.simulator_config.scenario = SimulatorScenario::Normal;
-    inner.simulator_config.telemetry_paused = false;
+    config.scenario = SimulatorScenario::Normal;
+    config.telemetry_paused = false;
     let now = Utc::now();
-    inner.simulator.position = Some(position_value(position, position, now, Source::Simulator));
-    inner.simulator.movement_status = MovementStatus::AtTarget;
-    inner.simulator.last_seen_at = now;
+    device.position = Some(position_value(position, position, now, Source::Simulator));
+    device.movement_status = MovementStatus::AtTarget;
+    device.last_seen_at = now;
     let history_changed = match record_history(&mut inner) {
         Ok(changed) => changed,
         Err(record) => {
@@ -1630,7 +1742,10 @@ async fn reset_simulator(
             "Simulator state may have changed; refresh simulator status.",
         );
     }
-    Json(envelope(simulator_status(&inner), None)).into_response()
+    let data = simulator_by_id(&inner, id)
+        .map(|(device, config)| simulator_status(device, config))
+        .expect("the simulator remains configured after resetting it");
+    Json(envelope(data, None)).into_response()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1925,6 +2040,8 @@ struct SimulatorResetRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SimulatorStatus {
+    id: String,
+    advertised_name: String,
     scenario: SimulatorScenario,
     wireless_profile: WirelessProfile,
     battery_state: BatteryState,
@@ -2287,18 +2404,17 @@ fn read_history(path: &Path) -> io::Result<Vec<HistoryObservation>> {
         .collect()
 }
 
-fn make_simulated_device(now: DateTime<Utc>) -> Device {
-    let name = "Hallway Blinds0".to_owned();
+fn make_simulated_device(id: &str, name: &str, now: DateTime<Utc>) -> Device {
     let payload = simulated_manufacturer_payload(&name, 100, 100);
     let mut manufacturer_data = SOMA_MANUFACTURER_ID.to_le_bytes().to_vec();
     manufacturer_data.extend_from_slice(&payload);
     Device {
-        id: SIMULATOR_ID.to_owned(),
-        logical_id: Some(logical_id_for_name(&name, "simulator")),
-        observed_address: Some("simulator://blind-1".to_owned()),
-        adapter_device_id: "simulator://blind-1".to_owned(),
+        id: id.to_owned(),
+        logical_id: Some(logical_id_for_name(name, "simulator")),
+        observed_address: Some(format!("simulator://{id}")),
+        adapter_device_id: format!("simulator://{id}"),
         device_name: Some("S".to_owned()),
-        advertised_name: name,
+        advertised_name: name.to_owned(),
         rssi_dbm: -84,
         last_seen_at: now,
         freshness: Freshness::Fresh,
@@ -2311,6 +2427,81 @@ fn make_simulated_device(now: DateTime<Utc>) -> Device {
         movement_status: MovementStatus::AtTarget,
         battery: simulator_battery_telemetry(BatteryState::Unavailable, now),
     }
+}
+
+fn initialize_simulators(inner: &mut Inner, now: DateTime<Utc>) {
+    let previous_primary_logical_id = inner.simulator.logical_id.clone();
+    retarget_simulated_device(&mut inner.simulator, SIMULATOR_ID, SIMULATOR_NAME);
+    if inner.simulator_two.is_none() {
+        inner.simulator_two = Some(make_simulated_device(
+            SECOND_SIMULATOR_ID,
+            SECOND_SIMULATOR_NAME,
+            now,
+        ));
+    } else if let Some(device) = inner.simulator_two.as_mut() {
+        retarget_simulated_device(device, SECOND_SIMULATOR_ID, SECOND_SIMULATOR_NAME);
+    }
+    if inner.simulator_two_config.is_none() {
+        inner.simulator_two_config = Some(SimulatorConfig::default());
+    }
+    if let Some(previous_logical_id) = previous_primary_logical_id {
+        let current_logical_id = logical_id_for_name(SIMULATOR_NAME, "simulator");
+        for record in inner
+            .history
+            .iter_mut()
+            .filter(|record| record.device_id == SIMULATOR_ID)
+        {
+            record.logical_id = Some(current_logical_id.clone());
+        }
+        for enrollment in inner
+            .enrollments
+            .values_mut()
+            .filter(|entry| entry.is_simulated)
+        {
+            if enrollment.logical_id == previous_logical_id {
+                enrollment.advertised_name = SIMULATOR_NAME.to_owned();
+                enrollment.logical_id = current_logical_id.clone();
+            }
+        }
+    }
+}
+
+fn retarget_simulated_device(device: &mut Device, id: &str, name: &str) {
+    let (current, target) = device
+        .position
+        .as_ref()
+        .map(|position| {
+            (
+                position.current_closed_percent,
+                position.target_closed_percent,
+            )
+        })
+        .unwrap_or((100, 100));
+    let payload = simulated_manufacturer_payload(name, current, target);
+    let mut manufacturer_data = SOMA_MANUFACTURER_ID.to_le_bytes().to_vec();
+    manufacturer_data.extend_from_slice(&payload);
+    device.id = id.to_owned();
+    device.logical_id = Some(logical_id_for_name(name, "simulator"));
+    device.observed_address = Some(format!("simulator://{id}"));
+    device.adapter_device_id = format!("simulator://{id}");
+    device.advertised_name = name.to_owned();
+    device.source = Source::Simulator;
+    device.is_simulated = true;
+    device.manufacturer_data_hex = hex::encode(manufacturer_data);
+    device.manufacturer_payload_hex = hex::encode(payload);
+}
+
+fn refresh_simulator_after_start(
+    device: &mut Device,
+    config: &SimulatorConfig,
+    now: DateTime<Utc>,
+) {
+    device.freshness = Freshness::Fresh;
+    device.last_seen_at = now;
+    if let Some(position) = device.position.as_mut() {
+        position.observed_at = now;
+    }
+    device.battery = simulator_battery_telemetry(config.battery_state, now);
 }
 
 fn position_value(
@@ -2332,15 +2523,69 @@ fn position_value(
     }
 }
 
-fn simulator_status(inner: &Inner) -> SimulatorStatus {
-    let position = inner.simulator.position.as_ref();
+fn simulator_by_id<'a>(inner: &'a Inner, id: &str) -> Option<(&'a Device, &'a SimulatorConfig)> {
+    match id {
+        SIMULATOR_ID => Some((&inner.simulator, &inner.simulator_config)),
+        SECOND_SIMULATOR_ID => inner
+            .simulator_two
+            .as_ref()
+            .zip(inner.simulator_two_config.as_ref()),
+        _ => None,
+    }
+}
+
+fn simulator_by_id_mut<'a>(
+    inner: &'a mut Inner,
+    id: &str,
+) -> Option<(&'a mut Device, &'a mut SimulatorConfig)> {
+    match id {
+        SIMULATOR_ID => Some((&mut inner.simulator, &mut inner.simulator_config)),
+        SECOND_SIMULATOR_ID => inner
+            .simulator_two
+            .as_mut()
+            .zip(inner.simulator_two_config.as_mut()),
+        _ => None,
+    }
+}
+
+fn simulator_id_for_logical_id(inner: &Inner, logical_id: &str) -> Option<&'static str> {
+    [SIMULATOR_ID, SECOND_SIMULATOR_ID].into_iter().find(|id| {
+        simulator_by_id(inner, id)
+            .is_some_and(|(device, _)| device.logical_id.as_deref() == Some(logical_id))
+    })
+}
+
+fn simulator_count(inner: &Inner) -> usize {
+    1 + usize::from(inner.simulator_two.is_some())
+}
+
+fn simulator_snapshots(inner: &Inner) -> Vec<Device> {
+    [SIMULATOR_ID, SECOND_SIMULATOR_ID]
+        .into_iter()
+        .filter_map(|id| simulator_by_id(inner, id).map(|(device, _)| device_snapshot(device)))
+        .collect()
+}
+
+fn simulator_statuses(inner: &Inner) -> Vec<SimulatorStatus> {
+    [SIMULATOR_ID, SECOND_SIMULATOR_ID]
+        .into_iter()
+        .filter_map(|id| {
+            simulator_by_id(inner, id).map(|(device, config)| simulator_status(device, config))
+        })
+        .collect()
+}
+
+fn simulator_status(device: &Device, config: &SimulatorConfig) -> SimulatorStatus {
+    let position = device.position.as_ref();
     SimulatorStatus {
-        scenario: inner.simulator_config.scenario,
-        wireless_profile: inner.simulator_config.wireless_profile,
-        battery_state: inner.simulator_config.battery_state,
-        connection_delay_ms: inner.simulator_config.connection_delay_ms,
-        write_response_delay_ms: inner.simulator_config.write_response_delay_ms,
-        telemetry_paused: inner.simulator_config.telemetry_paused,
+        id: device.id.clone(),
+        advertised_name: device.advertised_name.clone(),
+        scenario: config.scenario,
+        wireless_profile: config.wireless_profile,
+        battery_state: config.battery_state,
+        connection_delay_ms: config.connection_delay_ms,
+        write_response_delay_ms: config.write_response_delay_ms,
+        telemetry_paused: config.telemetry_paused,
         current_closed_percent: position
             .map(|value| value.current_closed_percent)
             .unwrap_or(100),
@@ -2353,7 +2598,7 @@ fn simulator_status(inner: &Inner) -> SimulatorStatus {
 fn record_history(inner: &mut Inner) -> Result<bool, String> {
     let mut devices: Vec<_> = inner.devices.values().cloned().collect();
     if inner.simulator_enabled {
-        devices.push(device_snapshot(inner));
+        devices.extend(simulator_snapshots(inner));
     }
     let mut changed = false;
     for device in devices {
@@ -2424,8 +2669,8 @@ fn prune_history(inner: &mut Inner) {
     }
 }
 
-fn advance_simulator(inner: &mut Inner, now: DateTime<Utc>) {
-    let Some((current, target)) = inner.simulator.position.as_mut().map(|position| {
+fn advance_simulator(device: &mut Device, config: &SimulatorConfig, now: DateTime<Utc>) {
+    let Some((current, target)) = device.position.as_mut().map(|position| {
         if position.current_closed_percent < position.target_closed_percent {
             position.current_closed_percent = position
                 .current_closed_percent
@@ -2445,8 +2690,8 @@ fn advance_simulator(inner: &mut Inner, now: DateTime<Utc>) {
     }) else {
         return;
     };
-    inner.simulator.movement_status = movement_status(current, target);
-    inner.simulator.rssi_dbm = simulator_rssi(inner.simulator_config.wireless_profile, now);
+    device.movement_status = movement_status(current, target);
+    device.rssi_dbm = simulator_rssi(config.wireless_profile, now);
 }
 
 fn simulator_rssi(profile: WirelessProfile, now: DateTime<Utc>) -> i16 {
@@ -2624,8 +2869,8 @@ fn ble_failure_code(failure: &BleFailure) -> &'static str {
     }
 }
 
-fn device_snapshot(inner: &Inner) -> Device {
-    let mut device = inner.simulator.clone();
+fn device_snapshot(simulator: &Device) -> Device {
+    let mut device = simulator.clone();
     let (current, target) = device
         .position
         .as_ref()
@@ -2679,15 +2924,20 @@ async fn enroll_device(
     }
     let mut inner = state.inner.lock().await;
     prune_registry(&mut inner, Utc::now());
-    let observed = if inner.simulator_enabled && request.observed_device_id == inner.simulator.id {
-        Some(device_snapshot(&inner))
+    let observed = if inner.simulator_enabled {
+        simulator_snapshots(&inner)
+            .into_iter()
+            .find(|device| device.id == request.observed_device_id)
     } else {
+        None
+    }
+    .or_else(|| {
         inner
             .devices
             .values()
             .find(|device| device.id == request.observed_device_id)
             .cloned()
-    };
+    });
     let Some(observed) = observed else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -3326,12 +3576,8 @@ fn resolve_toggle(
         ));
     }
     let device = if enrollment.is_simulated {
-        inner
-            .simulator
-            .logical_id
-            .as_deref()
-            .filter(|logical_id| *logical_id == enrollment.logical_id)
-            .map(|_| &inner.simulator)
+        simulator_id_for_logical_id(inner, &enrollment.logical_id)
+            .and_then(|id| simulator_by_id(inner, id).map(|(device, _)| device))
     } else {
         let matching: Vec<_> = inner
             .devices
@@ -3486,12 +3732,15 @@ async fn process_command(state: AppState, command_id: String) {
     let Ok(_adapter_permit) = state.adapter_slots.clone().acquire_owned().await else {
         return;
     };
-    let (action, scenario, connection_delay_ms, write_delay_ms, is_simulated) = {
+    let (action, simulator_id, scenario, connection_delay_ms, write_delay_ms) = {
         let mut inner = state.inner.lock().await;
-        let is_simulated = inner
+        let simulator_id = inner
             .enrollments
             .get(&managed_device_id)
-            .is_some_and(|enrollment| enrollment.is_simulated);
+            .filter(|enrollment| enrollment.is_simulated)
+            .and_then(|enrollment| simulator_id_for_logical_id(&inner, &enrollment.logical_id));
+        let config = simulator_id
+            .and_then(|id| simulator_by_id(&inner, id).map(|(_, config)| config.clone()));
         let Some(command) = inner.commands.get_mut(&command_id) else {
             return;
         };
@@ -3509,22 +3758,28 @@ async fn process_command(state: AppState, command_id: String) {
         command.started_at = Some(Utc::now());
         command.attempt = 1;
         let action = command.action;
-        let scenario = inner.simulator_config.scenario;
-        let connection_delay_ms = inner.simulator_config.connection_delay_ms;
-        let write_delay_ms = inner.simulator_config.write_response_delay_ms;
+        let scenario = config
+            .as_ref()
+            .map_or(SimulatorScenario::Normal, |config| config.scenario);
+        let connection_delay_ms = config
+            .as_ref()
+            .map_or(0, |config| config.connection_delay_ms);
+        let write_delay_ms = config
+            .as_ref()
+            .map_or(0, |config| config.write_response_delay_ms);
         let _ = state.persist(&inner).await;
         (
             action,
+            simulator_id,
             scenario,
             connection_delay_ms,
             write_delay_ms,
-            is_simulated,
         )
     };
-    if !is_simulated {
+    let Some(simulator_id) = simulator_id else {
         process_physical_command(&state, &command_id, action).await;
         return;
-    }
+    };
     tokio::time::sleep(std::time::Duration::from_millis(
         connection_delay_ms.saturating_add(write_delay_ms),
     ))
@@ -3532,16 +3787,20 @@ async fn process_command(state: AppState, command_id: String) {
 
     let mut inner = state.inner.lock().await;
     let now = Utc::now();
+    let simulator_enabled = inner.simulator_enabled;
+    let Some((device, config)) = simulator_by_id_mut(&mut inner, simulator_id) else {
+        return;
+    };
     if matches!(
         scenario,
         SimulatorScenario::PreWriteFailure
             | SimulatorScenario::OutcomeUnknown
             | SimulatorScenario::GattWriteError
     ) {
-        inner.simulator_config.scenario = SimulatorScenario::Normal;
+        config.scenario = SimulatorScenario::Normal;
     }
     if scenario == SimulatorScenario::TelemetryPaused {
-        inner.simulator_config.telemetry_paused = true;
+        config.telemetry_paused = true;
     }
     let update_simulator_telemetry = matches!(
         scenario,
@@ -3552,9 +3811,9 @@ async fn process_command(state: AppState, command_id: String) {
         SimulatorScenario::Normal
             | SimulatorScenario::OutcomeUnknown
             | SimulatorScenario::TelemetryPaused
-    ) && inner.simulator_enabled
+    ) && simulator_enabled
     {
-        inner.simulator.position.as_mut().map(|position| {
+        device.position.as_mut().map(|position| {
             let target = action.target_closed_percent(position.current_closed_percent);
             position.target_closed_percent = target;
             if update_simulator_telemetry {
@@ -3566,9 +3825,9 @@ async fn process_command(state: AppState, command_id: String) {
         None
     };
     if let Some((current, target)) = simulator_position {
-        inner.simulator.movement_status = movement_status(current, target);
+        device.movement_status = movement_status(current, target);
         if update_simulator_telemetry {
-            inner.simulator.last_seen_at = now;
+            device.last_seen_at = now;
         }
     }
     if let Some(command) = inner.commands.get_mut(&command_id) {
@@ -3949,8 +4208,9 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
     let matching: Vec<&Device> = if enrollment.is_simulated {
         inner
             .simulator_enabled
-            .then_some(&inner.simulator)
-            .filter(|device| device.logical_id.as_deref() == Some(enrollment.logical_id.as_str()))
+            .then(|| simulator_id_for_logical_id(inner, &enrollment.logical_id))
+            .flatten()
+            .and_then(|id| simulator_by_id(inner, id).map(|(device, _)| device))
             .into_iter()
             .collect()
     } else {
@@ -4023,6 +4283,79 @@ fn command_status_text(status: CommandStatus) -> &'static str {
 mod security_hardening_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn persisted_single_simulator_state_keeps_primary_and_adds_second() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let state = AppState::new();
+        let old_name = "Hallway Blinds0";
+        let old_logical_id = logical_id_for_name(old_name, "simulator");
+        {
+            let mut inner = state.inner.lock().await;
+            retarget_simulated_device(&mut inner.simulator, SIMULATOR_ID, old_name);
+            inner.simulator.position = Some(position_value(42, 42, Utc::now(), Source::Simulator));
+            inner.simulator_config.scenario = SimulatorScenario::TelemetryPaused;
+            inner.simulator_config.telemetry_paused = true;
+            let old_snapshot = device_snapshot(&inner.simulator);
+            assert!(record_history_for_device(&mut inner, &old_snapshot));
+            inner.enrollments.insert(
+                "existing-simulator-enrollment".into(),
+                Enrollment {
+                    id: "existing-simulator-enrollment".into(),
+                    label: "My simulator".into(),
+                    advertised_name: old_name.into(),
+                    logical_id: old_logical_id,
+                    is_simulated: true,
+                    created_at: Utc::now(),
+                },
+            );
+            let mut persisted = serde_json::to_value(&*inner).unwrap();
+            let object = persisted.as_object_mut().unwrap();
+            object.remove("simulator_two");
+            object.remove("simulator_two_config");
+            std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+        }
+
+        let restored = AppState::from_data_path(&path).await.unwrap();
+        let inner = restored.inner.lock().await;
+        assert_eq!(inner.simulator.advertised_name, SIMULATOR_NAME);
+        assert_eq!(
+            inner
+                .simulator
+                .position
+                .as_ref()
+                .unwrap()
+                .current_closed_percent,
+            42
+        );
+        assert_eq!(
+            inner.simulator_config.scenario,
+            SimulatorScenario::TelemetryPaused
+        );
+        assert_eq!(
+            inner.history[0].logical_id.as_deref(),
+            Some(logical_id_for_name(SIMULATOR_NAME, "simulator").as_str())
+        );
+        let second = inner.simulator_two.as_ref().unwrap();
+        assert_eq!(second.id, SECOND_SIMULATOR_ID);
+        assert_eq!(second.advertised_name, SECOND_SIMULATOR_NAME);
+        assert_eq!(
+            second.position.as_ref().unwrap().current_closed_percent,
+            100
+        );
+        let enrollment = inner
+            .enrollments
+            .get("existing-simulator-enrollment")
+            .unwrap()
+            .clone();
+        assert_eq!(enrollment.advertised_name, SIMULATOR_NAME);
+        assert_eq!(
+            enrollment.logical_id,
+            logical_id_for_name(SIMULATOR_NAME, "simulator")
+        );
+        assert_eq!(managed_device(&inner, enrollment).availability, "ready");
+    }
+
     #[test]
     fn battery_retry_schedule_distinguishes_unavailable_from_success() {
         let now = Utc::now();
@@ -4073,7 +4406,7 @@ mod security_hardening_tests {
         let now = Utc::now();
         for index in 0..MAX_DISCOVERED_DEVICES {
             let key = format!("peripheral-{index}");
-            let mut device = make_simulated_device(now);
+            let mut device = make_simulated_device(SIMULATOR_ID, SIMULATOR_NAME, now);
             device.id = format!("device-{index}");
             device.logical_id = Some(format!("soma-{index}"));
             device.adapter_device_id = key.clone();
@@ -4269,7 +4602,7 @@ mod security_hardening_tests {
             inner.devices["peripheral-0"].advertised_name,
             "Updated blind"
         );
-        assert_eq!(inner.history.len(), 2);
+        assert_eq!(inner.history.len(), 3);
     }
 
     #[tokio::test]

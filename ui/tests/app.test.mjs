@@ -17,6 +17,23 @@ test('observations are associated only with a unique matching identity and sourc
 });
 test('device-provided text is escaped',()=>assert.equal(escapeHtml('<img src="x">'), '&lt;img src=&quot;x&quot;&gt;'));
 
+test('service refresh loads the simulator collection', async () => {
+ const {refreshService} = await import('../app.mjs');
+ const simulators = [{id:'simulator-1', advertised_name:'Somaris Simulator 1'}, {id:'simulator-2', advertised_name:'Somaris Simulator 2'}];
+ const calls = [];
+ const request = async path => {
+  calls.push(path);
+  if (path === '/api/dev/simulators') return simulators;
+  if (path === '/api/v1/diagnostics') return {scanner:{adapter_available:true}};
+  return [];
+ };
+ const state = {};
+ await refreshService(state, request);
+ assert.ok(calls.includes('/api/dev/simulators'));
+ assert.deepEqual(state.simulators, simulators);
+ assert.equal(state.serviceError, null);
+});
+
 test('enrollment errors survive successful and failed service refreshes until retry or dismissal', async () => {
  const {enrollBlind, refreshService, dismissEnrollmentError} = await import('../app.mjs');
  const state = {enrollmentError:null, serviceError:null};
