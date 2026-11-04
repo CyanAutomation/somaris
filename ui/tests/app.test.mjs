@@ -1,6 +1,28 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, commandMessage, escapeHtml, observationFor} from '../app.mjs';
+import {activityMessage, commandMessage, displayPreferenceFrom, escapeHtml, observationFor, resolveDisplayMode} from '../app.mjs';
+
+test('automatic display mode distinguishes square panels from phones and desktop windows',()=>{
+ assert.equal(resolveDisplayMode('auto', 800, 800), 'panel');
+ assert.equal(resolveDisplayMode('auto', 390, 390), 'panel');
+ assert.equal(resolveDisplayMode('auto', 390, 844), 'mobile');
+ assert.equal(resolveDisplayMode('auto', 1440, 900), 'desktop');
+ assert.equal(resolveDisplayMode('auto', 800, 560), 'desktop');
+});
+
+test('display preference query pins a mode and otherwise uses the saved choice',()=>{
+ assert.equal(displayPreferenceFrom('?view=panel', 'desktop'), 'panel');
+ assert.equal(displayPreferenceFrom('?view=unknown', 'mobile'), 'mobile');
+ assert.equal(displayPreferenceFrom('', 'panel'), 'panel');
+ assert.equal(displayPreferenceFrom('', 'unknown'), 'auto');
+});
+
+test('explicit display mode overrides automatic viewport selection',()=>{
+ assert.equal(resolveDisplayMode('panel', 390, 844), 'panel');
+ assert.equal(resolveDisplayMode('mobile', 1440, 900), 'mobile');
+ assert.equal(resolveDisplayMode('desktop', 390, 844), 'desktop');
+ assert.equal(resolveDisplayMode('unknown', 390, 844), 'mobile');
+});
 
 test('command messages distinguish acknowledgement and uncertain outcomes',()=>{
  assert.match(commandMessage({status:'write_acknowledged'})[0],/acknowledged/i);
