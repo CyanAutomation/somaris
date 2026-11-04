@@ -301,7 +301,21 @@ async fn history_can_be_enabled_and_paged_from_a_persistent_file() {
     assert_eq!(page["data"][0]["position"]["current_closed_percent"], 0);
     assert_eq!(page["meta"]["next_cursor"], 1);
     let saved_lines = std::fs::read_to_string(&history_path).unwrap();
-    assert_eq!(saved_lines.lines().count(), 3);
+    let records: Vec<Value> = saved_lines
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 4);
+    assert!(
+        records
+            .iter()
+            .any(|record| record["device_id"] == "simulator-1")
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["device_id"] == "simulator-2")
+    );
 }
 
 #[tokio::test]

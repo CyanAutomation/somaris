@@ -3,7 +3,7 @@
   "info": {
     "title": "Somaris API",
     "version": "1.2.0",
-    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes only the documented fixed actions. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. The built-in simulator remains available for software development. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. BLE scans use bounded windows and yield exclusive adapter access to GATT operations between windows. The control API has no authentication and is intended for a trusted network; CORS is not authentication."
+    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes only the documented fixed actions. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. Two built-in simulators remain available for software development under the distinct names Somaris Simulator 1 and Somaris Simulator 2. Their positions and failure settings are independent, and simulated commands never use Bluetooth. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. BLE scans use bounded windows and yield exclusive adapter access to GATT operations between windows. The control API has no authentication and is intended for a trusted network; CORS is not authentication."
   },
   "servers": [
     {
@@ -351,7 +351,7 @@
     "/api/dev/simulator": {
       "get": {
         "operationId": "getSimulatorStatus",
-        "summary": "Read simulated blind state and active scenario",
+        "summary": "Read Simulator 1 state and active scenario (legacy endpoint)",
         "responses": {
           "200": {
             "description": "Current in-memory simulator status.",
@@ -387,7 +387,7 @@
     "/api/dev/simulator/scenario": {
       "put": {
         "operationId": "setSimulatorScenario",
-        "summary": "Configure simulator failures, wireless timing, and battery response",
+        "summary": "Configure Simulator 1 failures, wireless timing, and battery response (legacy endpoint)",
         "requestBody": {
           "required": true,
           "content": {
@@ -439,7 +439,7 @@
     "/api/dev/simulator/reset": {
       "post": {
         "operationId": "resetSimulator",
-        "summary": "Reset the simulated blind to an explicit closed percentage",
+        "summary": "Reset Simulator 1 to an explicit closed percentage (legacy endpoint)",
         "requestBody": {
           "required": false,
           "content": {
@@ -471,6 +471,176 @@
       },
       "options": {
         "operationId": "preflightSimulatorReset",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/dev/simulators": {
+      "get": {
+        "operationId": "listSimulators",
+        "summary": "List the built-in simulated blinds and their independent settings",
+        "responses": {
+          "200": {
+            "description": "Current status for each enabled simulator.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SimulatorStatusListEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightSimulators",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/dev/simulators/{id}/scenario": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Built-in simulator ID from GET /api/dev/simulators.",
+          "schema": {
+            "type": "string",
+            "enum": [
+              "simulator-1",
+              "simulator-2"
+            ]
+          }
+        }
+      ],
+      "put": {
+        "operationId": "setNamedSimulatorScenario",
+        "summary": "Configure one simulator failure scenario, wireless profile, or battery response",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SimulatorScenarioRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The requested settings are active for this simulator.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SimulatorStatusEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightNamedSimulatorScenario",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/dev/simulators/{id}/reset": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "Built-in simulator ID from GET /api/dev/simulators.",
+          "schema": {
+            "type": "string",
+            "enum": [
+              "simulator-1",
+              "simulator-2"
+            ]
+          }
+        }
+      ],
+      "post": {
+        "operationId": "resetNamedSimulator",
+        "summary": "Reset one simulator to an explicit closed percentage",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SimulatorResetRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The selected simulator reset completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SimulatorStatusEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightNamedSimulatorReset",
         "summary": "Browser CORS preflight",
         "responses": {
           "204": {
@@ -1667,6 +1837,8 @@
       "SimulatorStatus": {
         "type": "object",
         "required": [
+          "id",
+          "advertised_name",
           "scenario",
           "wireless_profile",
           "battery_state",
@@ -1677,6 +1849,18 @@
           "target_closed_percent"
         ],
         "properties": {
+          "id": {
+            "type": "string",
+            "enum": [
+              "simulator-1",
+              "simulator-2"
+            ],
+            "description": "Stable ID for this built-in simulator."
+          },
+          "advertised_name": {
+            "type": "string",
+            "description": "Distinct synthetic name included in the simulated SOMA V2 advertisement."
+          },
           "scenario": {
             "type": "string",
             "enum": [
@@ -1685,7 +1869,8 @@
               "outcome_unknown",
               "gatt_write_error",
               "telemetry_paused"
-            ]
+            ],
+            "description": "Scenario configured for this simulator only."
           },
           "wireless_profile": {
             "type": "string",
@@ -2314,6 +2499,24 @@
         "properties": {
           "data": {
             "$ref": "#/components/schemas/Command"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "SimulatorStatusListEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SimulatorStatus"
+            }
           },
           "meta": {
             "$ref": "#/components/schemas/Meta"
