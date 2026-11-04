@@ -62,6 +62,25 @@ async fn wait_for_command(app: &Router, command_id: &str) -> Value {
     panic!("command did not reach a terminal state");
 }
 
+async fn wait_for_batch(app: &Router, batch_id: &str) -> Value {
+    for _ in 0..1000 {
+        let (_, _, body) = request(
+            app,
+            Method::GET,
+            &format!("/api/control/v1/batches/{batch_id}"),
+            &[],
+            None,
+        )
+        .await;
+        let batch = body.unwrap()["data"].clone();
+        if !matches!(batch["status"].as_str(), Some("queued" | "running")) {
+            return batch;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    panic!("batch did not reach a terminal state");
+}
+
 #[tokio::test]
 async fn health_reports_liveness_while_readiness_tracks_scanner_availability() {
     let app = router(AppState::new());
@@ -344,6 +363,8 @@ async fn uncertain_simulator_outcomes_are_never_safe_to_retry() {
     assert_eq!(command["status"], "outcome_unknown");
     assert_eq!(command["write_state"], "possibly_sent");
     assert_eq!(command["retryable"], false);
+    let (_, _, activity) = request(&app, Method::GET, "/api/control/v1/audit-log", &[], None).await;
+    assert_eq!(activity.unwrap()["data"][0]["status"], "outcome_unknown");
 }
 
 #[tokio::test]
@@ -352,6 +373,300 @@ async fn history_is_explicitly_unavailable_when_not_configured() {
     let (status, _, body) = request(&app, Method::GET, "/api/v1/history", &[], None).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body.unwrap()["error"]["code"], "history_disabled");
+}
+
+#[tokio::test]
+async fn recent_audit_log_is_available_by_default_and_survives_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("nested/state.json");
+    let app = router(AppState::from_data_path(&state_path).await.unwrap());
+
+    let (status, headers, empty) =
+        request(&app, Method::GET, "/api/control/v1/audit-log", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty.unwrap()["data"], json!([]));
+    let etag = headers.get(header::ETAG).unwrap().to_str().unwrap();
+    let (status, _, _) = request(
+        &app,
+        Method::GET,
+        "/api/control/v1/audit-log",
+        &[("if-none-match", etag)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let simulator_id = devices.unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _, enrolled) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": simulator_id, "label": "Study blind"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let enrollment_id = enrolled.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+
+    let (_, _, accepted) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{enrollment_id}/commands"),
+        &[("idempotency-key", "do-not-store-this-key")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    let command_id = accepted.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&app, &command_id).await["status"],
+        "write_acknowledged"
+    );
+
+    let (status, _, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{enrollment_id}/commands"),
+        &[("idempotency-key", "do-not-store-this-key")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let (status, _, activity) =
+        request(&app, Method::GET, "/api/control/v1/audit-log", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let activity = activity.unwrap()["data"].as_array().unwrap().clone();
+    assert_eq!(activity.len(), 2);
+    assert_eq!(activity[0]["kind"], "command");
+    assert_eq!(activity[0]["action"], "open");
+    assert_eq!(activity[0]["status"], "write_acknowledged");
+    assert_eq!(activity[0]["subject"], "Study blind");
+    assert_eq!(activity[1]["kind"], "enrollment_added");
+    assert_eq!(activity[1]["subject"], "Study blind");
+    assert!(
+        !serde_json::to_string(&activity)
+            .unwrap()
+            .contains("do-not-store-this-key")
+    );
+
+    drop(app);
+    let restored = router(AppState::from_data_path(&state_path).await.unwrap());
+    let (status, _, restored_activity) = request(
+        &restored,
+        Method::GET,
+        "/api/control/v1/audit-log",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(restored_activity.unwrap()["data"], json!(activity));
+}
+
+#[tokio::test]
+async fn recent_audit_log_keeps_only_the_last_thirty_entries() {
+    let app = router(AppState::new());
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let simulator_id = devices.unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    for _ in 0..16 {
+        let (status, _, enrolled) = request(
+            &app,
+            Method::POST,
+            "/api/control/v1/devices",
+            &[],
+            Some(json!({"observed_device_id": simulator_id, "label": "Temporary blind"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let enrollment_id = enrolled.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+        let (status, _, _) = request(
+            &app,
+            Method::DELETE,
+            &format!("/api/control/v1/devices/{enrollment_id}"),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    let (status, _, activity) =
+        request(&app, Method::GET, "/api/control/v1/audit-log", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let activity = activity.unwrap()["data"].as_array().unwrap().clone();
+    assert_eq!(activity.len(), 30);
+    assert_eq!(activity[0]["kind"], "enrollment_removed");
+    assert_eq!(activity[29]["kind"], "enrollment_added");
+}
+
+#[tokio::test]
+async fn recent_audit_log_records_batch_outcomes_and_simulator_changes() {
+    let app = router(AppState::new());
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let devices = devices.unwrap();
+    for device in devices["data"].as_array().unwrap() {
+        let (status, _, _) = request(
+            &app,
+            Method::POST,
+            "/api/control/v1/devices",
+            &[],
+            Some(json!({
+                "observed_device_id": device["id"],
+                "label": device["advertised_name"]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, _, accepted) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "batch-key-not-logged")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let batch_id = accepted.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(wait_for_batch(&app, &batch_id).await["status"], "completed");
+
+    let (status, _, _) = request(
+        &app,
+        Method::PUT,
+        "/api/dev/simulators/simulator-1/scenario",
+        &[],
+        Some(json!({"scenario": "outcome_unknown", "battery_state": "observed_sample"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = request(
+        &app,
+        Method::POST,
+        "/api/dev/simulators/simulator-1/reset",
+        &[],
+        Some(json!({"position_closed_percent": 25})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, activity) =
+        request(&app, Method::GET, "/api/control/v1/audit-log", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let activity = activity.unwrap()["data"].as_array().unwrap().clone();
+    assert_eq!(activity[0]["kind"], "simulator_reset");
+    assert_eq!(activity[0]["detail"], "Reset to 25% closed");
+    assert_eq!(activity[1]["kind"], "simulator_settings_changed");
+    assert_eq!(
+        activity[1]["detail"],
+        "Scenario: outcome_unknown, Battery: observed_sample"
+    );
+    assert_eq!(activity[2]["kind"], "batch");
+    assert_eq!(activity[2]["status"], "completed");
+    assert_eq!(activity[2]["action"], "close");
+    assert!(
+        !serde_json::to_string(&activity)
+            .unwrap()
+            .contains("batch-key-not-logged")
+    );
+}
+
+#[tokio::test]
+async fn durable_state_without_an_audit_log_field_loads_with_an_empty_log() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.json");
+    let app = router(AppState::from_data_path(&state_path).await.unwrap());
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let simulator_id = devices.unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _, _) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": simulator_id, "label": "Legacy state"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    drop(app);
+
+    let bytes = std::fs::read(&state_path).unwrap();
+    let mut persisted: Value = serde_json::from_slice(&bytes).unwrap();
+    persisted.as_object_mut().unwrap().remove("audit_log");
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
+
+    let restored = router(AppState::from_data_path(&state_path).await.unwrap());
+    let (status, _, activity) = request(
+        &restored,
+        Method::GET,
+        "/api/control/v1/audit-log",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(activity.unwrap()["data"], json!([]));
+}
+
+#[tokio::test]
+async fn durable_audit_log_is_trimmed_to_thirty_entries_when_loaded() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.json");
+    let app = router(AppState::from_data_path(&state_path).await.unwrap());
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let simulator_id = devices.unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _, _) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": simulator_id, "label": "Audit state"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    drop(app);
+
+    let bytes = std::fs::read(&state_path).unwrap();
+    let mut persisted: Value = serde_json::from_slice(&bytes).unwrap();
+    persisted["audit_log"] = json!(
+        (0..32)
+            .map(|index| json!({
+                "id": format!("entry-{index}"),
+                "occurred_at": "2026-01-01T00:00:00Z",
+                "kind": "enrollment_added",
+                "subject": format!("Blind {index}")
+            }))
+            .collect::<Vec<_>>()
+    );
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&persisted).unwrap()).unwrap();
+
+    let restored = router(AppState::from_data_path(&state_path).await.unwrap());
+    let (status, _, activity) = request(
+        &restored,
+        Method::GET,
+        "/api/control/v1/audit-log",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let activity = activity.unwrap()["data"].as_array().unwrap().clone();
+    assert_eq!(activity.len(), 30);
+    assert_eq!(activity[0]["id"], "entry-31");
+    assert_eq!(activity[29]["id"], "entry-2");
 }
 
 #[tokio::test]
@@ -379,6 +694,7 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         ("/api/control/v1/devices/{id}/toggle", &["post", "options"]),
         ("/api/control/v1/batches", &["post", "options"]),
         ("/api/control/v1/batches/{id}", &["get", "options"]),
+        ("/api/control/v1/audit-log", &["get", "options"]),
         ("/api/control/v1/queue", &["get", "options"]),
         ("/api/control/v1/commands/{id}", &["get", "options"]),
         ("/openapi.json", &["get"]),
