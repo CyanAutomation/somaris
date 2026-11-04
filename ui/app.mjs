@@ -1,4 +1,16 @@
-export const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+import {
+  escapeHtml,
+  renderBlindActions,
+  renderBlindCard,
+  renderBlindStatus,
+  renderButton,
+  renderDeviceList,
+  renderHomeSupportingSections,
+  renderInfoGrid,
+  movementStatusFromPositions,
+} from './components.mjs';
+
+export {escapeHtml};
 const displayModes = new Set(['auto', 'panel', 'mobile', 'desktop']);
 export function resolveDisplayMode(preference, width, height) {
   if (displayModes.has(preference) && preference !== 'auto') return preference;
@@ -63,49 +75,89 @@ const state = {managed:[], observations:[], diagnostics:null, activity:[], comma
 const esc = escapeHtml;
 const relative = date => { if (!date) return 'Never seen'; const seconds = Math.max(0, Math.floor((Date.now()-new Date(date).getTime())/1000)); if (!Number.isFinite(seconds)) return 'Time unavailable'; if(seconds < 60) return 'Seen just now'; if(seconds < 3600) return `Seen ${Math.floor(seconds/60)} min ago`; if(seconds < 86400) return `Seen ${Math.floor(seconds/3600)} hr ago`; return `Seen ${Math.floor(seconds/86400)} days ago`; };
 async function api(path, options) { const response = await fetch(path, {cache:'no-store', ...options}); const body = await response.json().catch(()=>({})); if(!response.ok) throw new Error(body.error?.message || body.message || `Request failed (${response.status})`); return body.data; }
-function button(label, action, extra='', disabled=false) { return `<button class="button ${extra}" data-action="${action}" ${disabled?'disabled':''}>${label}</button>`; }
+function button(label, action, extra='', disabled=false, icon=null) {
+ return renderButton({label, action, variant:extra, disabled, icon});
+}
 function notice(message, dismissAction) { return message ? `<div class="notice" role="alert">${esc(message)}${dismissAction?` <button class="text-button" data-action="${dismissAction}">Dismiss</button>`:''}</div>` : ''; }
 function availability(value) { return ({ready:['Ready',''],stale:['Stale','warn'],not_seen:['Not seen','warn'],ambiguous:['Ambiguous','bad']})[value] || ['Unavailable','warn']; }
 function card(device) {
  const e=device.enrollment, o=observationFor(device,state.observations), [label,tone]=availability(device.availability), p=device.position?.current_closed_percent;
  const command=state.commands[e.id]; const [message,msgTone]=command ? commandMessage(command) : ['', ''];
- const position=Number.isInteger(p) ? `${p}<span>%</span>` : '—';
- const movement=({opening:'Opening',closing:'Closing',at_target:'At reported target'})[o?.movement_status] || 'Position unavailable';
  const lines=Number.isInteger(p) ? Math.max(1, Math.round(p/100*11)) : 0;
- return `<article class="card"><div class="card-top"><div><div class="subtle">${e.is_simulated?'SIMULATED BLIND':'YOUR BLIND'}</div><h3><button class="card-title" data-action="details:${esc(e.id)}" aria-label="View details for ${esc(e.label)}">${esc(e.label)}</button></h3><div class="subtle">${esc(relative(device.last_seen_at))}</div></div><span class="badge ${tone}">${label}</span></div><div class="blind-display"><div><div class="position-value">${position}</div><div class="position-caption">${Number.isInteger(p)?'closed · '+esc(movement):'No position reported'}</div></div><div class="blind-art" aria-hidden="true">${'<i></i>'.repeat(lines)}</div></div><div class="controls">${button('↑ &nbsp; Open','command:open:'+esc(e.id),'',!!state.serviceError||device.availability!=='ready'||state.busy.has(e.id))}${button('■ &nbsp; Stop','command:stop:'+esc(e.id),'secondary',!!state.serviceError||device.availability!=='ready')}${button('↓ &nbsp; Close','command:close:'+esc(e.id),'secondary',!!state.serviceError||device.availability!=='ready'||state.busy.has(e.id))}</div>${message?`<p class="message ${msgTone}" role="status">${esc(message)}</p>`:''}${device.availability!=='ready'?'<p class="message warn">Controls are unavailable until this blind is uniquely observed again.</p>':''}<div class="card-foot">${batteryDisplay(o?.battery)}<button class="text-button" data-action="details:${esc(e.id)}">View details &nbsp; ↗</button></div></article>`;
+ const disabled=!!state.serviceError||device.availability!=='ready';
+ const controlsMarkup=renderBlindActions({
+  deviceId:e.id, blindLabel:e.label,
+  panelMode:document.documentElement.dataset.displayMode==='panel',
+  disabled, busy:state.busy.has(e.id),
+ });
+ const messageMarkup=message?`<p class="message ${msgTone}" role="status">${esc(message)}</p>`:'';
+ const availabilityMessage=device.availability!=='ready'?'<p class="message warn">Controls are unavailable until this blind is uniquely observed again.</p>':'';
+ const footerMarkup=`${batteryDisplay(o?.battery)}<button type="button" class="text-button" data-action="details:${esc(e.id)}">View details &nbsp; ↗</button>`;
+ return renderBlindCard({
+  id:e.id, label:e.label, isSimulated:e.is_simulated, lastSeen:relative(device.last_seen_at),
+  availabilityLabel:label, availabilityTone:tone,
+  positionPercent:p, movementStatus:o?.movement_status, blindLines:lines,
+  controlsMarkup, messageMarkup:`${messageMarkup}${availabilityMessage}`, footerMarkup,
+ });
 }
 function activityPanel() {
  const entries = state.activity || [];
  const list = entries.length
   ? `<ol class="activity-list">${entries.map(entry=>`<li class="activity-item"><span class="activity-copy">${esc(activityMessage(entry))}${entry.detail&&entry.kind!=='simulator_settings_changed'&&entry.kind!=='simulator_reset'?`<span class="subtle">${esc(entry.detail)}</span>`:''}</span><time datetime="${esc(entry.completed_at||entry.occurred_at)}">${esc(new Date(entry.completed_at||entry.occurred_at).toLocaleString())}</time></li>`).join('')}</ol>`
   : '<div class="panel activity-empty"><p>No changes recorded yet.</p></div>';
- if (document.documentElement.dataset.displayMode === 'panel') return `<details class="activity-section panel-activity"><summary><span>Recent activity</span><span class="count">${entries.length} of 30 changes</span></summary>${list}</details>`;
  return `<section class="activity-section"><div class="section-heading"><h2>Recent activity</h2><span class="count">${entries.length} of 30 changes</span></div>${list}</section>`;
 }
 function home() {
  const panelMode = document.documentElement.dataset.displayMode === 'panel';
- const hero = panelMode ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${button('+ &nbsp; Add a blind','add')}</section>`;
- const add = panelMode ? button('+ Add','add','secondary panel-add') : '';
+ const hero = panelMode ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${button('Add a blind','add','',false,'add')}</section>`;
+ const add = panelMode ? button('Add','add','secondary panel-add',false,'add') : '';
  const empty = panelMode
   ? `<div class="panel empty"><h3>No blinds yet</h3><p>Add a nearby blind to see its status and controls here.</p></div>`
-  : `<div class="panel empty"><div class="empty-icon">☼</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p>${button('+ &nbsp; Add a blind','add')}</div>`;
- const standardSections = panelMode ? activityPanel() : `${activityPanel()}<div class="section-heading" style="margin-top:35px"><h2>Somaris service</h2><button class="text-button" data-action="service">View service status &nbsp; ↗</button></div><p class="subtle">${esc(scannerSummary())}</p>`;
- return `${hero}${notice(state.serviceError)}${notice(state.actionError,'dismiss-action')}<div class="section-heading"><h2>Your blinds</h2><span class="count">${state.managed.length} ${state.managed.length===1?'blind':'blinds'}</span>${add}</div>${state.managed.length?`<div class="grid">${state.managed.map(card).join('')}</div>`:empty}${standardSections}`;
+  : `<div class="panel empty"><div class="empty-icon">☼</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p>${button('Add a blind','add','',false,'add')}</div>`;
+ const listMarkup=renderDeviceList({
+  count:state.managed.length, panelMode, addButton:add,
+  cardsMarkup:state.managed.map(card).join(''), emptyMarkup:empty,
+ });
+ const serviceMarkup=`<div class="section-heading" style="margin-top:35px"><h2>Somaris service</h2><button type="button" class="text-button" data-action="service">View service status &nbsp; ↗</button></div><p class="subtle">${esc(scannerSummary())}</p>`;
+ const supportingSections=renderHomeSupportingSections({
+  panelMode,
+  activityMarkup:panelMode?'':activityPanel(),
+  serviceMarkup:panelMode?'':serviceMarkup,
+ });
+ return `${hero}${notice(state.serviceError)}${notice(state.actionError,'dismiss-action')}${listMarkup}${supportingSections}`;
 }
 function scannerSummary(){ const s=state.diagnostics?.scanner; if(!s) return 'Service status unavailable'; return s.adapter_available ? (s.scan_active?'Bluetooth adapter available · scanning':'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
 function back(){ return '<button class="text-button back" data-action="home">← &nbsp; Back to your blinds</button>'; }
 function addPage(){ const available=state.observations.filter(o=>!state.managed.some(m=>m.enrollment.logical_id===o.logical_id && !!m.enrollment.is_simulated===!!o.is_simulated)); return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p>${notice(state.serviceError)}${notice(state.enrollmentError,'dismiss-enrollment')}<div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length?`<div class="stack">${available.map(o=>`<form class="panel device-row" data-enroll="${esc(o.id)}"><div><h3>${esc(o.advertised_name||o.device_name||'Unnamed blind')}</h3><p class="subtle">${o.is_simulated?'Simulator · ':''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field">Display name<input name="label" maxlength="64" required value="${esc(o.advertised_name||o.device_name||'Blind')}"></label></div><button class="button" ${o.freshness!=='fresh'?'disabled':''}>Add blind</button></form>`).join('')}</div>`:`<div class="panel empty"><div class="empty-icon">⌁</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available?'Keep your blind nearby and refresh in a moment.': 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${button('Refresh devices','refresh','secondary')}</div>`}`; }
-function detailPage(id){ const d=state.managed.find(x=>x.enrollment.id===id); if(!d) return `${back()}<div class="notice">This blind is no longer enrolled.</div>`; const o=observationFor(d,state.observations); const fields=[['Availability',availability(d.availability)[0]],['Last observation',d.last_seen_at?new Date(d.last_seen_at).toLocaleString():'Never'],['Position',d.position?`${d.position.current_closed_percent}% closed`:'Unavailable'],['Reported target',d.position?`${d.position.target_closed_percent}% closed`:'Unavailable'],['Signal',o?.rssi_dbm!=null?`${o.rssi_dbm} dBm`:'Unavailable'],['Battery voltage',o?.battery?.voltage_mv!=null?`${o.battery.voltage_mv} mV${o.battery.status!=='observed'?' (cached)':''}`:'Unavailable'],['Source',d.enrollment.is_simulated?'Simulator':'Bluetooth']]; return `${back()}<h1 class="page-title">${esc(d.enrollment.label)}</h1><p class="page-intro">The latest observations reported by your blind.</p><div class="info-grid">${fields.map(([k,v])=>`<div class="info-item"><span class="meta-label subtle">${esc(k)}</span><strong>${esc(v)}</strong></div>`).join('')}</div><p class="message">Position is observed telemetry and may not reflect the current physical position.</p>`; }
+function detailPage(id){
+ const d=state.managed.find(x=>x.enrollment.id===id);
+ if(!d)return `${back()}<div class="notice">This blind is no longer enrolled.</div>`;
+ const o=observationFor(d,state.observations);
+ const fields=[
+  {label:'Availability',value:availability(d.availability)[0]},
+  {label:'Position',contentMarkup:renderBlindStatus({positionPercent:d.position?.current_closed_percent,movementStatus:o?.movement_status,compact:true})},
+  {label:'Last observation',value:d.last_seen_at?new Date(d.last_seen_at).toLocaleString():'Never'},
+  {label:'Reported target',value:d.position?`${d.position.target_closed_percent}% closed`:'Unavailable'},
+  {label:'Signal',value:o?.rssi_dbm!=null?`${o.rssi_dbm} dBm`:'Unavailable'},
+  {label:'Battery voltage',value:o?.battery?.voltage_mv!=null?`${o.battery.voltage_mv} mV${o.battery.status!=='observed'?' (cached)':''}`:'Unavailable'},
+  {label:'Source',value:d.enrollment.is_simulated?'Simulator':'Bluetooth'},
+ ];
+ return `${back()}<h1 class="page-title">${esc(d.enrollment.label)}</h1><p class="page-intro">The latest observations reported by your blind.</p>${renderInfoGrid(fields)}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>`;
+}
 function simulatorControls(){
  if(!state.simulators?.length)return '';
- const options=(values,current)=>values.map(([v,l])=>`<option value="${v}" ${v===current?'selected':''}>${l}</option>`).join('');
+ const options=(values,current)=>values.map(([value,label])=>`<option value="${value}" ${value===current?'selected':''}>${label}</option>`).join('');
  const scenarios=[['normal','Normal'],['pre_write_failure','Connection failure'],['outcome_unknown','Unknown outcome'],['gatt_write_error','Write error'],['telemetry_paused','Telemetry paused']];
  const profiles=[['standard','Standard'],['hallway_observed','Hallway observed'],['hallway_slow_link','Hallway slow link']];
  const batteries=[['unsupported','Unsupported'],['unavailable','Unavailable'],['observed_sample','Observed sample']];
- const instances=state.simulators.map(simulator=>`<div class="simulator-controls"><h3>${esc(simulator.advertised_name)}</h3><p class="subtle">${simulator.current_closed_percent}% closed · simulator ID ${esc(simulator.id)}</p><form data-simulator="${esc(simulator.id)}"><label class="field">Scenario<select name="scenario">${options(scenarios,simulator.scenario)}</select></label><label class="field">Wireless profile<select name="wireless_profile">${options(profiles,simulator.wireless_profile)}</select></label><label class="field">Battery state<select name="battery_state">${options(batteries,simulator.battery_state)}</select></label><button class="button">Apply settings</button></form><button class="button secondary" style="margin-top:12px" data-action="sim-reset:${esc(simulator.id)}">Reset to closed</button></div>`).join('');
+ const instances=state.simulators.map(simulator=>{
+  const movementStatus=movementStatusFromPositions(simulator.current_closed_percent,simulator.target_closed_percent);
+  const position=renderBlindStatus({positionPercent:simulator.current_closed_percent,movementStatus,compact:true});
+  return `<div class="simulator-controls"><h3>${esc(simulator.advertised_name)}</h3><div class="simulator-position">${position}<span class="subtle">Simulator ID ${esc(simulator.id)}</span></div><form data-simulator="${esc(simulator.id)}"><label class="field">Scenario<select name="scenario">${options(scenarios,simulator.scenario)}</select></label><label class="field">Wireless profile<select name="wireless_profile">${options(profiles,simulator.wireless_profile)}</select></label><label class="field">Battery state<select name="battery_state">${options(batteries,simulator.battery_state)}</select></label><button class="button">Apply settings</button></form><button class="button secondary" style="margin-top:12px" data-action="sim-reset:${esc(simulator.id)}">Reset to closed</button></div>`;
+ }).join('');
  return `<section class="panel" style="margin-top:28px"><p class="eyebrow">Development</p><h2>Simulator controls</h2><p class="subtle">Settings and resets apply only to the selected simulator.</p>${instances}</section>`;
 }
-function servicePage(){ const s=state.diagnostics?.scanner; return `${back()}<h1 class="page-title">Service status</h1><p class="page-intro">A closer look at the Somaris service and Bluetooth scanner.</p>${notice(state.serviceError)}${notice(state.actionError,'dismiss-action')}<div class="info-grid">${[['Service',state.serviceError?'Connection problem':'Connected'],['Bluetooth adapter',s?.adapter_available?'Available':'Unavailable'],['Scanner',s?.status||'Unavailable'],['Advertisements seen',s?.soma_advertisements_seen??'—'],['Last scanner error',s?.last_error_code||'None reported'],['Telemetry history',state.diagnostics?.history_enabled?'Enabled':'Not enabled'],['Simulators',state.simulators?.length??'Unavailable or disabled']].map(([k,v])=>`<div class="info-item"><span class="meta-label subtle">${esc(k)}</span><strong>${esc(v)}</strong></div>`).join('')}</div>${simulatorControls()}`; }
+function servicePage(){ const s=state.diagnostics?.scanner; const fields=[['Service',state.serviceError?'Connection problem':'Connected'],['Bluetooth adapter',s?.adapter_available?'Available':'Unavailable'],['Scanner',s?.status||'Unavailable'],['Advertisements seen',s?.soma_advertisements_seen??'—'],['Last scanner error',s?.last_error_code||'None reported'],['Telemetry history',state.diagnostics?.history_enabled?'Enabled':'Not enabled'],['Simulators',state.simulators?.length??'Unavailable or disabled']].map(([label,value])=>({label,value})); return `${back()}<h1 class="page-title">Service status</h1><p class="page-intro">A closer look at the Somaris service and Bluetooth scanner.</p>${notice(state.serviceError)}${notice(state.actionError,'dismiss-action')}${renderInfoGrid(fields)}${simulatorControls()}`; }
 function page(){return location.hash.slice(1)||'home'}
 function render(){ if(!app)return; const focused=app.contains(document.activeElement) ? document.activeElement.dataset.action : null; const p=page(); app.innerHTML=p==='add'?addPage():p==='service'?servicePage():p.startsWith('details/')?detailPage(decodeURIComponent(p.slice(8))):home(); const indicator=document.querySelector('#service-status'); indicator.innerHTML=`<span class="status-dot ${state.serviceError?'bad':state.diagnostics?.scanner?.adapter_available?'good':''}"></span> ${state.serviceError?'Disconnected':state.diagnostics?.scanner?.adapter_available?'Connected':'Service degraded'}`; if(focused) [...app.querySelectorAll('[data-action]')].find(el=>el.dataset.action===focused)?.focus({preventScroll:true}); }
 export async function refreshService(target, request) {
