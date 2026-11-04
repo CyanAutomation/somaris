@@ -62,6 +62,18 @@ export function renderButton({
   return `<button type="button" class="${classes}" data-action="${escapeHtml(action)}"${accessibility}${titleAttribute}${disabled ? ' disabled' : ''}>${iconContent}${labelContent}</button>`;
 }
 
+export function renderAddBlindButton({variant = ''} = {}) {
+  return renderButton({
+    label:'Add a blind',
+    accessibleLabel:'Add a blind',
+    title:'Add a blind',
+    action:'add',
+    variant:['add-icon-button', variant].filter(Boolean).join(' '),
+    icon:'add',
+    iconOnly:true,
+  });
+}
+
 export function renderBlindActions({deviceId, blindLabel, panelMode = false, disabled = false, busy = false}) {
   const actions = [
     ['open', 'Open', ''],
