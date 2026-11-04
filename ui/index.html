@@ -3,6 +3,9 @@
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#11141a"><title>Somaris — your blinds</title>
+  <link rel="icon" type="image/svg+xml" href="/ui/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/ui/favicon-32x32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/ui/apple-touch-icon.png">
   <link rel="stylesheet" href="/ui/style.css">
   <link rel="stylesheet" href="/ui/components.css">
   <link rel="stylesheet" href="/ui/panel.css">
@@ -11,24 +14,7 @@
   <div class="app-shell">
     <header class="topbar">
       <a class="brand" href="#home" aria-label="Somaris home"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>somaris<span class="brand-dot">.</span></span></a>
-      <div class="top-actions">
-        <span id="service-status" class="service-status"><span class="status-dot"></span> Connecting</span>
-        <details class="display-menu">
-          <summary class="icon-button" aria-label="Display mode" title="Display mode">▦</summary>
-          <div class="display-popover">
-            <label for="display-mode">Display mode</label>
-            <select id="display-mode">
-              <option value="auto">Auto</option>
-              <option value="panel">Panel</option>
-              <option value="mobile">Mobile</option>
-              <option value="desktop">Desktop</option>
-            </select>
-            <span class="subtle">Auto adapts to this screen.</span>
-            <a class="display-link" href="#service">Service status</a>
-          </div>
-        </details>
-        <button class="icon-button" id="refresh" aria-label="Refresh" title="Refresh">↻</button>
-      </div>
+      <div class="top-actions" id="top-actions"></div>
     </header>
     <main id="app"><div class="loading">Connecting to Somaris…</div></main>
     <footer>Made for a little more light. <span>Somaris</span></footer>

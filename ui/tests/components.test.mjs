@@ -9,8 +9,10 @@ import {
   renderBadge,
   renderDeviceCardHeader,
   renderButton,
+  renderIconButton,
   renderAddBlindButton,
   renderDeviceList,
+  renderTopbarActions,
   renderHomeSupportingSections,
   renderInfoGrid,
 } from '../components.mjs';
@@ -66,6 +68,16 @@ test('shared button primitive escapes user text and supports icon-only accessibl
   assert.doesNotMatch(markup, /<span class="button-label">Open<\/span>/);
 });
 
+test('reusable icon button primitive provides consistent accessible icon controls', () => {
+  const markup = renderIconButton({label:'Refresh', action:'refresh', icon:'refresh'});
+  assert.match(markup, /class="button icon-button icon-action"/);
+  assert.match(markup, /aria-label="Refresh"/);
+  assert.match(markup, /title="Refresh"/);
+  assert.match(markup, /data-action="refresh"/);
+  assert.match(markup, /data-icon="refresh"/);
+  assert.doesNotMatch(markup, /button-label/);
+});
+
 test('shared badge and device-card header primitives keep card markup consistent and escaped', () => {
   assert.equal(renderBadge({label:'Ready', tone:''}), '<span class="badge">Ready</span>');
   assert.equal(renderBadge({label:'Stale <blind>', tone:'warn'}), '<span class="badge warn">Stale &lt;blind&gt;</span>');
@@ -115,18 +127,39 @@ test('regular device cards keep the shared components without panel-only variant
   assert.match(card, /class="badge">Ready<\/span>/);
 });
 
-test('panel device list keeps count and add action without a visible section title', () => {
+test('panel device list omits its heading because panel count and add action live in the topbar', () => {
   const panel = renderDeviceList({
-    count:3, panelMode:true, addButton:'<button>+ Add</button>', cardsMarkup:'<article>Blind</article>',
+    count:3, panelMode:true, cardsMarkup:'<article>Blind</article>',
     emptyMarkup:'<div>No blinds</div>',
   });
-  assert.match(panel, /3 blinds/);
-  assert.match(panel, /<button>\+ Add<\/button>/);
+  assert.doesNotMatch(panel, /3 blinds|<button>\+ Add<\/button>/);
   assert.doesNotMatch(panel, /<h2[^>]*>Your blinds<\/h2>/);
   assert.match(panel, /<article>Blind<\/article>/);
 
   const regular = renderDeviceList({count:1, panelMode:false, addButton:'', cardsMarkup:'<article>Blind</article>', emptyMarkup:''});
   assert.match(regular, /<h2>Your blinds<\/h2>/);
+});
+
+test('topbar composes the plus-only add action beside display and refresh controls', () => {
+  const panel = renderTopbarActions({blindCount:3, panelMode:true, displayPreference:'panel'});
+  assert.match(panel, /class="topbar-device-count">3 blinds<\/span>/);
+  assert.match(panel, /data-action="add"[^>]*aria-label="Add a blind"/);
+  assert.match(panel, /data-icon="add"/);
+  assert.match(panel, /aria-label="Display mode"/);
+  assert.match(panel, /data-icon="display"/);
+  assert.match(panel, /data-action="refresh"[^>]*aria-label="Refresh"/);
+  assert.match(panel, /data-icon="refresh"/);
+  assert.ok(panel.indexOf('data-action="add"') < panel.indexOf('aria-label="Display mode"'));
+  assert.ok(panel.indexOf('aria-label="Display mode"') < panel.indexOf('data-action="refresh"'));
+  assert.doesNotMatch(panel, />Add a blind</);
+
+  for (const displayPreference of ['mobile', 'desktop']) {
+    const regular = renderTopbarActions({blindCount:3, panelMode:false, displayPreference});
+    assert.doesNotMatch(regular, /topbar-device-count/);
+    assert.match(regular, /data-action="add"/);
+    assert.match(regular, /data-icon="add"/);
+    assert.doesNotMatch(regular, />Add a blind</);
+  }
 });
 
 test('panel home omits supporting sections while regular view retains activity and service', () => {
