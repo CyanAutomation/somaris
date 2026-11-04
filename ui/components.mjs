@@ -4,6 +4,8 @@ export const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, chara
 
 const icons = {
   add:'<path d="M12 5v14M5 12h14"/>',
+  display:'<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/>',
+  refresh:'<path d="M20 11a8 8 0 0 0-14.9-3M4 4v4h4M4 13a8 8 0 0 0 14.9 3M20 20v-4h-4"/>',
   open:'<path d="M12 19V5M5 12l7-7 7 7"/>',
   stop:'<rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"/>',
   close:'<path d="M12 5v14m7-7-7 7-7-7"/>',
@@ -75,16 +77,44 @@ export function renderButton({
   return `<button type="button" class="${classes}" data-action="${escapeHtml(action)}"${accessibility}${titleAttribute}${disabled ? ' disabled' : ''}>${iconContent}${labelContent}</button>`;
 }
 
-export function renderAddBlindButton({variant = ''} = {}) {
+export function renderIconButton({label, action, icon, variant = '', disabled = false}) {
   return renderButton({
-    label:'Add a blind',
-    accessibleLabel:'Add a blind',
-    title:'Add a blind',
-    action:'add',
-    variant:['add-icon-button', variant].filter(Boolean).join(' '),
-    icon:'add',
+    label,
+    accessibleLabel:label,
+    title:label,
+    action,
+    variant:['icon-button', variant].filter(Boolean).join(' '),
+    disabled,
+    icon,
     iconOnly:true,
   });
+}
+
+export function renderAddBlindButton({variant = ''} = {}) {
+  return renderIconButton({
+    label:'Add a blind',
+    action:'add',
+    variant:['add-icon-button', 'topbar-add', variant].filter(Boolean).join(' '),
+    icon:'add',
+  });
+}
+
+export function renderTopbarActions({
+  blindCount = 0,
+  panelMode = false,
+  displayPreference = 'auto',
+  serviceLabel = 'Connecting',
+  serviceTone = '',
+} = {}) {
+  const modes = [['auto', 'Auto'], ['panel', 'Panel'], ['mobile', 'Mobile'], ['desktop', 'Desktop']];
+  const safePreference = modes.some(([value]) => value === displayPreference) ? displayPreference : 'auto';
+  const count = Number.isInteger(blindCount) && blindCount >= 0 ? blindCount : 0;
+  const countLabel = `${count} ${count === 1 ? 'blind' : 'blinds'}`;
+  const status = `<span id="service-status" class="service-status"><span class="status-dot${serviceTone ? ` ${escapeHtml(serviceTone)}` : ''}"></span> ${escapeHtml(serviceLabel)}</span>`;
+  const panelCount = panelMode ? `<span class="topbar-device-count">${escapeHtml(countLabel)}</span>` : '';
+  const displayMenu = `<details class="display-menu"><summary class="icon-button display-mode-button" aria-label="Display mode" title="Display mode">${iconMarkup('display')}</summary><div class="display-popover"><label for="display-mode">Display mode</label><select id="display-mode">${modes.map(([value, label]) => `<option value="${value}"${value === safePreference ? ' selected' : ''}>${label}</option>`).join('')}</select><span class="subtle">Auto adapts to this screen.</span><a class="display-link" href="#service">Service status</a></div></details>`;
+  const refreshButton = renderIconButton({label:'Refresh', action:'refresh', icon:'refresh', variant:'topbar-icon-button'});
+  return `${status}${panelCount}${renderAddBlindButton()}${displayMenu}${refreshButton}`;
 }
 
 export function renderBlindActions({deviceId, blindLabel, panelMode = false, disabled = false, busy = false}) {
@@ -131,12 +161,12 @@ export function renderBlindCard({
   return `<article class="card${cardVariant}">${header}<div class="blind-display${displayVariant}">${status}<div class="blind-art" aria-hidden="true">${slats}</div></div>${controlsMarkup}${messageMarkup}<div class="card-foot">${footerMarkup}</div></article>`;
 }
 
-export function renderDeviceList({count, panelMode = false, addButton = '', cardsMarkup = '', emptyMarkup = '', title = 'Your blinds'}) {
+export function renderDeviceList({count, panelMode = false, cardsMarkup = '', emptyMarkup = '', title = 'Your blinds'}) {
   const titleContent = panelMode ? '' : `<h2>${escapeHtml(title)}</h2>`;
-  const addContent = panelMode ? addButton : '';
-  const countLabel = `${count} ${count === 1 ? 'blind' : 'blinds'}`;
+  const countLabel = panelMode ? '' : `<span class="count">${count} ${count === 1 ? 'blind' : 'blinds'}</span>`;
   const content = cardsMarkup ? `<div class="grid">${cardsMarkup}</div>` : emptyMarkup;
-  return `<section class="device-list${panelMode ? ' device-list--panel' : ''}" aria-label="${escapeHtml(title)}"><div class="section-heading device-list-heading">${titleContent}<span class="count">${countLabel}</span>${addContent}</div>${content}</section>`;
+  const heading = panelMode ? '' : `<div class="section-heading device-list-heading">${titleContent}${countLabel}</div>`;
+  return `<section class="device-list${panelMode ? ' device-list--panel' : ''}" aria-label="${escapeHtml(title)}">${heading}${content}</section>`;
 }
 
 export function renderHomeSupportingSections({panelMode = false, activityMarkup = '', serviceMarkup = ''}) {

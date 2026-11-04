@@ -1125,6 +1125,9 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/panel.css", get(ui_panel_style))
         .route("/ui/app.mjs", get(ui_app))
         .route("/ui/components.mjs", get(ui_components))
+        .route("/ui/favicon.svg", get(ui_favicon_svg))
+        .route("/ui/favicon-32x32.png", get(ui_favicon_png))
+        .route("/ui/apple-touch-icon.png", get(ui_apple_touch_icon))
         .route("/api/v1/health", get(health).options(preflight))
         .route("/api/v1/ready", get(ready).options(preflight))
         .route("/api/v1/diagnostics", get(diagnostics).options(preflight))
@@ -1238,6 +1241,27 @@ async fn ui_components() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../ui/components.mjs"),
+    )
+}
+
+async fn ui_favicon_svg() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml; charset=utf-8")],
+        include_str!("../ui/favicon.svg"),
+    )
+}
+
+async fn ui_favicon_png() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        Bytes::from_static(include_bytes!("../ui/favicon-32x32.png")),
+    )
+}
+
+async fn ui_apple_touch_icon() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        Bytes::from_static(include_bytes!("../ui/apple-touch-icon.png")),
     )
 }
 
