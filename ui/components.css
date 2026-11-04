@@ -17,3 +17,14 @@
 .device-list-heading .count{margin-left:auto}
 .simulator-position{display:flex;align-items:baseline;gap:16px;margin:10px 0 16px;flex-wrap:wrap}
 .simulator-position .blind-state--compact{margin:0}
+.button.danger{background:#8a342d;color:#fff}
+.button.danger:hover{background:#a94438}
+.enrollment-actions{display:grid;gap:10px;margin-top:30px}
+.enrollment-actions h2{font-size:18px;letter-spacing:-.02em;margin:0}
+.enrollment-actions>p{color:var(--color-muted);line-height:1.5;margin:0 0 4px;max-width:620px}
+.enrollment-actions>.button{justify-self:start}
+.confirmation-panel{display:grid;gap:16px;margin:8px 0 0;border-color:#693d38}
+.confirmation-copy h2{font-size:18px;letter-spacing:-.02em;margin:0 0 8px}
+.confirmation-copy p{color:var(--color-muted);line-height:1.5;margin:0}
+.confirmation-actions{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}
+@media(max-width:600px){.confirmation-actions>.button{flex:1 1 140px}}

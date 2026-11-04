@@ -9,6 +9,7 @@ const icons = {
   open:'<path d="M12 19V5M5 12l7-7 7 7"/>',
   stop:'<rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"/>',
   close:'<path d="M12 5v14m7-7-7 7-7-7"/>',
+  trash:'<path d="M4 7h16M10 11v6m4-6v6M5 7l1 14h12l1-14M9 7V4h6v3"/>',
 };
 
 export function iconMarkup(name) {
@@ -88,6 +89,21 @@ export function renderIconButton({label, action, icon, variant = '', disabled = 
     icon,
     iconOnly:true,
   });
+}
+
+export function renderDestructiveButton({label, action, disabled = false, icon = 'trash'}) {
+  return renderButton({label, action, variant:'danger', disabled, icon});
+}
+
+export function renderConfirmationPanel({
+  title,
+  message,
+  confirmLabel = 'Confirm',
+  confirmAction,
+  cancelAction,
+  disabled = false,
+}) {
+  return `<section class="confirmation-panel panel" role="group" aria-label="${escapeHtml(title)}"><div class="confirmation-copy"><h2>${escapeHtml(title)}</h2><p>${escapeHtml(message)}</p></div><div class="confirmation-actions">${renderButton({label:'Cancel', action:cancelAction, variant:'secondary', disabled})}${renderDestructiveButton({label:confirmLabel, action:confirmAction, disabled})}</div></section>`;
 }
 
 export function renderAddBlindButton({variant = ''} = {}) {
