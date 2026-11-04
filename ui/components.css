@@ -1,0 +1,36 @@
+.ui-icon{display:block;width:1.2em;height:1.2em;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.controls .button{display:flex;align-items:center;justify-content:center;gap:8px}
+.blind-state{display:grid;gap:5px;min-width:0}
+.blind-state__label{font-size:clamp(26px,3vw,36px);font-weight:780;line-height:1;letter-spacing:-.04em}
+.blind-state__percent{color:var(--color-muted);font-size:14px;line-height:1.2}
+.blind-state--compact{margin-top:8px}
+.blind-state--compact .blind-state__label{font-size:20px}
+.blind-state--compact .blind-state__percent{font-size:13px}
+.device-list-heading .count{margin-left:auto}
+.panel-device-list-heading{justify-content:flex-end}
+.panel-device-list-heading .count{margin-left:0}
+.simulator-position{display:flex;align-items:baseline;gap:16px;margin:10px 0 16px;flex-wrap:wrap}
+.simulator-position .blind-state--compact{margin:0}
+
+html[data-display-mode="panel"] .device-list--panel .device-list-heading{justify-content:flex-end;gap:12px;min-height:48px;margin:0 0 12px}
+html[data-display-mode="panel"] .device-list--panel .device-list-heading .count{margin:0;font-size:14px}
+html[data-display-mode="panel"] .device-list--panel .panel-add{min-width:90px;min-height:48px;padding:10px 15px;font-size:15px}
+html[data-display-mode="panel"] .device-list--panel .grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+html[data-display-mode="panel"] .device-list--panel .card{display:flex;min-width:0;flex-direction:column;padding:14px;border-radius:20px}
+html[data-display-mode="panel"] .device-list--panel .card-top{gap:8px;align-items:center}
+html[data-display-mode="panel"] .device-list--panel .card h3{font-size:17px;line-height:1.15}
+html[data-display-mode="panel"] .device-list--panel .badge{padding:6px 8px;font-size:11px}
+html[data-display-mode="panel"] .device-list--panel .blind-display{min-height:58px;margin:12px 0;gap:8px}
+html[data-display-mode="panel"] .device-list--panel .blind-state__label{font-size:26px}
+html[data-display-mode="panel"] .device-list--panel .blind-state__percent{font-size:13px}
+html[data-display-mode="panel"] .device-list--panel .controls{grid-template-columns:repeat(3,minmax(56px,1fr));gap:8px}
+html[data-display-mode="panel"] .device-list--panel .controls .button.icon-action{width:100%;min-width:56px;min-height:64px;padding:12px;border-radius:16px}
+html[data-display-mode="panel"] .device-list--panel .controls .ui-icon{width:30px;height:30px}
+html[data-display-mode="panel"] .device-list--panel .card .message{margin:10px 0 0;font-size:12px;line-height:1.4}
+html[data-display-mode="panel"] .device-list--panel .card-foot{display:none}
+
+@media(max-width:480px){
+ html[data-display-mode="panel"] .device-list--panel .grid{grid-template-columns:minmax(0,1fr)}
+ html[data-display-mode="panel"] .device-list--panel .card{padding:16px}
+ html[data-display-mode="panel"] .device-list--panel .blind-display{margin:14px 0}
+}
