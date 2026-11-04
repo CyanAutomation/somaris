@@ -38,36 +38,3 @@ html[data-display-mode="mobile"] footer{margin-top:55px}
  html[data-display-mode="desktop"] .device-row .button{width:auto}
  html[data-display-mode="desktop"] footer{margin-top:80px}
 }
-
-html[data-display-mode="panel"],html[data-display-mode="panel"] body{height:100%;min-height:0;overflow:hidden}
-html[data-display-mode="panel"] body{height:100vh;height:100dvh}
-html[data-display-mode="panel"] .app-shell{display:flex;flex-direction:column;width:100%;max-width:none;height:100%;min-height:0;margin:0;padding:0 16px}
-html[data-display-mode="panel"] .topbar{height:48px;min-height:48px}
-html[data-display-mode="panel"] .top-actions{gap:8px}
-html[data-display-mode="panel"] .service-status{font-size:0;gap:0}
-html[data-display-mode="panel"] .service-status .status-dot{width:9px;height:9px}
-html[data-display-mode="panel"] #app{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:4px 0 8px}
-html[data-display-mode="panel"] footer,html[data-display-mode="panel"] .hero{display:none}
-html[data-display-mode="panel"] .section-heading{gap:8px;margin:0 0 6px}
-html[data-display-mode="panel"] .section-heading h2{font-size:16px}
-html[data-display-mode="panel"] .count{margin-left:auto;font-size:12px}
-html[data-display-mode="panel"] .panel-add{min-height:44px;padding:8px 13px;font-size:13px}
-html[data-display-mode="panel"] .grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-html[data-display-mode="panel"] .card{min-width:0;padding:8px;border-radius:17px}
-html[data-display-mode="panel"] .card-top{gap:6px;align-items:center}
-html[data-display-mode="panel"] .card-top>div>.subtle:first-child,html[data-display-mode="panel"] .card-top>div>.subtle:last-child{display:none}
-html[data-display-mode="panel"] .card h3{min-width:0;margin:0;font-size:15px;line-height:1.1;overflow-wrap:anywhere}
-html[data-display-mode="panel"] .badge{padding:5px 7px;font-size:10px}
-html[data-display-mode="panel"] .blind-display{margin:5px 0;gap:8px}
-html[data-display-mode="panel"] .position-value{font-size:32px}
-html[data-display-mode="panel"] .position-value span{font-size:16px}
-html[data-display-mode="panel"] .position-caption{margin-top:2px;font-size:10px;line-height:1.15}
-html[data-display-mode="panel"] .blind-art,html[data-display-mode="panel"] .card-foot{display:none}
-html[data-display-mode="panel"] .controls{gap:4px}
-html[data-display-mode="panel"] .controls .button{min-width:0;min-height:44px;padding:7px 2px;font-size:11px;white-space:nowrap}
-html[data-display-mode="panel"] .message{margin:8px 0 0;font-size:11px;line-height:1.35}
-html[data-display-mode="panel"] .notice{margin:0 0 8px;padding:10px 12px;font-size:12px}
-html[data-display-mode="panel"] .empty{padding:18px 14px;text-align:left}
-html[data-display-mode="panel"] .empty h3{font-size:16px;margin-bottom:5px}
-html[data-display-mode="panel"] .empty p{margin:0;line-height:1.4;font-size:12px}
-html[data-display-mode="panel"] #app>.subtle{display:none}

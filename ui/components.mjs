@@ -36,9 +36,22 @@ export function movementStatusFromPositions(currentPercent, targetPercent) {
   return targetPercent > currentPercent ? 'closing' : 'opening';
 }
 
-export function renderBlindStatus({positionPercent, movementStatus, compact = false}) {
+export function renderBlindStatus({positionPercent, movementStatus, compact = false, panelMode = false}) {
   const {label, percentClosed} = blindState(positionPercent, movementStatus);
-  return `<div class="blind-state${compact ? ' blind-state--compact' : ''}"><strong class="blind-state__label">${escapeHtml(label)}</strong>${percentClosed === null ? '' : `<span class="blind-state__percent">${percentClosed}% closed</span>`}</div>`;
+  const variants = [compact && 'blind-state--compact', panelMode && 'blind-state--panel'].filter(Boolean).join(' ');
+  return `<div class="blind-state${variants ? ` ${variants}` : ''}"><strong class="blind-state__label">${escapeHtml(label)}</strong>${percentClosed === null ? '' : `<span class="blind-state__percent">${percentClosed}% closed</span>`}</div>`;
+}
+
+export function renderBadge({label, tone = ''}) {
+  const variant = tone ? ` ${escapeHtml(tone)}` : '';
+  return `<span class="badge${variant}">${escapeHtml(label)}</span>`;
+}
+
+export function renderDeviceCardHeader({id, label, availabilityLabel, availabilityTone = '', isSimulated = false, lastSeen = ''}) {
+  const escapedId = escapeHtml(id);
+  const escapedLabel = escapeHtml(label);
+  const kind = isSimulated ? 'SIMULATED BLIND' : 'YOUR BLIND';
+  return `<div class="card-top device-card-header"><div class="device-card-heading"><div class="subtle">${kind}</div><h3><button type="button" class="card-title" data-action="details:${escapedId}" aria-label="View details for ${escapedLabel}">${escapedLabel}</button></h3><div class="subtle">${escapeHtml(lastSeen)}</div></div>${renderBadge({label:availabilityLabel, tone:availabilityTone})}</div>`;
 }
 
 export function renderButton({
@@ -108,12 +121,14 @@ export function renderBlindCard({
   controlsMarkup,
   messageMarkup = '',
   footerMarkup = '',
+  panelMode = false,
 }) {
-  const escapedId = escapeHtml(id);
-  const escapedLabel = escapeHtml(label);
   const slats = '<i></i>'.repeat(Math.max(0, Math.min(11, blindLines)));
-  const tone = availabilityTone ? ` ${escapeHtml(availabilityTone)}` : '';
-  return `<article class="card"><div class="card-top"><div><div class="subtle">${isSimulated ? 'SIMULATED BLIND' : 'YOUR BLIND'}</div><h3><button type="button" class="card-title" data-action="details:${escapedId}" aria-label="View details for ${escapedLabel}">${escapedLabel}</button></h3><div class="subtle">${escapeHtml(lastSeen)}</div></div><span class="badge${tone}">${escapeHtml(availabilityLabel)}</span></div><div class="blind-display">${renderBlindStatus({positionPercent, movementStatus})}<div class="blind-art" aria-hidden="true">${slats}</div></div>${controlsMarkup}${messageMarkup}<div class="card-foot">${footerMarkup}</div></article>`;
+  const cardVariant = panelMode ? ' card--panel' : '';
+  const displayVariant = panelMode ? ' blind-display--panel' : '';
+  const header = renderDeviceCardHeader({id, label, availabilityLabel, availabilityTone, isSimulated, lastSeen});
+  const status = renderBlindStatus({positionPercent, movementStatus, panelMode});
+  return `<article class="card${cardVariant}">${header}<div class="blind-display${displayVariant}">${status}<div class="blind-art" aria-hidden="true">${slats}</div></div>${controlsMarkup}${messageMarkup}<div class="card-foot">${footerMarkup}</div></article>`;
 }
 
 export function renderDeviceList({count, panelMode = false, addButton = '', cardsMarkup = '', emptyMarkup = '', title = 'Your blinds'}) {
