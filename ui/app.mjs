@@ -3,6 +3,7 @@ import {
   renderBlindActions,
   renderBlindCard,
   renderBlindStatus,
+  renderAddBlindButton,
   renderButton,
   renderDeviceList,
   renderHomeSupportingSections,
@@ -109,11 +110,11 @@ function activityPanel() {
 }
 function home() {
  const panelMode = document.documentElement.dataset.displayMode === 'panel';
- const hero = panelMode ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${button('Add a blind','add','',false,'add')}</section>`;
- const add = panelMode ? button('Add','add','secondary panel-add',false,'add') : '';
+ const hero = panelMode ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${renderAddBlindButton({variant:'hero-add'})}</section>`;
+ const add = panelMode ? renderAddBlindButton({variant:'secondary panel-add'}) : '';
  const empty = panelMode
   ? `<div class="panel empty"><h3>No blinds yet</h3><p>Add a nearby blind to see its status and controls here.</p></div>`
-  : `<div class="panel empty"><div class="empty-icon">☼</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p>${button('Add a blind','add','',false,'add')}</div>`;
+  : `<div class="panel empty"><div class="empty-icon">☼</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p>${renderAddBlindButton()}</div>`;
  const listMarkup=renderDeviceList({
   count:state.managed.length, panelMode, addButton:add,
   cardsMarkup:state.managed.map(card).join(''), emptyMarkup:empty,

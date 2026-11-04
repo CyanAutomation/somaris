@@ -7,6 +7,7 @@ import {
   renderBlindCard,
   renderBlindStatus,
   renderButton,
+  renderAddBlindButton,
   renderDeviceList,
   renderHomeSupportingSections,
   renderInfoGrid,
@@ -61,6 +62,15 @@ test('shared button primitive escapes user text and supports icon-only accessibl
   assert.match(markup, /data-action="command:open:&lt;id&gt;"/);
   assert.match(markup, /aria-hidden="true"/);
   assert.doesNotMatch(markup, /<span class="button-label">Open<\/span>/);
+});
+
+test('add-blind action is a plus-only button with an accessible name and tooltip', () => {
+  const markup = renderAddBlindButton({variant:'secondary panel-add'});
+  assert.match(markup, /aria-label="Add a blind"/);
+  assert.match(markup, /title="Add a blind"/);
+  assert.match(markup, /data-action="add"/);
+  assert.match(markup, /data-icon="add"/);
+  assert.doesNotMatch(markup, /class="button-label"/);
 });
 
 test('device card composes the state, named actions and reusable content areas', () => {
