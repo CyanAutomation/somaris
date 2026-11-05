@@ -792,7 +792,7 @@
       "post": {
         "operationId": "submitBlindCommand",
         "summary": "Queue a validated open, close, or stop command",
-        "description": "Commands are serialized FIFO per managed device and recheck freshness and identity before each physical attempt. Adapter concurrency is bounded. Stop cancels queued movements and can preempt an in-flight movement only before its GATT write starts; after that the stop runs behind it. Queued commands expire after the configured queue wait timeout. On service restart, queued commands resume after a fresh observation; a command that was connecting is recovered as outcome_unknown and is never replayed. Physical commands receive one automatic retry at most after a confirmed connection or service-discovery failure before any GATT write, with a 250 ms backoff. A shared 45-second execution deadline covers all attempts and backoff; queue wait has a separate timeout. After Stop or deadline cancellation, Somaris allows up to 10 additional seconds for adapter cleanup before finalizing the command. If the execution deadline expires before a write, the command is connection_failed with error_code command_timeout and is safe to resubmit with a new idempotency key. If a write may have started, the outcome is outcome_unknown and must be checked against telemetry before retrying. Command responses distinguish GATT write acknowledgement from movement observed in /api/v1/devices. Managed physical-device entries expose gatt_readiness as historical command evidence, not a live connection probe. For physical devices, stop uses the one-byte 00 payload on the separately discovered motor-control characteristic. Simulated commands use the in-memory model and never invoke BlueZ.",
+        "description": "Commands are serialized per managed device and recheck freshness and identity before each physical attempt. Adapter concurrency is bounded. Stop cancels queued movements and can preempt an in-flight movement only before its GATT write starts; after that the stop runs behind it. Queued commands expire after the configured queue wait timeout. On service restart, queued commands resume after a fresh observation; a command that was connecting is recovered as outcome_unknown and is never replayed. Physical commands receive at most one automatic retry after a confirmed connection or service-discovery failure before any GATT write. Retry delay uses capped exponential backoff with deterministic jitter, increasing with recent confirmed pre-write failures. After four such failed attempts within ten minutes, Open and Close requests are throttled for an increasing cooldown (15 seconds to 120 seconds); Stop remains available. Stop batches make one attempt for every target before retrying eligible pre-write failures. A Stop's first connection window is 12 seconds and its recovery window is 20 seconds; Open and Close retain a 30-second connection window. A shared 45-second execution deadline covers each command's attempts and backoff; queue wait has a separate timeout. After cancellation, Somaris allows up to 10 additional seconds for adapter cleanup before finalizing the command. If the execution deadline expires before a write, the command is connection_failed with error_code command_timeout and is safe to resubmit with a new idempotency key. If a write may have started, the outcome is outcome_unknown and must be checked against telemetry before retrying. Command attempts include phase timing and the advertisement age and RSSI used. Managed physical-device entries expose distinct advertisement, transport, and movement evidence; none is a live GATT probe. Movement feedback learns a per-blind rate from observed position samples and reports stalls without issuing corrective commands. For physical devices, stop uses the one-byte 00 payload on the separately discovered motor-control characteristic. Simulated commands use the in-memory model and never invoke BlueZ.",
         "parameters": [
           {
             "name": "Idempotency-Key",
@@ -835,6 +835,16 @@
           },
           "409": {
             "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "description": "Repeated confirmed pre-write failures have placed Open and Close requests in cooldown. Stop is exempt.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds until another movement request is accepted.",
+                "schema": {"type": "integer", "minimum": 1}
+              }
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}
           },
           "415": {
             "$ref": "#/components/responses/Error"
@@ -909,6 +919,16 @@
           "409": {
             "$ref": "#/components/responses/Error"
           },
+          "429": {
+            "description": "Repeated confirmed pre-write failures have placed the selected Open or Close request in cooldown.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds until another movement request is accepted.",
+                "schema": {"type": "integer", "minimum": 1}
+              }
+            },
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}
+          },
           "503": {
             "$ref": "#/components/responses/Error"
           },
@@ -934,7 +954,7 @@
       "post": {
         "operationId": "submitBlindBatch",
         "summary": "Queue an action for all currently ready enrolled blinds",
-        "description": "The service snapshots enrolled blinds with a unique, fresh supported observation at acceptance. Enrollments that are not seen, stale, or ambiguous are returned in skipped and do not count as failures. The durable batch processes targets sequentially in label order. Each target uses the existing durable command queue, rechecks identity and freshness before connecting, and reports its ordinary child command status. A failed target does not prevent later targets from running. A batch is idempotent by its required Idempotency-Key; repeating that key with another action returns 409. A write_acknowledged child does not confirm physical movement. If no enrolled blind is ready, the request returns 409 no_available_blinds.",
+        "description": "The service snapshots enrolled blinds with a unique, fresh supported observation at acceptance. Enrollments that are not seen, stale, ambiguous, or in a movement cooldown are returned in skipped and do not count as failures; Stop batches bypass cooldown. The durable batch processes targets sequentially in label order. Stop batches cancel queued movement and preempt in-flight movement before its GATT write on every accepted target, reserve adapter access for the batch, make one attempt for each blind, then retry eligible confirmed pre-write failures. Each target rechecks identity and freshness before connecting and reports its ordinary child command status. A failed target does not prevent later targets from running. A batch is idempotent by its required Idempotency-Key; repeating that key with another action returns 409. A write_acknowledged child does not confirm physical movement. If no enrolled blind is eligible for the requested action, the request returns 409 no_available_blinds.",
         "parameters": [
           {
             "name": "Idempotency-Key",
@@ -2217,6 +2237,11 @@
             "type": "string",
             "format": "date-time"
           },
+          "advertisement_age_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Age of the latest advertisement at response generation. A fresh observation does not prove GATT connection readiness."
+          },
           "position": {
             "$ref": "#/components/schemas/ControlPosition"
           },
@@ -2224,6 +2249,10 @@
             "type": "string",
             "enum": ["closing", "opening", "at_target", "unavailable"],
             "description": "Derived from motor-reported current and target positions."
+          },
+          "motion_feedback": {
+            "$ref": "#/components/schemas/MotionFeedback",
+            "description": "Position-derived progress and a learned travel-rate estimate. It does not trigger automatic corrective commands."
           },
           "position_status": {
             "type": "string",
@@ -2272,6 +2301,7 @@
         "type": "object",
         "required": [
           "status",
+          "transport_evidence",
           "attempt_count"
         ],
         "properties": {
@@ -2281,6 +2311,7 @@
               "untested",
               "queued",
               "connecting",
+              "deferred",
               "connection_failed",
               "write_acknowledged",
               "write_failed",
@@ -2288,7 +2319,22 @@
               "expired",
               "cancelled"
             ],
-            "description": "Outcome of the latest retained physical command. Acknowledged is historical evidence of a successful GATT response, not current reachability or movement."
+            "description": "Outcome of the latest retained physical command. deferred means it was accepted before a cooldown opened but was held before any write. Acknowledged is historical evidence of a successful GATT response, not current reachability or movement."
+          },
+          "transport_evidence": {
+            "type": "string",
+            "enum": [
+              "untested",
+              "command_pending",
+              "cooldown",
+              "recently_acknowledged",
+              "acknowledgement_aged",
+              "prewrite_failure",
+              "write_failed",
+              "outcome_unknown",
+              "no_recent_write"
+            ],
+            "description": "Interpretation of the latest retained command evidence. Advertisement availability is reported separately."
           },
           "last_command_accepted_at": {
             "type": "string",
@@ -2314,6 +2360,28 @@
           "error_code": {
             "type": "string",
             "description": "Stable code for the latest failed or cancelled command."
+          },
+          "cooldown_until": {
+            "type": "string",
+            "format": "date-time",
+            "description": "After repeated confirmed pre-write failures, Open and Close requests are temporarily throttled. Stop remains available."
+          }
+        }
+      },
+      "MotionFeedback": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": ["awaiting_progress", "progress_observed", "stalled", "target_reached", "unavailable"],
+            "description": "Derived from motor position advertisements. Stall detection requires fresh position telemetry and never causes an automatic movement command."
+          },
+          "last_progress_at": {"type": "string", "format": "date-time"},
+          "estimated_travel_rate_percent_per_second": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Median observed position rate from retained samples for this motor and target direction."
           }
         }
       },
@@ -2441,7 +2509,8 @@
             "enum": [
               "not_seen",
               "stale",
-              "ambiguous"
+              "ambiguous",
+              "cooldown"
             ]
           }
         }
@@ -2603,6 +2672,7 @@
             "enum": [
               "queued",
               "connecting",
+              "deferred",
               "connection_failed",
               "write_acknowledged",
               "write_failed",
@@ -2699,6 +2769,22 @@
             "type": "integer",
             "minimum": 0
           },
+          "phase_timings": {
+            "$ref": "#/components/schemas/BleAttemptTimings"
+          },
+          "advertisement_observed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "advertisement_age_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "advertisement_rssi_dbm": {
+            "type": "integer",
+            "minimum": -127,
+            "maximum": 20
+          },
           "write_state": {
             "type": "string",
             "enum": [
@@ -2713,6 +2799,18 @@
           "error_code": {
             "type": "string"
           }
+        }
+      },
+      "BleAttemptTimings": {
+        "type": "object",
+        "properties": {
+          "peripheral_lookup_ms": {"type": "integer", "minimum": 0},
+          "connect_ms": {"type": "integer", "minimum": 0},
+          "service_discovery_ms": {"type": "integer", "minimum": 0},
+          "identity_verification_ms": {"type": "integer", "minimum": 0},
+          "gatt_discovery_ms": {"type": "integer", "minimum": 0},
+          "gatt_write_ms": {"type": "integer", "minimum": 0},
+          "disconnect_ms": {"type": "integer", "minimum": 0}
         }
       },
       "QueueDiagnostics": {

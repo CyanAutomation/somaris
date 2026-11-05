@@ -15,8 +15,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{
     ble::{
-        BleAdapter, BleCommandControl, BleFailure, BleFailureStage, BleObservation,
-        BtleplugAdapter, SOMA_MANUFACTURER_ID, decode_ba71_voltage, parse_soma_payload,
+        BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureStage,
+        BleObservation, BtleplugAdapter, SOMA_MANUFACTURER_ID, decode_ba71_voltage,
+        parse_soma_payload,
     },
     controller::ServiceAction,
     integration::{DeviceCapabilities, StateChange, StateChangePublisher},
@@ -262,6 +263,7 @@ pub struct AppState {
     inner: Arc<Mutex<Inner>>,
     device_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     command_controls: Arc<Mutex<HashMap<String, BleCommandControl>>>,
+    battery_controls: Arc<Mutex<HashMap<String, BleCommandControl>>>,
     adapter_slots: Arc<Semaphore>,
     ble_adapter: Arc<RwLock<Option<Arc<dyn BleAdapter>>>>,
     ble_enabled: bool,
@@ -498,6 +500,7 @@ impl AppState {
             inner: Arc::new(Mutex::new(inner)),
             device_locks: Arc::new(Mutex::new(HashMap::new())),
             command_controls: Arc::new(Mutex::new(HashMap::new())),
+            battery_controls: Arc::new(Mutex::new(HashMap::new())),
             adapter_slots: Arc::new(Semaphore::new(queue_config.adapter_concurrency)),
             ble_adapter: Arc::new(RwLock::new(None)),
             ble_enabled: false,
@@ -1104,28 +1107,73 @@ impl AppState {
                     .collect::<Vec<_>>()
             };
             for (managed_id, logical_id, expected_name, peripheral_id) in candidates {
-                let lock = {
-                    let mut locks = self.device_locks.lock().await;
-                    locks
-                        .entry(managed_id.clone())
-                        .or_insert_with(|| Arc::new(Semaphore::new(1)))
-                        .clone()
-                };
-                let Ok(_device_permit) = lock.acquire_owned().await else {
-                    continue;
-                };
-                let Ok(_adapter_permit) = self.adapter_slots.clone().acquire_owned().await else {
-                    continue;
-                };
-                self.record_battery_attempt(
-                    &logical_id,
-                    &peripheral_id,
-                    expected_name,
-                    adapter.clone(),
-                )
-                .await;
+                if self
+                    .poll_battery_candidate(
+                        managed_id,
+                        logical_id,
+                        expected_name,
+                        peripheral_id,
+                        adapter.clone(),
+                    )
+                    .await
+                {
+                    // Let an accepted Stop use the adapter before polling another blind.
+                    break;
+                }
             }
         }
+    }
+
+    async fn poll_battery_candidate(
+        &self,
+        managed_id: String,
+        logical_id: String,
+        expected_name: String,
+        peripheral_id: String,
+        adapter: Arc<dyn BleAdapter>,
+    ) -> bool {
+        let control = BleCommandControl::new();
+        self.battery_controls
+            .lock()
+            .await
+            .insert(managed_id.clone(), control.clone());
+        let lock = {
+            let mut locks = self.device_locks.lock().await;
+            locks
+                .entry(managed_id.clone())
+                .or_insert_with(|| Arc::new(Semaphore::new(1)))
+                .clone()
+        };
+        let preempted = async {
+            let _device_permit = tokio::select! {
+                biased;
+                _ = control.cancelled() => return true,
+                permit = lock.acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return false,
+                },
+            };
+            let _adapter_permit = tokio::select! {
+                biased;
+                _ = control.cancelled() => return true,
+                permit = self.adapter_slots.clone().acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return false,
+                },
+            };
+            self.record_battery_attempt(
+                &logical_id,
+                &peripheral_id,
+                expected_name,
+                adapter,
+                &control,
+            )
+            .await;
+            control.is_cancelled()
+        }
+        .await;
+        self.battery_controls.lock().await.remove(&managed_id);
+        preempted
     }
 
     async fn record_battery_attempt(
@@ -1134,9 +1182,12 @@ impl AppState {
         peripheral_id: &str,
         expected_name: String,
         adapter: Arc<dyn BleAdapter>,
+        control: &BleCommandControl,
     ) {
         let attempted_at = Utc::now();
-        let response = adapter.read_battery(peripheral_id, &expected_name).await;
+        let response = adapter
+            .read_battery_with_control(peripheral_id, &expected_name, control)
+            .await;
         let mut inner = self.inner.lock().await;
         let Some(device) = inner.devices.get_mut(peripheral_id) else {
             return;
@@ -1174,6 +1225,12 @@ impl AppState {
                     .or_else(|| Some(ble_failure_code(&failure).into()));
                 device.battery.failure_stage = Some(failure.stage.as_str().into());
             }
+        }
+    }
+
+    async fn preempt_battery_read(&self, managed_device_id: &str) {
+        if let Some(control) = self.battery_controls.lock().await.get(managed_device_id) {
+            control.request_prewrite_cancel();
         }
     }
 }
@@ -2320,10 +2377,14 @@ pub struct ManagedDevice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertisement_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<ControlPosition>,
     /// Motor-reported target, separate from Somaris command intent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub movement_status: Option<MovementStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub motion_feedback: Option<MotionFeedback>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position_status: Option<PositionStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2342,10 +2403,31 @@ pub struct ManagedDevice {
     pub requested_command_status: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionFeedbackStatus {
+    AwaitingProgress,
+    ProgressObserved,
+    Stalled,
+    TargetReached,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotionFeedback {
+    pub status: MotionFeedbackStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_travel_rate_percent_per_second: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GattReadiness {
     /// The most recent command outcome; historical evidence, not a live connection probe.
     pub status: String,
+    /// A compact interpretation of the latest transport evidence.
+    pub transport_evidence: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_command_accepted_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2357,6 +2439,8 @@ pub struct GattReadiness {
     pub failure_stage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2401,6 +2485,7 @@ struct CommandRequest {
 enum CommandStatus {
     Queued,
     Connecting,
+    Deferred,
     ConnectionFailed,
     WriteAcknowledged,
     WriteFailed,
@@ -2458,6 +2543,14 @@ struct CommandAttempt {
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
     write_state: WriteState,
+    #[serde(default)]
+    phase_timings: BleAttemptTimings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advertisement_observed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advertisement_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advertisement_rssi_dbm: Option<i16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_stage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3533,7 +3626,7 @@ async fn queue_batch(
             "Idempotency-Key must contain 1 to 128 characters.",
         );
     };
-    let batch = {
+    let (batch, cancelled_movements, preemptible_movements) = {
         let mut inner = state.inner.lock().await;
         let key_id = format!("batch:{key}");
         if let Some(existing_id) = inner.batch_idempotency.get(&key_id)
@@ -3557,6 +3650,8 @@ async fn queue_batch(
             .iter()
             .filter(|enrollment| {
                 managed_device(&inner, (*enrollment).clone()).availability == "ready"
+                    && (request.action == Action::Stop
+                        || cooldown_remaining_seconds(&inner, &enrollment.id, Utc::now()).is_none())
             })
             .count();
         if inner.commands.len().saturating_add(ready_count) > MAX_COMMANDS
@@ -3570,9 +3665,46 @@ async fn queue_batch(
         }
         let mut targets = Vec::new();
         let mut skipped = Vec::new();
+        let mut cancelled_movements = Vec::new();
+        let mut preemptible_movements = Vec::new();
         for enrollment in enrollments {
             let managed = managed_device(&inner, enrollment.clone());
-            if managed.availability == "ready" {
+            let cooling_down = request.action != Action::Stop
+                && cooldown_remaining_seconds(&inner, &enrollment.id, Utc::now()).is_some();
+            if managed.availability == "ready" && !cooling_down {
+                if request.action == Action::Stop {
+                    let mut cancelled = Vec::new();
+                    for command in inner.commands.values_mut().filter(|command| {
+                        command.managed_device_id == enrollment.id
+                            && command.status == CommandStatus::Queued
+                            && matches!(command.action, Action::Open | Action::Close)
+                    }) {
+                        command.status = CommandStatus::Cancelled;
+                        command.completed_at = Some(Utc::now());
+                        command.error_code = Some("preempted_by_stop".into());
+                        command.retryable = false;
+                        cancelled_movements.push(command.id.clone());
+                        cancelled.push((
+                            command.id.clone(),
+                            command.completed_at.unwrap_or_else(Utc::now),
+                        ));
+                    }
+                    for (id, completed_at) in cancelled {
+                        update_activity_status(&mut inner, &id, "cancelled", completed_at);
+                    }
+                    preemptible_movements.extend(
+                        inner
+                            .commands
+                            .values()
+                            .filter(|command| {
+                                command.managed_device_id == enrollment.id
+                                    && command.status == CommandStatus::Connecting
+                                    && command.write_state == WriteState::NotSent
+                                    && matches!(command.action, Action::Open | Action::Close)
+                            })
+                            .map(|command| command.id.clone()),
+                    );
+                }
                 let child_key = format!("batch:{key}:{}", enrollment.id);
                 let command = make_command(
                     &enrollment.id,
@@ -3596,7 +3728,11 @@ async fn queue_batch(
                 skipped.push(BatchSkipped {
                     managed_device_id: enrollment.id,
                     label: enrollment.label,
-                    availability: managed.availability,
+                    availability: if cooling_down {
+                        "cooldown".into()
+                    } else {
+                        managed.availability
+                    },
                 });
             }
         }
@@ -3604,7 +3740,7 @@ async fn queue_batch(
             return error_response(
                 StatusCode::CONFLICT,
                 "no_available_blinds",
-                "No enrolled device is ready for control.",
+                "No enrolled device is eligible for this batch action; devices may be unseen, stale, ambiguous, or cooling down.",
             );
         }
         let now = Utc::now();
@@ -3642,8 +3778,24 @@ async fn queue_batch(
                 "Batch may have been accepted; refresh the batch list through its returned resource.",
             );
         }
-        batch
+        (batch, cancelled_movements, preemptible_movements)
     };
+    if !cancelled_movements.is_empty() || !preemptible_movements.is_empty() {
+        let mut controls = state.command_controls.lock().await;
+        for id in cancelled_movements {
+            controls.remove(&id);
+        }
+        for id in preemptible_movements {
+            if let Some(control) = controls.get(&id) {
+                control.request_prewrite_cancel();
+            }
+        }
+    }
+    if batch.action == Action::Stop {
+        for target in &batch.targets {
+            state.preempt_battery_read(&target.managed_device_id).await;
+        }
+    }
     tokio::spawn(process_batch(state, batch.id.clone()));
     (StatusCode::ACCEPTED, Json(envelope(batch, None))).into_response()
 }
@@ -3735,6 +3887,7 @@ struct ApiFailure {
     status: StatusCode,
     code: &'static str,
     message: String,
+    retry_after_seconds: Option<u64>,
 }
 
 impl ApiFailure {
@@ -3743,13 +3896,25 @@ impl ApiFailure {
             status,
             code,
             message: message.into(),
+            retry_after_seconds: None,
         }
+    }
+
+    fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_seconds = Some(seconds);
+        self
     }
 }
 
 impl IntoResponse for ApiFailure {
     fn into_response(self) -> Response {
-        error_response(self.status, self.code, &self.message)
+        let mut response = error_response(self.status, self.code, &self.message);
+        if let Some(seconds) = self.retry_after_seconds
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 
@@ -3922,6 +4087,16 @@ async fn submit_command(
         };
         return Err(ApiFailure::new(StatusCode::CONFLICT, code, message));
     }
+    if action != Action::Stop
+        && let Some(retry_after) = cooldown_remaining_seconds(&inner, managed_device_id, Utc::now())
+    {
+        return Err(ApiFailure::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "device_cooldown",
+            format!("Recent confirmed connection failures; retry in {retry_after} seconds."),
+        )
+        .with_retry_after(retry_after));
+    }
     let outstanding: Vec<_> = inner
         .commands
         .values()
@@ -4029,6 +4204,9 @@ async fn submit_command(
                 control.request_prewrite_cancel();
             }
         }
+    }
+    if action == Action::Stop {
+        state.preempt_battery_read(managed_device_id).await;
     }
     Ok((command, true))
 }
@@ -4188,6 +4366,15 @@ fn opposite(action: Action) -> Action {
 }
 
 async fn process_command(state: AppState, command_id: String) {
+    process_command_with_retry_budget(state, command_id, 1, false).await;
+}
+
+async fn process_command_with_retry_budget(
+    state: AppState,
+    command_id: String,
+    retry_budget: u8,
+    adapter_slot_reserved: bool,
+) {
     let control = state
         .command_controls
         .lock()
@@ -4217,11 +4404,25 @@ async fn process_command(state: AppState, command_id: String) {
         state.command_controls.lock().await.remove(&command_id);
         return;
     };
-    let Ok(_adapter_permit) = state.adapter_slots.clone().acquire_owned().await else {
-        state.command_controls.lock().await.remove(&command_id);
-        return;
+    let _adapter_permit = if adapter_slot_reserved {
+        None
+    } else {
+        let Ok(permit) = state.adapter_slots.clone().acquire_owned().await else {
+            state.command_controls.lock().await.remove(&command_id);
+            return;
+        };
+        Some(permit)
     };
-    let (action, simulator_id, scenario, connection_delay_ms, write_delay_ms, execution_deadline) = {
+    let (
+        action,
+        simulator_id,
+        scenario,
+        connection_delay_ms,
+        write_delay_ms,
+        execution_deadline,
+        first_attempt,
+        failure_streak,
+    ) = {
         let mut inner = state.inner.lock().await;
         let simulator_id = inner
             .enrollments
@@ -4230,6 +4431,34 @@ async fn process_command(state: AppState, command_id: String) {
             .and_then(|enrollment| simulator_id_for_logical_id(&inner, &enrollment.logical_id));
         let config =
             simulator_id.and_then(|id| simulator_by_id(&inner, id).map(|(_, config)| *config));
+        let cooldown = inner
+            .commands
+            .get(&command_id)
+            .filter(|command| {
+                command.status == CommandStatus::Queued && command.action != Action::Stop
+            })
+            .and_then(|_| cooldown_remaining_seconds(&inner, &managed_device_id, Utc::now()));
+        if let Some(retry_after) = cooldown {
+            if let Some(command) = inner.commands.get_mut(&command_id)
+                && command.status == CommandStatus::Queued
+            {
+                command.status = CommandStatus::Deferred;
+                command.completed_at = Some(Utc::now());
+                command.attempt = 0;
+                command.error_code = Some("device_cooldown".into());
+                command.failure_stage = Some("cooldown".into());
+                command.write_state = WriteState::NotSent;
+                command.retryable = true;
+            }
+            let completed_at = Utc::now();
+            update_activity_status(&mut inner, &command_id, "deferred", completed_at);
+            let _ = state.persist(&inner).await;
+            drop(inner);
+            state.command_controls.lock().await.remove(&command_id);
+            tracing::info!(%command_id, retry_after_seconds = retry_after, "Command deferred by per-device cooldown");
+            return;
+        }
+        let failure_streak = prewrite_failure_streak(&inner, &managed_device_id, Utc::now()).0;
         let Some(command) = inner.commands.get_mut(&command_id) else {
             drop(inner);
             state.command_controls.lock().await.remove(&command_id);
@@ -4252,16 +4481,25 @@ async fn process_command(state: AppState, command_id: String) {
             return;
         }
         command.status = CommandStatus::Connecting;
-        let started_at = Utc::now();
+        let started_at = command.started_at.unwrap_or_else(Utc::now);
         command.started_at = Some(started_at);
-        command.attempt = 1;
+        let first_attempt = command
+            .attempts
+            .len()
+            .saturating_add(1)
+            .min(u8::MAX as usize) as u8;
+        command.attempt = first_attempt;
         command.attempts.push(CommandAttempt {
-            number: 1,
+            number: first_attempt,
             phase: "connecting".into(),
             started_at,
             completed_at: None,
             duration_ms: None,
             write_state: WriteState::NotSent,
+            phase_timings: BleAttemptTimings::default(),
+            advertisement_observed_at: None,
+            advertisement_age_ms: None,
+            advertisement_rssi_dbm: None,
             failure_stage: None,
             error_code: None,
         });
@@ -4285,10 +4523,24 @@ async fn process_command(state: AppState, command_id: String) {
             connection_delay_ms,
             write_delay_ms,
             execution_deadline,
+            first_attempt,
+            failure_streak,
         )
     };
     let Some(simulator_id) = simulator_id else {
-        process_physical_command(&state, &command_id, action, control, execution_deadline).await;
+        process_physical_command(
+            &state,
+            &command_id,
+            action,
+            control,
+            execution_deadline,
+            PhysicalCommandRetry {
+                first_attempt,
+                retry_budget,
+                failure_streak,
+            },
+        )
+        .await;
         return;
     };
     let simulation_started = Instant::now();
@@ -4312,8 +4564,9 @@ async fn process_command(state: AppState, command_id: String) {
         finish_command_attempt(
             &state,
             &command_id,
-            1,
+            first_attempt,
             simulation_started.elapsed(),
+            BleAttemptTimings::default(),
             Err(&failure),
         )
         .await;
@@ -4325,8 +4578,9 @@ async fn process_command(state: AppState, command_id: String) {
         finish_command_attempt(
             &state,
             &command_id,
-            1,
+            first_attempt,
             simulation_started.elapsed(),
+            BleAttemptTimings::default(),
             Err(&failure),
         )
         .await;
@@ -4483,10 +4737,43 @@ async fn process_command(state: AppState, command_id: String) {
     state.command_controls.lock().await.remove(&command_id);
 }
 
-fn physical_target(
-    inner: &Inner,
-    managed_device_id: &str,
-) -> Result<(String, String), &'static str> {
+struct PhysicalTarget {
+    peripheral_id: String,
+    expected_name: String,
+    advertisement_observed_at: DateTime<Utc>,
+    advertisement_rssi_dbm: i16,
+}
+
+async fn record_command_radio_evidence(
+    state: &AppState,
+    command_id: &str,
+    attempt_number: u8,
+    target: &PhysicalTarget,
+) {
+    let mut inner = state.inner.lock().await;
+    let now = Utc::now();
+    let attempt = inner.commands.get_mut(command_id).and_then(|command| {
+        command
+            .attempts
+            .iter_mut()
+            .rev()
+            .find(|a| a.number == attempt_number)
+    });
+    if let Some(attempt) = attempt {
+        attempt.advertisement_observed_at = Some(target.advertisement_observed_at);
+        attempt.advertisement_age_ms = Some(
+            now.signed_duration_since(target.advertisement_observed_at)
+                .num_milliseconds()
+                .max(0) as u64,
+        );
+        attempt.advertisement_rssi_dbm = Some(target.advertisement_rssi_dbm);
+    }
+    if state.persist(&inner).await.is_err() {
+        tracing::warn!(%command_id, attempt = attempt_number, "Command radio evidence could not be persisted.");
+    }
+}
+
+fn physical_target(inner: &Inner, managed_device_id: &str) -> Result<PhysicalTarget, &'static str> {
     let Some(enrollment) = inner.enrollments.get(managed_device_id) else {
         return Err("enrollment_not_found");
     };
@@ -4507,10 +4794,12 @@ fn physical_target(
         .collect();
     match matches.as_slice() {
         [] => Err("device_not_ready"),
-        [device] => Ok((
-            device.adapter_device_id.clone(),
-            enrollment.advertised_name.clone(),
-        )),
+        [device] => Ok(PhysicalTarget {
+            peripheral_id: device.adapter_device_id.clone(),
+            expected_name: enrollment.advertised_name.clone(),
+            advertisement_observed_at: device.last_seen_at,
+            advertisement_rssi_dbm: device.rssi_dbm,
+        }),
         _ => Err("ambiguous_device"),
     }
 }
@@ -4525,9 +4814,106 @@ fn retryable_prewrite_failure(failure: &BleFailure) -> bool {
         )
 }
 
-fn retry_backoff(attempt: u8) -> std::time::Duration {
-    let exponent = attempt.saturating_sub(1).min(3);
-    std::time::Duration::from_millis(250_u64.saturating_mul(1_u64 << exponent))
+const PREWRITE_FAILURE_WINDOW: ChronoDuration = ChronoDuration::minutes(10);
+const COOLDOWN_FAILURE_THRESHOLD: usize = 4;
+
+fn command_is_safe_prewrite_failure(command: &Command) -> bool {
+    command.status == CommandStatus::ConnectionFailed
+        && command.retryable
+        && command.write_state == WriteState::NotSent
+        && matches!(
+            command.failure_stage.as_deref(),
+            Some("device_connection" | "service_resolution")
+        )
+}
+
+fn prewrite_failure_streak(
+    inner: &Inner,
+    managed_device_id: &str,
+    now: DateTime<Utc>,
+) -> (usize, Option<DateTime<Utc>>) {
+    let mut recent: Vec<_> = inner
+        .commands
+        .values()
+        .filter(|command| {
+            command.managed_device_id == managed_device_id
+                && command.completed_at.is_some_and(|completed_at| {
+                    now.signed_duration_since(completed_at) <= PREWRITE_FAILURE_WINDOW
+                })
+        })
+        .collect();
+    recent.sort_by_key(|command| command.completed_at);
+    let mut attempts = 0usize;
+    let mut latest_failure_at = None;
+    for command in recent.into_iter().rev() {
+        if command.status == CommandStatus::Deferred
+            && command.error_code.as_deref() == Some("device_cooldown")
+        {
+            continue;
+        }
+        if command.status == CommandStatus::WriteAcknowledged {
+            break;
+        }
+        if !command_is_safe_prewrite_failure(command) {
+            break;
+        }
+        latest_failure_at.get_or_insert(command.completed_at.unwrap());
+        attempts = attempts.saturating_add(command.attempt.max(1) as usize);
+    }
+    (attempts, latest_failure_at)
+}
+
+fn cooldown_duration_seconds(failure_streak: usize) -> Option<u64> {
+    if failure_streak < COOLDOWN_FAILURE_THRESHOLD {
+        return None;
+    }
+    let exponent = failure_streak
+        .saturating_sub(COOLDOWN_FAILURE_THRESHOLD)
+        .min(3) as u32;
+    Some(15_u64.saturating_mul(1_u64 << exponent).min(120))
+}
+
+fn device_cooldown_until(
+    inner: &Inner,
+    managed_device_id: &str,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let (streak, latest_failure_at) = prewrite_failure_streak(inner, managed_device_id, now);
+    let duration = cooldown_duration_seconds(streak)?;
+    latest_failure_at
+        .map(|failed_at| failed_at + ChronoDuration::seconds(duration as i64))
+        .filter(|until| *until > now)
+}
+
+fn cooldown_remaining_seconds(
+    inner: &Inner,
+    managed_device_id: &str,
+    now: DateTime<Utc>,
+) -> Option<u64> {
+    device_cooldown_until(inner, managed_device_id, now).map(|until| {
+        until
+            .signed_duration_since(now)
+            .num_seconds()
+            .saturating_add(1)
+            .max(1) as u64
+    })
+}
+
+fn retry_backoff(command_id: &str, attempt: u8, failure_streak: usize) -> std::time::Duration {
+    let exponent = failure_streak
+        .saturating_add(attempt.saturating_sub(1) as usize)
+        .min(4) as u32;
+    let base_ms = 250_u64.saturating_mul(1_u64 << exponent).min(4_000);
+    let digest = Sha256::digest(format!("{command_id}:{attempt}:{failure_streak}").as_bytes());
+    let seed = u16::from_be_bytes([digest[0], digest[1]]) as u64;
+    let jitter_ms = seed % (base_ms / 2 + 1);
+    std::time::Duration::from_millis(base_ms / 2 + jitter_ms)
+}
+
+struct PhysicalCommandRetry {
+    first_attempt: u8,
+    retry_budget: u8,
+    failure_streak: usize,
 }
 
 async fn process_physical_command(
@@ -4536,7 +4922,13 @@ async fn process_physical_command(
     action: Action,
     control: BleCommandControl,
     deadline: tokio::time::Instant,
+    retry: PhysicalCommandRetry,
 ) {
+    let PhysicalCommandRetry {
+        first_attempt,
+        retry_budget,
+        failure_streak,
+    } = retry;
     let (managed_device_id, started_at) = {
         let inner = state.inner.lock().await;
         let Some(command) = inner.commands.get(command_id) else {
@@ -4552,12 +4944,13 @@ async fn process_physical_command(
         Action::Close => ServiceAction::Close,
         Action::Stop => ServiceAction::Stop,
     };
-    let mut attempt = 1;
+    let mut attempt = first_attempt;
     let mut failure_code_override = None;
     let result = loop {
-        if attempt > 1 {
+        if attempt > first_attempt {
             start_command_attempt(state, command_id, attempt).await;
         }
+        control.reset_timings();
         let attempt_started = tokio::time::Instant::now();
         let attempt_result = if control.is_cancelled() {
             Err(control.cancellation_failure())
@@ -4576,7 +4969,8 @@ async fn process_physical_command(
                         outcome_unknown: false,
                     })
                 }
-                Ok((peripheral_id, expected_name)) => {
+                Ok(target) => {
+                    record_command_radio_evidence(state, command_id, attempt, &target).await;
                     let Some(adapter) = state.ble_adapter.read().await.clone() else {
                         let failure = BleFailure {
                             stage: BleFailureStage::Adapter,
@@ -4589,6 +4983,7 @@ async fn process_physical_command(
                             command_id,
                             attempt,
                             attempt_started.elapsed(),
+                            BleAttemptTimings::default(),
                             Err(&failure),
                         )
                         .await;
@@ -4600,10 +4995,11 @@ async fn process_physical_command(
                         )
                         .await;
                     };
-                    let write = adapter.write_action(
-                        &peripheral_id,
-                        &expected_name,
+                    let write = adapter.write_action_with_attempt(
+                        &target.peripheral_id,
+                        &target.expected_name,
                         service_action,
+                        attempt,
                         &control,
                     );
                     tokio::pin!(write);
@@ -4639,15 +5035,17 @@ async fn process_physical_command(
             command_id,
             attempt,
             attempt_started.elapsed(),
+            control.timings(),
             attempt_result.as_ref().map(|_| ()),
         )
         .await;
 
         if let Err(failure) = &attempt_result
-            && attempt == 1
+            && attempt < first_attempt.saturating_add(retry_budget)
+            && failure_streak.saturating_add(attempt as usize) < COOLDOWN_FAILURE_THRESHOLD
             && retryable_prewrite_failure(failure)
         {
-            let delay = retry_backoff(attempt);
+            let delay = retry_backoff(command_id, attempt, failure_streak);
             tracing::warn!(
                 command_id,
                 attempt,
@@ -4661,7 +5059,7 @@ async fn process_physical_command(
                     _ = control.cancelled() => break Err(control.cancellation_failure()),
                     _ = tokio::time::sleep(delay) => {}
                 }
-                attempt = 2;
+                attempt = attempt.saturating_add(1);
                 continue;
             }
         }
@@ -4759,6 +5157,10 @@ async fn start_command_attempt(state: &AppState, command_id: &str, number: u8) {
             completed_at: None,
             duration_ms: None,
             write_state: WriteState::NotSent,
+            phase_timings: BleAttemptTimings::default(),
+            advertisement_observed_at: None,
+            advertisement_age_ms: None,
+            advertisement_rssi_dbm: None,
             failure_stage: None,
             error_code: None,
         });
@@ -4773,6 +5175,7 @@ async fn finish_command_attempt(
     command_id: &str,
     number: u8,
     elapsed: StdDuration,
+    phase_timings: BleAttemptTimings,
     result: Result<(), &BleFailure>,
 ) {
     let mut inner = state.inner.lock().await;
@@ -4787,6 +5190,7 @@ async fn finish_command_attempt(
     if let Some(attempt) = attempt {
         attempt.completed_at = Some(now);
         attempt.duration_ms = Some(elapsed.as_millis().min(u64::MAX as u128) as u64);
+        attempt.phase_timings = phase_timings;
         match result {
             Ok(()) => {
                 attempt.phase = "gatt_write_acknowledged".into();
@@ -4858,13 +5262,14 @@ async fn complete_physical_failure(
 }
 
 async fn process_batch(state: AppState, batch_id: String) {
-    let command_ids = {
+    let (action, command_ids) = {
         let mut inner = state.inner.lock().await;
         let Some(batch) = inner.batches.get_mut(&batch_id) else {
             return;
         };
         batch.status = "running".into();
         batch.started_at = Some(Utc::now());
+        let action = batch.action;
         let ids = batch
             .targets
             .iter()
@@ -4872,73 +5277,123 @@ async fn process_batch(state: AppState, batch_id: String) {
             .collect::<Vec<_>>();
         set_activity_status(&mut inner, &batch_id, "running", None);
         let _ = state.persist(&inner).await;
-        ids
+        (action, ids)
     };
-    for command_id in command_ids {
-        process_command(state.clone(), command_id.clone()).await;
-        let mut inner = state.inner.lock().await;
-        let command = inner.commands.get(&command_id).cloned();
-        let completed_batch = if let Some(batch) = inner.batches.get_mut(&batch_id) {
-            if let Some(target) = batch
-                .targets
-                .iter_mut()
-                .find(|target| target.command_id.as_deref() == Some(command_id.as_str()))
-                && let Some(command) = command
-            {
-                target.status = command_status_text(command.status).into();
-                target.error_code = command.error_code.clone();
-                target.command = Some(command);
+    let _stop_batch_adapter_permits = if action == Action::Stop {
+        let mut permits = Vec::with_capacity(state.queue_config.adapter_concurrency);
+        for _ in 0..state.queue_config.adapter_concurrency {
+            let Ok(permit) = state.adapter_slots.clone().acquire_owned().await else {
+                return;
+            };
+            permits.push(permit);
+        }
+        Some(permits)
+    } else {
+        None
+    };
+    let retry_budget = u8::from(action != Action::Stop);
+    for command_id in &command_ids {
+        process_command_with_retry_budget(
+            state.clone(),
+            command_id.clone(),
+            retry_budget,
+            action == Action::Stop,
+        )
+        .await;
+        record_batch_target(&state, &batch_id, command_id).await;
+    }
+    if action == Action::Stop {
+        for command_id in &command_ids {
+            if reset_safe_batch_retry(&state, command_id).await {
+                process_command_with_retry_budget(state.clone(), command_id.clone(), 0, true).await;
+                record_batch_target(&state, &batch_id, command_id).await;
             }
-            batch.acknowledged_count = batch
-                .targets
-                .iter()
-                .filter(|target| target.status == "write_acknowledged")
-                .count() as u64;
-            batch.failed_count = batch
-                .targets
-                .iter()
-                .filter(|target| {
-                    matches!(
-                        target.status.as_str(),
-                        "connection_failed"
-                            | "write_failed"
-                            | "outcome_unknown"
-                            | "expired"
-                            | "cancelled"
-                    )
-                })
-                .count() as u64;
-            batch.pending_count = batch
-                .targets
-                .iter()
-                .filter(|target| {
-                    matches!(target.status.as_str(), "pending" | "queued" | "connecting")
-                })
-                .count() as u64;
-            if batch.pending_count == 0 {
-                batch.status = if batch.acknowledged_count == batch.target_count {
-                    "completed".into()
-                } else if batch.acknowledged_count == 0 {
-                    "failed".into()
-                } else {
-                    "partial".into()
-                };
-                batch.completed_at = Some(Utc::now());
-            }
-            (batch.pending_count == 0).then(|| {
-                (
-                    batch.status.clone(),
-                    batch.completed_at.unwrap_or_else(Utc::now),
+        }
+    }
+    finish_batch(&state, &batch_id).await;
+}
+
+async fn reset_safe_batch_retry(state: &AppState, command_id: &str) -> bool {
+    let mut inner = state.inner.lock().await;
+    let Some(command) = inner.commands.get_mut(command_id) else {
+        return false;
+    };
+    if !command_is_safe_prewrite_failure(command) {
+        return false;
+    }
+    command.status = CommandStatus::Queued;
+    command.completed_at = None;
+    command.error_code = None;
+    command.failure_stage = None;
+    command.write_state = WriteState::NotSent;
+    command.retryable = false;
+    update_activity_status(&mut inner, command_id, "queued", Utc::now());
+    if state.persist(&inner).await.is_err() {
+        tracing::warn!(%command_id, "Stop batch recovery retry could not be persisted.");
+    }
+    true
+}
+
+async fn record_batch_target(state: &AppState, batch_id: &str, command_id: &str) {
+    let mut inner = state.inner.lock().await;
+    let command = inner.commands.get(command_id).cloned();
+    if let Some(batch) = inner.batches.get_mut(batch_id) {
+        if let Some(target) = batch
+            .targets
+            .iter_mut()
+            .find(|target| target.command_id.as_deref() == Some(command_id))
+            && let Some(command) = command
+        {
+            target.status = command_status_text(command.status).into();
+            target.error_code = command.error_code.clone();
+            target.command = Some(command);
+        }
+        batch.acknowledged_count = batch
+            .targets
+            .iter()
+            .filter(|target| target.status == "write_acknowledged")
+            .count() as u64;
+        batch.failed_count = batch
+            .targets
+            .iter()
+            .filter(|target| {
+                matches!(
+                    target.status.as_str(),
+                    "connection_failed"
+                        | "deferred"
+                        | "write_failed"
+                        | "outcome_unknown"
+                        | "expired"
+                        | "cancelled"
                 )
             })
-        } else {
-            None
-        };
-        if let Some((status, completed_at)) = completed_batch {
-            update_activity_status(&mut inner, &batch_id, &status, completed_at);
-        }
-        let _ = state.persist(&inner).await;
+            .count() as u64;
+        batch.pending_count = batch
+            .targets
+            .iter()
+            .filter(|target| matches!(target.status.as_str(), "pending" | "queued" | "connecting"))
+            .count() as u64;
     }
+    let _ = state.persist(&inner).await;
+}
+
+async fn finish_batch(state: &AppState, batch_id: &str) {
+    let mut inner = state.inner.lock().await;
+    let Some(batch) = inner.batches.get_mut(batch_id) else {
+        return;
+    };
+    batch.status = if batch.acknowledged_count == batch.target_count {
+        "completed".into()
+    } else if batch.acknowledged_count == 0 {
+        "failed".into()
+    } else {
+        "partial".into()
+    };
+    batch.completed_at = Some(Utc::now());
+    let status = batch.status.clone();
+    let completed_at = batch.completed_at.unwrap_or_else(Utc::now);
+    update_activity_status(&mut inner, batch_id, &status, completed_at);
+    let _ = state.persist(&inner).await;
 }
 
 fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
@@ -4976,8 +5431,10 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
             capabilities,
             gatt_readiness,
             last_seen_at: matching.iter().map(|device| device.last_seen_at).max(),
+            advertisement_age_ms: None,
             position: None,
             movement_status: None,
+            motion_feedback: None,
             position_status: None,
             position_freshness: None,
             position_source: None,
@@ -4998,11 +5455,18 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
                 capabilities,
                 gatt_readiness,
                 last_seen_at: Some(device.last_seen_at),
+                advertisement_age_ms: Some(
+                    Utc::now()
+                        .signed_duration_since(device.last_seen_at)
+                        .num_milliseconds()
+                        .max(0) as u64,
+                ),
                 position: device.position.as_ref().map(|position| ControlPosition {
                     current_closed_percent: position.current_closed_percent,
                     target_closed_percent: position.target_closed_percent,
                 }),
                 movement_status: Some(device.movement_status),
+                motion_feedback: motion_feedback(inner, device),
                 position_status: Some(device.position_status),
                 position_freshness: Some(device.freshness),
                 position_source: device.position.as_ref().map(|position| position.source),
@@ -5021,8 +5485,10 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
             capabilities,
             gatt_readiness,
             last_seen_at: None,
+            advertisement_age_ms: None,
             position: None,
             movement_status: None,
+            motion_feedback: None,
             position_status: Some(PositionStatus::NotObserved),
             position_freshness: None,
             position_source: None,
@@ -5057,7 +5523,170 @@ fn requested_target(inner: &Inner, managed_device_id: &str) -> (Option<u8>, Opti
     )
 }
 
+fn motion_feedback(inner: &Inner, device: &Device) -> Option<MotionFeedback> {
+    let position = device.position.as_ref()?;
+    let now = Utc::now();
+    if device.freshness != Freshness::Fresh
+        || now.signed_duration_since(device.last_seen_at) > ChronoDuration::seconds(60)
+        || now.signed_duration_since(position.observed_at) > ChronoDuration::seconds(15)
+    {
+        return Some(MotionFeedback {
+            status: MotionFeedbackStatus::Unavailable,
+            last_progress_at: None,
+            estimated_travel_rate_percent_per_second: None,
+        });
+    }
+    let samples: Vec<_> = inner
+        .history
+        .iter()
+        .filter(|sample| {
+            sample.device_id == device.id && sample.position_status == PositionStatus::Observed
+        })
+        .collect();
+    Some(motion_feedback_from_samples(
+        position.current_closed_percent,
+        position.target_closed_percent,
+        &samples,
+        Utc::now(),
+    ))
+}
+
+fn motion_feedback_from_samples(
+    current: u8,
+    target: u8,
+    samples: &[&HistoryObservation],
+    now: DateTime<Utc>,
+) -> MotionFeedback {
+    if current == target {
+        return MotionFeedback {
+            status: MotionFeedbackStatus::TargetReached,
+            last_progress_at: None,
+            estimated_travel_rate_percent_per_second: estimate_travel_rate(samples, target),
+        };
+    }
+
+    let mut samples: Vec<_> = samples
+        .iter()
+        .filter_map(|sample| {
+            let position = sample.position.as_ref()?;
+            (position.target_closed_percent == target).then_some((*sample, position))
+        })
+        .collect();
+    samples.sort_by_key(|(sample, _)| sample.observed_at);
+    let segment_start = samples
+        .iter()
+        .rposition(|(_, position)| position.current_closed_percent == target)
+        .map_or(0, |index| index.saturating_add(1));
+    let segment = &samples[segment_start..];
+    let mut last_progress_at = None;
+    let mut segment_rates = Vec::new();
+    for pair in segment.windows(2) {
+        let (previous_sample, previous) = pair[0];
+        let (sample, position) = pair[1];
+        let moved = if target > previous.current_closed_percent {
+            position.current_closed_percent > previous.current_closed_percent
+        } else {
+            position.current_closed_percent < previous.current_closed_percent
+        };
+        if moved {
+            let elapsed = sample
+                .observed_at
+                .signed_duration_since(previous_sample.observed_at)
+                .num_milliseconds();
+            if elapsed > 0 {
+                segment_rates.push(
+                    (position
+                        .current_closed_percent
+                        .abs_diff(previous.current_closed_percent) as f64)
+                        / (elapsed as f64 / 1000.0),
+                );
+            }
+            last_progress_at = Some(sample.observed_at);
+        }
+    }
+    let learned_rate = estimate_travel_rate(
+        &samples
+            .iter()
+            .map(|(sample, _)| *sample)
+            .collect::<Vec<_>>(),
+        target,
+    );
+    let rate = median(segment_rates).or(learned_rate);
+    let stalled_after_seconds = rate
+        .map(|rate| (3.0 / rate.max(0.01)).clamp(15.0, 45.0))
+        .unwrap_or(20.0);
+    let stalled = segment.len() >= 3
+        && segment.last().is_some_and(|(last, _)| {
+            now.signed_duration_since(last.observed_at) <= ChronoDuration::seconds(60)
+        })
+        && segment.first().is_some_and(|(first, _)| {
+            now.signed_duration_since(last_progress_at.unwrap_or(first.observed_at))
+                .num_milliseconds() as f64
+                / 1000.0
+                >= stalled_after_seconds
+        });
+
+    MotionFeedback {
+        status: if stalled {
+            MotionFeedbackStatus::Stalled
+        } else if last_progress_at.is_some() {
+            MotionFeedbackStatus::ProgressObserved
+        } else {
+            MotionFeedbackStatus::AwaitingProgress
+        },
+        last_progress_at,
+        estimated_travel_rate_percent_per_second: rate,
+    }
+}
+
+fn estimate_travel_rate(samples: &[&HistoryObservation], target: u8) -> Option<f64> {
+    let mut samples: Vec<_> = samples
+        .iter()
+        .filter_map(|sample| {
+            let position = sample.position.as_ref()?;
+            (position.target_closed_percent == target).then_some((*sample, position))
+        })
+        .collect();
+    samples.sort_by_key(|(sample, _)| sample.observed_at);
+    let rates: Vec<_> = samples
+        .windows(2)
+        .filter_map(|pair| {
+            let (previous_sample, previous) = pair[0];
+            let (sample, position) = pair[1];
+            let moved_toward_target = if target > previous.current_closed_percent {
+                position.current_closed_percent > previous.current_closed_percent
+            } else {
+                position.current_closed_percent < previous.current_closed_percent
+            };
+            if !moved_toward_target {
+                return None;
+            }
+            let elapsed_ms = sample
+                .observed_at
+                .signed_duration_since(previous_sample.observed_at)
+                .num_milliseconds();
+            (elapsed_ms > 0).then(|| {
+                position
+                    .current_closed_percent
+                    .abs_diff(previous.current_closed_percent) as f64
+                    / (elapsed_ms as f64 / 1000.0)
+            })
+        })
+        .collect();
+    median(rates)
+}
+
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    values.retain(|value| value.is_finite() && *value > 0.0);
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    Some(values[values.len() / 2])
+}
+
 fn gatt_readiness(inner: &Inner, managed_device_id: &str) -> GattReadiness {
+    let now = Utc::now();
     let latest = inner
         .commands
         .values()
@@ -5075,21 +5704,45 @@ fn gatt_readiness(inner: &Inner, managed_device_id: &str) -> GattReadiness {
     match latest {
         Some(command) => GattReadiness {
             status: command_status_text(command.status).to_owned(),
+            transport_evidence: match command.status {
+                CommandStatus::Queued | CommandStatus::Connecting => "command_pending".into(),
+                CommandStatus::Deferred => "cooldown".into(),
+                CommandStatus::WriteAcknowledged => {
+                    if command.completed_at.is_some_and(|at| {
+                        now.signed_duration_since(at) <= ChronoDuration::minutes(10)
+                    }) {
+                        "recently_acknowledged".into()
+                    } else {
+                        "acknowledgement_aged".into()
+                    }
+                }
+                CommandStatus::ConnectionFailed => "prewrite_failure".into(),
+                CommandStatus::WriteFailed => "write_failed".into(),
+                CommandStatus::OutcomeUnknown => "outcome_unknown".into(),
+                CommandStatus::Expired | CommandStatus::Cancelled => "no_recent_write".into(),
+            },
             last_command_accepted_at: Some(command.accepted_at),
-            last_attempt_at: command.started_at,
+            last_attempt_at: command
+                .attempts
+                .last()
+                .map(|attempt| attempt.started_at)
+                .or(command.started_at),
             last_write_acknowledged_at,
             attempt_count: command.attempt,
             failure_stage: command.failure_stage.clone(),
             error_code: command.error_code.clone(),
+            cooldown_until: device_cooldown_until(inner, managed_device_id, now),
         },
         None => GattReadiness {
             status: "untested".into(),
+            transport_evidence: "untested".into(),
             last_command_accepted_at: None,
             last_attempt_at: None,
             last_write_acknowledged_at: None,
             attempt_count: 0,
             failure_stage: None,
             error_code: None,
+            cooldown_until: device_cooldown_until(inner, managed_device_id, now),
         },
     }
 }
@@ -5108,6 +5761,7 @@ fn command_status_text(status: CommandStatus) -> &'static str {
     match status {
         CommandStatus::Queued => "queued",
         CommandStatus::Connecting => "connecting",
+        CommandStatus::Deferred => "deferred",
         CommandStatus::ConnectionFailed => "connection_failed",
         CommandStatus::WriteAcknowledged => "write_acknowledged",
         CommandStatus::WriteFailed => "write_failed",
@@ -5120,6 +5774,94 @@ fn command_status_text(status: CommandStatus) -> &'static str {
 #[cfg(test)]
 mod security_hardening_tests {
     use super::*;
+
+    fn history_sample(
+        cursor: u64,
+        seconds_ago: i64,
+        current: u8,
+        target: u8,
+    ) -> HistoryObservation {
+        HistoryObservation {
+            cursor,
+            device_id: "blind-one".into(),
+            logical_id: Some("blind-one".into()),
+            observed_at: Utc::now() - ChronoDuration::seconds(seconds_ago),
+            rssi_dbm: -55,
+            position_status: PositionStatus::Observed,
+            position: Some(HistoryPosition {
+                current_closed_percent: current,
+                target_closed_percent: target,
+            }),
+        }
+    }
+
+    #[test]
+    fn retry_backoff_is_stable_jittered_and_grows_with_failure_history() {
+        let first = retry_backoff("command-1", 1, 0);
+        assert_eq!(first, retry_backoff("command-1", 1, 0));
+        let later = retry_backoff("command-1", 1, 2);
+        assert!(later >= first);
+        assert!(first >= StdDuration::from_millis(125));
+        assert!(later <= StdDuration::from_millis(1_000));
+        assert_eq!(cooldown_duration_seconds(3), None);
+        assert_eq!(cooldown_duration_seconds(4), Some(15));
+        assert_eq!(cooldown_duration_seconds(20), Some(120));
+    }
+
+    #[test]
+    fn movement_cooldown_errors_include_retry_after() {
+        let response = ApiFailure::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "device_cooldown",
+            "Try again later.",
+        )
+        .with_retry_after(15)
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "15");
+    }
+
+    #[test]
+    fn motion_feedback_learns_rate_and_reports_progress_and_stall_separately() {
+        let now = Utc::now();
+        let moving = [
+            history_sample(1, 10, 10, 100),
+            history_sample(2, 8, 20, 100),
+        ];
+        let moving_refs: Vec<_> = moving.iter().collect();
+        let progress = motion_feedback_from_samples(20, 100, &moving_refs, now);
+        assert_eq!(progress.status, MotionFeedbackStatus::ProgressObserved);
+        assert_eq!(progress.estimated_travel_rate_percent_per_second, Some(5.0));
+
+        let stationary = [
+            history_sample(3, 50, 35, 100),
+            history_sample(4, 40, 35, 100),
+            history_sample(5, 30, 35, 100),
+        ];
+        let stationary_refs: Vec<_> = stationary.iter().collect();
+        let stalled = motion_feedback_from_samples(35, 100, &stationary_refs, now);
+        assert_eq!(stalled.status, MotionFeedbackStatus::Stalled);
+
+        let reached = motion_feedback_from_samples(100, 100, &stationary_refs, now);
+        assert_eq!(reached.status, MotionFeedbackStatus::TargetReached);
+    }
+
+    #[tokio::test]
+    async fn stale_position_feedback_is_unavailable_instead_of_reported_as_stalled() {
+        let state = AppState::new();
+        let mut device = make_simulated_device("blind-one", "Blind One", Utc::now());
+        let observed_at = Utc::now() - ChronoDuration::seconds(20);
+        device.position = Some(position_value(
+            40,
+            100,
+            observed_at,
+            Source::BleAdvertisement,
+        ));
+        device.movement_status = MovementStatus::Closing;
+        let inner = state.inner.lock().await;
+        let feedback = motion_feedback(&inner, &device).unwrap();
+        assert_eq!(feedback.status, MotionFeedbackStatus::Unavailable);
+    }
 
     #[tokio::test]
     async fn persisted_single_simulator_state_keeps_primary_and_adds_second() {
@@ -5369,7 +6111,9 @@ mod security_hardening_tests {
         assert!(!inner.devices.contains_key("peripheral-0"));
         assert!(inner.devices.contains_key("peripheral-rotated"));
         assert_eq!(
-            physical_target(&inner, "enrollment-0").unwrap().0,
+            physical_target(&inner, "enrollment-0")
+                .unwrap()
+                .peripheral_id,
             "peripheral-rotated"
         );
         assert_eq!(
@@ -5420,7 +6164,9 @@ mod security_hardening_tests {
         assert!(!inner.devices.contains_key("peripheral-1023"));
         assert!(inner.devices.contains_key("peripheral-rotated"));
         assert_eq!(
-            physical_target(&inner, "enrollment-1023").unwrap().0,
+            physical_target(&inner, "enrollment-1023")
+                .unwrap()
+                .peripheral_id,
             "peripheral-rotated"
         );
     }
@@ -5696,6 +6442,10 @@ mod security_hardening_tests {
             completed_at: None,
             duration_ms: None,
             write_state: WriteState::NotSent,
+            phase_timings: BleAttemptTimings::default(),
+            advertisement_observed_at: None,
+            advertisement_age_ms: None,
+            advertisement_rssi_dbm: None,
             failure_stage: None,
             error_code: None,
         });

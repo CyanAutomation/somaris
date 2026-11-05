@@ -56,6 +56,7 @@ export function commandMessage(command) {
   switch (command.status) {
     case 'queued': return ['Queued. Waiting for the blind…', ''];
     case 'connecting': return ['Sending command to the blind…', ''];
+    case 'deferred': return ['Movement paused by the Bluetooth cooldown. Stop remains available.', 'warn'];
     case 'write_acknowledged': return ['Command acknowledged. Movement is shown when reported by the blind.', ''];
     case 'outcome_unknown': case 'write_failed': return ['The outcome is uncertain. Check the reported position before trying again.', 'warn'];
     case 'connection_failed': return [command.retryable ? 'Could not connect. No command was sent; you can try again.' : 'Could not connect to the blind.', 'bad'];
@@ -89,7 +90,7 @@ export function batteryDisplay(battery) {
   const voltage = Number.isInteger(battery.voltage_mv) && battery.voltage_mv > 0 ? `Battery voltage: ${battery.voltage_mv} mV. ` : '';
   return `<div class="battery-reading subtle">Battery ~${battery.percent_estimate}%${cached}<details class="battery-info"><summary aria-label="Battery information">i</summary><span class="battery-tooltip">${voltage}Percentage is an estimate based on voltage.</span></details></div>`;
 }
-const terminal = new Set(['write_acknowledged','connection_failed','write_failed','outcome_unknown','expired','cancelled']);
+const terminal = new Set(['write_acknowledged','connection_failed','write_failed','outcome_unknown','expired','cancelled','deferred']);
 const app = typeof document === 'undefined' ? null : document.querySelector('#app');
 const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, serviceError:null, enrollmentError:null, removalError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, actionError:null, busy:new Set(), tokens:{}, simulators:null};
 let displayPreference = storedDisplayPreference();
@@ -106,6 +107,7 @@ export function gattReadinessLabel(readiness) {
   case 'untested': return 'No command sent yet';
   case 'queued': return 'Command queued';
   case 'connecting': return 'Command in progress';
+  case 'deferred': return 'Paused by Bluetooth cooldown';
   case 'connection_failed': return 'Could not connect; no write sent';
   case 'write_acknowledged': return 'GATT write acknowledged';
   case 'write_failed': return 'Write failed; delivery uncertain';
@@ -115,6 +117,28 @@ export function gattReadinessLabel(readiness) {
   default: return 'No command result available';
  }
 }
+export function gattTransportEvidenceLabel(evidence) {
+ return ({
+  untested:'No transport evidence yet',
+  command_pending:'A command is in progress',
+  recently_acknowledged:'A GATT write was recently acknowledged',
+  acknowledgement_aged:'The last GATT acknowledgement is old',
+  prewrite_failure:'The latest command failed before a write',
+  write_failed:'The latest write failed; delivery may be uncertain',
+  outcome_unknown:'The latest write outcome is unknown',
+  no_recent_write:'No recent write evidence',
+  cooldown:'Movement command cooldown is active',
+ })[evidence] || 'Transport evidence unavailable';
+}
+export function motionFeedbackLabel(feedback) {
+ return ({
+  awaiting_progress:'Waiting for position progress',
+  progress_observed:'Position progress observed',
+  stalled:'No recent position progress',
+  target_reached:'Motor reports the target position',
+  unavailable:'Position feedback unavailable',
+ })[feedback?.status] || 'No movement feedback';
+}
 function dateTimeLabel(value, fallback) {
  if (!value) return fallback;
  const date = new Date(value);
@@ -123,6 +147,8 @@ function dateTimeLabel(value, fallback) {
 function card(device) {
  const e=device.enrollment, o=observationFor(device,state.observations), [label,tone]=availability(device.availability), p=device.position?.current_closed_percent;
  const panelMode=document.documentElement.dataset.displayMode==='panel';
+ const cooldownUntil=device.gatt_readiness?.cooldown_until;
+ const movementCooldown=!!cooldownUntil && new Date(cooldownUntil).getTime()>Date.now();
  const command=state.commands[e.id]; const [message,msgTone]=command ? commandMessage(command) : ['', ''];
  const lines=Number.isInteger(p) ? Math.max(1, Math.round(p/100*11)) : 0;
  const disabled=!!state.serviceError||device.availability!=='ready';
@@ -130,15 +156,17 @@ function card(device) {
   deviceId:e.id, blindLabel:e.label,
   panelMode,
   disabled, busy:state.busy.has(e.id),
+  movementDisabled:movementCooldown,
  });
  const messageMarkup=message?`<p class="message ${msgTone}" role="status">${esc(message)}</p>`:'';
  const availabilityMessage=device.availability!=='ready'?'<p class="message warn">Controls are unavailable until this blind is uniquely observed again.</p>':'';
+ const cooldownMessage=movementCooldown?`<p class="message warn">Repeated Bluetooth connection failures. Open and Close are paused until ${esc(dateTimeLabel(cooldownUntil,'the cooldown ends'))}; Stop remains available.</p>`:'';
  const footerMarkup=`${batteryDisplay(o?.battery)}<button type="button" class="text-button" data-action="details:${esc(e.id)}">View details &nbsp; ↗</button>`;
  return renderBlindCard({
   id:e.id, label:e.label, isSimulated:e.is_simulated, lastSeen:relative(device.last_seen_at),
   availabilityLabel:label, availabilityTone:tone,
   positionPercent:p, movementStatus:o?.movement_status, blindLines:lines,
-  controlsMarkup, messageMarkup:`${messageMarkup}${availabilityMessage}`, footerMarkup, panelMode,
+  controlsMarkup, messageMarkup:`${messageMarkup}${availabilityMessage}${cooldownMessage}`, footerMarkup, panelMode,
  });
 }
 function activityPanel() {
@@ -178,14 +206,19 @@ function detailPage(id){
   {label:'Availability',value:availability(d.availability)[0]},
   {label:'Position',contentMarkup:renderBlindStatus({positionPercent:d.position?.current_closed_percent,movementStatus:o?.movement_status,compact:true})},
   {label:'Last observation',value:d.last_seen_at?new Date(d.last_seen_at).toLocaleString():'Never'},
+  {label:'Advertisement age',value:Number.isFinite(d.advertisement_age_ms)?`${Math.floor(d.advertisement_age_ms/1000)} seconds`:'Unavailable'},
   {label:'Reported target',value:d.position?`${d.position.target_closed_percent}% closed`:'Unavailable'},
+  {label:'Movement feedback',value:motionFeedbackLabel(d.motion_feedback)},
+  ...(Number.isFinite(d.motion_feedback?.estimated_travel_rate_percent_per_second)?[{label:'Learned travel rate',value:`${d.motion_feedback.estimated_travel_rate_percent_per_second.toFixed(2)}% per second`}]:[]),
   {label:'Signal',value:o?.rssi_dbm!=null?`${o.rssi_dbm} dBm`:'Unavailable'},
   {label:'Battery voltage',value:o?.battery?.voltage_mv!=null?`${o.battery.voltage_mv} mV${o.battery.status!=='observed'?' (cached)':''}`:'Unavailable'},
   {label:'Source',value:d.enrollment.is_simulated?'Simulator':'Bluetooth'},
  ...(d.gatt_readiness ? [
   {label:'Last GATT command',value:gattReadinessLabel(d.gatt_readiness)},
+  {label:'Transport evidence',value:gattTransportEvidenceLabel(d.gatt_readiness.transport_evidence)},
   {label:'Last command attempt',value:dateTimeLabel(d.gatt_readiness.last_attempt_at,'Not attempted yet')},
   {label:'Last acknowledged GATT write',value:dateTimeLabel(d.gatt_readiness.last_write_acknowledged_at,'None recorded')},
+  ...(d.gatt_readiness.cooldown_until&&new Date(d.gatt_readiness.cooldown_until).getTime()>Date.now()?[{label:'Movement cooldown until',value:dateTimeLabel(d.gatt_readiness.cooldown_until,'None')}]:[]),
   {label:'Latest failure',value:d.gatt_readiness.error_code?`${d.gatt_readiness.error_code} · ${d.gatt_readiness.failure_stage||'unknown phase'}`:'None recorded'},
  ] : []),
  ];
