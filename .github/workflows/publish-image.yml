@@ -27,6 +27,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
@@ -61,6 +63,11 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+
       - name: Run UI tests
         run: node --test ui/tests/*.test.mjs
 
@@ -71,6 +78,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
@@ -86,7 +95,7 @@ jobs:
 
   image-changes:
     name: Check for image input changes
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.filter.outputs.changed }}
@@ -95,17 +104,29 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Fetch pull request base
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: git fetch --no-tags --depth=1 origin "$BASE_SHA"
-
       - name: Check changed paths
         id: filter
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
-          if git diff --name-only "$BASE_SHA" HEAD | grep -Eq '^(Dockerfile|Cargo\.toml|Cargo\.lock|openapi\.json|\.dockerignore|src/.*|ui/.*|\.github/workflows/publish-image\.yml)$'; then
+          if [[ "$GITHUB_EVENT_NAME" == 'pull_request' ]]; then
+            base_sha="$PR_BASE_SHA"
+          else
+            base_sha="$PUSH_BEFORE_SHA"
+          fi
+
+          if [[ "$base_sha" =~ ^0+$ ]] || ! git fetch --no-tags --depth=1 origin "$base_sha"; then
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! changed_paths="$(git diff --name-only "$base_sha" HEAD)"; then
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if grep -Eq '^(Dockerfile|Cargo\.toml|Cargo\.lock|openapi\.json|\.dockerignore|src/.*|ui/.*|\.github/workflows/publish-image\.yml)$' <<< "$changed_paths"; then
             echo 'changed=true' >> "$GITHUB_OUTPUT"
           else
             echo 'changed=false' >> "$GITHUB_OUTPUT"
@@ -120,6 +141,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -135,14 +158,16 @@ jobs:
 
   publish:
     name: Build and publish image
-    if: github.event_name == 'push'
-    needs: [test, dependency-audit]
+    if: github.event_name == 'push' && needs.image-changes.outputs.changed == 'true'
+    needs: [test, dependency-audit, image-changes]
     runs-on: ubuntu-latest
     environment: docker
 
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
