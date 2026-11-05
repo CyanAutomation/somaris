@@ -96,7 +96,7 @@ export function batteryDisplay(battery) {
 }
 const terminal = new Set(['write_acknowledged','connection_failed','write_failed','outcome_unknown','expired','cancelled','deferred']);
 const app = typeof document === 'undefined' ? null : document.querySelector('#app');
-const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, serviceError:null, enrollmentError:null, removalError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, actionError:null, busy:new Set(), tokens:{}, simulators:null};
+const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, serviceError:null, enrollmentError:null, removalError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, actionError:null, busy:new Set(), reconciliationRequired:new Set(), tokens:{}, simulators:null};
 let displayPreference = storedDisplayPreference();
 const esc = escapeHtml;
 const relative = date => { if (!date) return 'Never seen'; const seconds = Math.max(0, Math.floor((Date.now()-new Date(date).getTime())/1000)); if (!Number.isFinite(seconds)) return 'Time unavailable'; if(seconds < 60) return 'Seen just now'; if(seconds < 3600) return `Seen ${Math.floor(seconds/60)} min ago`; if(seconds < 86400) return `Seen ${Math.floor(seconds/3600)} hr ago`; return `Seen ${Math.floor(seconds/86400)} days ago`; };
@@ -306,41 +306,78 @@ export async function refreshService(target, request) {
       request('/api/control/v1/audit-log'),
     ]);
     Object.assign(target, {managed, observations, diagnostics, simulators, activity, serviceError:null});
+    const released = releaseReconciledCommandLocks(target);
+    if (released && target.actionError?.includes('movement controls remain locked')) {
+      target.actionError = 'A fresh position is now available. Verify it before trying again.';
+    }
   } catch (error) {
     target.serviceError = `Could not refresh Somaris: ${error.message}`;
   }
 }
 
-export async function refreshCommandTelemetry(target, request) {
+function hasPostCommandFreshPosition(command, device) {
+  const acceptedAt = Date.parse(command?.accepted_at || '');
+  const observedAt = Date.parse(device?.position_observed_at || '');
+  return device?.availability === 'ready'
+    && device.position_freshness === 'fresh'
+    && Number.isFinite(acceptedAt)
+    && Number.isFinite(observedAt)
+    && observedAt >= acceptedAt;
+}
+
+export function releaseReconciledCommandLocks(target) {
+  const required = target.reconciliationRequired;
+  if (!(required instanceof Set)) return false;
+  let released = false;
+  for (const id of required) {
+    const command = target.commands?.[id];
+    if (command && ['queued', 'connecting'].includes(command.status)) continue;
+    const device = target.managed?.find(item => item.enrollment?.id === id);
+    if (!hasPostCommandFreshPosition(command, device)) continue;
+    required.delete(id);
+    target.busy?.delete(id);
+    released = true;
+  }
+  return released;
+}
+
+export async function refreshCommandTelemetry(target, request, managedDeviceId) {
   const [managedResult, observationsResult] = await Promise.allSettled([
-    request('/api/control/v1/devices'),
-    request('/api/v1/devices'),
+    Promise.resolve().then(() => request('/api/control/v1/devices')),
+    Promise.resolve().then(() => request('/api/v1/devices')),
   ]);
   const failures = [];
   if (managedResult.status === 'fulfilled') target.managed = managedResult.value;
-  else failures.push(managedResult.reason);
+  else failures.push(`Managed devices: ${managedResult.reason?.message || String(managedResult.reason)}`);
   if (observationsResult.status === 'fulfilled') target.observations = observationsResult.value;
-  else failures.push(observationsResult.reason);
-  target.serviceError = failures.length
-    ? `Could not refresh Somaris position data: ${failures.map(error => error?.message || String(error)).join('; ')}`
+  else failures.push(`Observations: ${observationsResult.reason?.message || String(observationsResult.reason)}`);
+  const device = managedResult.status === 'fulfilled'
+    ? managedResult.value.find(item => item.enrollment?.id === managedDeviceId)
     : null;
-  return failures.length === 0;
+  return {
+    positionFresh: hasPostCommandFreshPosition(target.commands?.[managedDeviceId], device),
+    errors: failures,
+  };
 }
 
 export async function handleCommandPollFailure(target, id, token, error, refreshData, onChange = () => {}) {
   if (target.tokens?.[id] !== token) return false;
   const reason = String(error?.message || error).replace(/[.!?]+$/, '');
-  target.commands[id] = {status:'outcome_unknown'};
+  target.commands[id] = {...target.commands[id],status:'outcome_unknown'};
+  target.reconciliationRequired ??= new Set();
+  target.reconciliationRequired.add(id);
   target.actionError = `Could not check command status: ${reason}. Refreshing the latest position; check it before trying again.`;
   onChange();
-  try {
-    await refreshData();
-  } catch (refreshError) {
-    target.serviceError = `Could not refresh Somaris position data: ${refreshError?.message || String(refreshError)}`;
-  }
+  const refreshResult = await refreshData();
   if (target.tokens?.[id] !== token) return false;
-  target.busy?.delete(id);
-  target.actionError = `Could not check command status: ${reason}. Check the latest reported position before trying again.`;
+  const errors = refreshResult?.errors?.length ? ` Some telemetry could not be refreshed: ${refreshResult.errors.join('; ')}.` : '';
+  if (refreshResult?.positionFresh === true) {
+    target.reconciliationRequired.delete(id);
+    target.busy?.delete(id);
+    target.actionError = `Could not check command status: ${reason}. Check the latest reported position before trying again.${errors}`;
+  } else {
+    target.actionError = `Could not check command status: ${reason}. A fresh managed-device position is unavailable; movement controls remain locked. Refresh and verify the position before trying again.${errors}`;
+  }
   onChange();
   return true;
 }
@@ -399,9 +436,9 @@ export async function removeEnrolledBlind(target, request, refreshData, managedD
   return true;
 }
 
-async function refresh(quiet=false){ await refreshService(state, api); if(!quiet || !app?.querySelector('input:focus, select:focus')) render(); }
-async function sendCommand(id,action,positionClosedPercent,motorSpeedPercent){ if(state.busy.has(id) && action!=='stop') return; const token=Symbol(); state.busy.add(id); state.actionError=null; state.tokens[id]=token; state.commands[id]={status:'queued'}; render(); try { const key=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`; const body=action==='set_position'?{action,position_closed_percent:positionClosedPercent}:action==='set_motor_speed'?{action,motor_speed_percent:motorSpeedPercent}:{action}; const command=await api(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify(body)}); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); pollCommand(id,command.id,token); } catch(e) { if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.actionError=`Command request failed: ${e.message}. Its outcome may be unknown; check telemetry before trying again.`; state.busy.delete(id); render(); } }
-async function pollCommand(id,commandId,token){ try { const command=await api(`/api/control/v1/commands/${encodeURIComponent(commandId)}`); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); if(!terminal.has(command.status)){ setTimeout(()=>pollCommand(id,commandId,token),1500); return; } state.busy.delete(id); await refresh(true); } catch(e){ await handleCommandPollFailure(state,id,token,e,()=>refreshCommandTelemetry(state,api),render); } }
+async function refresh(quiet=false){ await refreshService(state,api); if(!quiet || !app?.querySelector('input:focus, select:focus')) render(); }
+async function sendCommand(id,action,positionClosedPercent,motorSpeedPercent){ if((state.busy.has(id)||state.reconciliationRequired.has(id)) && action!=='stop') return; const token=Symbol(); state.busy.add(id); state.actionError=null; state.tokens[id]=token; state.commands[id]={status:'queued'}; render(); try { const key=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`; const body=action==='set_position'?{action,position_closed_percent:positionClosedPercent}:action==='set_motor_speed'?{action,motor_speed_percent:motorSpeedPercent}:{action}; const command=await api(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify(body)}); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); pollCommand(id,command.id,token); } catch(e) { if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.actionError=`Command request failed: ${e.message}. Its outcome may be unknown; check telemetry before trying again.`; if(!state.reconciliationRequired.has(id))state.busy.delete(id); render(); } }
+async function pollCommand(id,commandId,token){ try { const command=await api(`/api/control/v1/commands/${encodeURIComponent(commandId)}`); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); if(!terminal.has(command.status)){ setTimeout(()=>pollCommand(id,commandId,token),1500); return; } if(!state.reconciliationRequired.has(id))state.busy.delete(id); await refresh(true); } catch(e){ await handleCommandPollFailure(state,id,token,e,()=>refreshCommandTelemetry(state,api,id),render); } }
 async function simulatorReset(id){state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_closed_percent:100})}); await refresh();}catch(error){state.actionError=`Simulator reset failed: ${error.message}`; render();}}
 async function confirmEnrollmentRemoval(id){
  if(state.removingEnrollmentId===id)return;
