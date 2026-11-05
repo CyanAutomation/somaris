@@ -36,6 +36,29 @@ pub enum RemoteAction {
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationAction {
+    Start,
+    Stop,
+    NudgeOpen,
+    NudgeClosed,
+    SetOpenLimit,
+    SetClosedLimit,
+}
+
+impl CalibrationAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "calibration_start",
+            Self::Stop => "calibration_stop",
+            Self::NudgeOpen => "calibration_nudge_open",
+            Self::NudgeClosed => "calibration_nudge_closed",
+            Self::SetOpenLimit => "calibration_set_open_limit",
+            Self::SetClosedLimit => "calibration_set_closed_limit",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RemoteApiClient {
     base_url: Url,
@@ -163,6 +186,66 @@ impl RemoteApiClient {
             idempotency_key,
             Some(json!({ "action": action })),
             "Failed to submit command",
+        )
+        .await
+    }
+
+    pub async fn submit_position(
+        &self,
+        managed_device_id: &str,
+        position_closed_percent: u8,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        if position_closed_percent > 100 {
+            return Err("Position must be from 0 to 100 percent closed.".into());
+        }
+        self.send_command(
+            managed_device_id,
+            "commands",
+            idempotency_key,
+            Some(json!({
+                "action": "set_position",
+                "position_closed_percent": position_closed_percent,
+            })),
+            "Failed to set blind position",
+        )
+        .await
+    }
+
+    pub async fn submit_motor_speed(
+        &self,
+        managed_device_id: &str,
+        motor_speed_percent: u8,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        if motor_speed_percent > 100 {
+            return Err("Motor speed must be from 0 to 100 percent.".into());
+        }
+        self.send_command(
+            managed_device_id,
+            "commands",
+            idempotency_key,
+            Some(json!({
+                "action": "set_motor_speed",
+                "motor_speed_percent": motor_speed_percent,
+            })),
+            "Failed to set motor speed",
+        )
+        .await
+    }
+
+    pub async fn submit_calibration_action(
+        &self,
+        managed_device_id: &str,
+        action: CalibrationAction,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        self.send_command(
+            managed_device_id,
+            "commands",
+            idempotency_key,
+            Some(json!({ "action": action.as_str() })),
+            "Failed to submit endpoint calibration action",
         )
         .await
     }

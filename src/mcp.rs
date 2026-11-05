@@ -64,9 +64,43 @@ enum CommandAction {
     Open,
     Close,
     Stop,
+    SetPosition,
+    SetMotorSpeed,
+    CalibrationStart,
+    CalibrationStop,
+    CalibrationNudgeOpen,
+    CalibrationNudgeClosed,
+    CalibrationSetOpenLimit,
+    CalibrationSetClosedLimit,
 }
 
 impl CommandAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Close => "close",
+            Self::Stop => "stop",
+            Self::SetPosition => "set_position",
+            Self::SetMotorSpeed => "set_motor_speed",
+            Self::CalibrationStart => "calibration_start",
+            Self::CalibrationStop => "calibration_stop",
+            Self::CalibrationNudgeOpen => "calibration_nudge_open",
+            Self::CalibrationNudgeClosed => "calibration_nudge_closed",
+            Self::CalibrationSetOpenLimit => "calibration_set_open_limit",
+            Self::CalibrationSetClosedLimit => "calibration_set_closed_limit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum BatchCommandAction {
+    Open,
+    Close,
+    Stop,
+}
+
+impl BatchCommandAction {
     fn as_str(self) -> &'static str {
         match self {
             Self::Open => "open",
@@ -80,8 +114,12 @@ impl CommandAction {
 struct CommandArgs {
     /// Managed-device enrollment ID.
     managed_device_id: String,
-    /// Fixed supported action.
+    /// Fixed supported action. SOMA motor-speed writes require firmware 2.2.0 or later.
     action: CommandAction,
+    /// Required when action is set_position; target in percent closed from 0 to 100.
+    position_closed_percent: Option<u8>,
+    /// Required when action is set_motor_speed; percentage from 0 to 100.
+    motor_speed_percent: Option<u8>,
     /// Caller-supplied key. Reuse it only when retrying the same request.
     idempotency_key: String,
 }
@@ -97,7 +135,7 @@ struct ToggleArgs {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct BatchArgs {
     /// Fixed supported action applied to the ready enrolled devices.
-    action: CommandAction,
+    action: BatchCommandAction,
     /// Caller-supplied key. Reuse it only when retrying the same request.
     idempotency_key: String,
 }
@@ -320,7 +358,7 @@ impl SomarisMcp {
     }
 
     #[tool(
-        description = "Queue an asynchronous open, close, or stop command. Returns a command ID to poll with get_command. Acknowledgement does not confirm movement; check telemetry before retrying a possibly-sent write."
+        description = "Queue an asynchronous blind command. set_position requires position_closed_percent from 0 to 100, measured closed. set_motor_speed requires motor_speed_percent from 0 to 100. Endpoint calibration uses calibration_start, calibration_nudge_open/closed, calibration_set_open/closed_limit, and calibration_stop in that order; normal movement is blocked while calibration is active. Returns a command ID to poll with get_command. Acknowledgement does not confirm movement; check telemetry before retrying a possibly-sent write."
     )]
     async fn submit_command(&self, Parameters(args): Parameters<CommandArgs>) -> String {
         self.call(
@@ -334,7 +372,11 @@ impl SomarisMcp {
                 "commands",
             ],
             &[],
-            Some(json!({ "action": args.action.as_str() })),
+            Some(json!({
+                "action": args.action.as_str(),
+                "position_closed_percent": args.position_closed_percent,
+                "motor_speed_percent": args.motor_speed_percent,
+            })),
             Some(&args.idempotency_key),
         )
         .await

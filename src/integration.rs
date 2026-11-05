@@ -18,17 +18,21 @@ pub struct DeviceCapabilities {
     pub close: bool,
     pub stop: bool,
     pub set_position: bool,
+    pub set_motor_speed: bool,
+    pub calibrate_endpoints: bool,
     pub position_feedback: bool,
 }
 
 impl DeviceCapabilities {
-    /// Current production controller supports fixed end-stop actions and reports
-    /// position. Arbitrary percentage positioning is not exposed.
+    /// Current production controller supports endpoint actions, stop, position
+    /// targeting, and motor-reported position.
     pub const WAZOMBI: Self = Self {
         open: true,
         close: true,
         stop: true,
-        set_position: false,
+        set_position: true,
+        set_motor_speed: true,
+        calibrate_endpoints: true,
         position_feedback: true,
     };
 

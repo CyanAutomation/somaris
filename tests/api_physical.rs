@@ -304,7 +304,7 @@ async fn enrolled_blind_battery_is_polled_and_reported() {
 }
 
 #[tokio::test]
-async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
+async fn scanned_blind_can_be_enrolled_and_supported_actions_are_written() {
     let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
     let app = app_with_adapter(adapter.clone()).await;
 
@@ -369,6 +369,85 @@ async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
         assert_eq!(adapter.actions().last().unwrap().2, expected);
     }
 
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "physical-position-35")],
+        Some(json!({"action": "set_position", "position_closed_percent": 35})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    let command = wait_for_command(&app, &command_id).await;
+    assert_eq!(command["status"], "write_acknowledged");
+    assert_eq!(command["action"], "set_position");
+    assert_eq!(command["target_closed_percent"], 35);
+    assert_eq!(
+        adapter.actions().last().unwrap().2,
+        ServiceAction::SetTargetClosedPercent(35)
+    );
+
+    for (key, action, expected) in [
+        (
+            "physical-speed-37",
+            "set_motor_speed",
+            ServiceAction::SetMotorSpeedPercent(37),
+        ),
+        (
+            "physical-calibration-start",
+            "calibration_start",
+            ServiceAction::CalibrationStart,
+        ),
+        (
+            "physical-calibration-nudge-open",
+            "calibration_nudge_open",
+            ServiceAction::CalibrationNudgeOpen,
+        ),
+        (
+            "physical-calibration-mark-open",
+            "calibration_set_open_limit",
+            ServiceAction::CalibrationSetOpenLimit,
+        ),
+        (
+            "physical-calibration-nudge-closed",
+            "calibration_nudge_closed",
+            ServiceAction::CalibrationNudgeClosed,
+        ),
+        (
+            "physical-calibration-mark-closed",
+            "calibration_set_closed_limit",
+            ServiceAction::CalibrationSetClosedLimit,
+        ),
+        (
+            "physical-calibration-stop",
+            "calibration_stop",
+            ServiceAction::CalibrationStop,
+        ),
+    ] {
+        let body = if action == "set_motor_speed" {
+            json!({"action": action, "motor_speed_percent": 37})
+        } else {
+            json!({"action": action})
+        };
+        let (status, response) = request(
+            &app,
+            Method::POST,
+            &format!("/api/control/v1/devices/{managed_id}/commands"),
+            &[("idempotency-key", key)],
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{action}");
+        let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            wait_for_command(&app, &command_id).await["status"],
+            "write_acknowledged",
+            "{action}"
+        );
+        assert_eq!(adapter.actions().last().unwrap().2, expected, "{action}");
+    }
+
     let (_, after_commands) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
     let blind_after_commands = after_commands.unwrap()["data"]
         .as_array()
@@ -381,7 +460,7 @@ async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
         blind_after_commands["position"]["current_closed_percent"],
         100
     );
-    assert_eq!(adapter.actions().len(), 3);
+    assert_eq!(adapter.actions().len(), 11);
     let (_, managed) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
     let gatt = &managed.unwrap()["data"][0]["gatt_readiness"];
     assert_eq!(gatt["status"], "write_acknowledged");
