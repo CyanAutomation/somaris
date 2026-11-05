@@ -671,6 +671,7 @@ async fn queue_limits_match_documented_defaults_and_can_be_configured() {
     assert_eq!(queue["max_queued_per_device"], 32);
     assert_eq!(queue["adapter_concurrency"], 1);
     assert_eq!(queue["adapter_scan_window_ms"], 5000);
+    assert_eq!(queue["command_execution_timeout_seconds"], 45);
 
     let configured_app = router(
         AppState::new()

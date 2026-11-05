@@ -792,7 +792,7 @@
       "post": {
         "operationId": "submitBlindCommand",
         "summary": "Queue a validated open, close, or stop command",
-        "description": "Commands are serialized FIFO per managed device and recheck freshness and identity before connecting and before a safe service-discovery retry. Adapter concurrency is bounded. Stop cancels queued open and close commands for that blind and runs after any command already in flight. Queued commands expire after the configured wait timeout. On service restart, queued commands resume after a fresh observation; a command that was connecting is recovered as outcome_unknown and is never replayed. For physical devices, stop uses the one-byte 00 payload on the separately discovered motor-control characteristic. Simulated commands use the in-memory model and never invoke BlueZ. Acknowledgement is reported separately from movement observed in /api/v1/devices. For physical devices, the service retries BlueZ connection establishment once, then permits one bounded retry for transient service-discovery failures before any GATT write; the default total command timeout is 45 seconds, with up to 30 seconds for initial discovery and 15 seconds for retry. For physical devices, connection_failed means no GATT write was sent; in the simulator it represents the selected pre-write scenario. Retry with a new idempotency key when retryable is true. For physical devices, a GATT write error has a possibly sent outcome and must not be repeated until telemetry is checked.",
+        "description": "Commands are serialized FIFO per managed device and recheck freshness and identity before each physical attempt. Adapter concurrency is bounded. Stop cancels queued movements and can preempt an in-flight movement only before its GATT write starts; after that the stop runs behind it. Queued commands expire after the configured queue wait timeout. On service restart, queued commands resume after a fresh observation; a command that was connecting is recovered as outcome_unknown and is never replayed. Physical commands receive one automatic retry at most after a confirmed connection or service-discovery failure before any GATT write, with a 250 ms backoff. A shared 45-second execution deadline covers all attempts and backoff; queue wait has a separate timeout. If that deadline expires before a write, the command is connection_failed with error_code command_timeout and is safe to resubmit with a new idempotency key. If a write may have started, the outcome is outcome_unknown and must be checked against telemetry before retrying. Command responses distinguish GATT write acknowledgement from movement observed in /api/v1/devices. Managed physical-device entries expose gatt_readiness as historical command evidence, not a live connection probe. For physical devices, stop uses the one-byte 00 payload on the separately discovered motor-control characteristic. Simulated commands use the in-memory model and never invoke BlueZ.",
         "parameters": [
           {
             "name": "Idempotency-Key",
@@ -2205,12 +2205,65 @@
             ],
             "description": "ready means a unique fresh physical or simulated observation is available; it does not mean the service is connected over GATT."
           },
+          "gatt_readiness": {
+            "$ref": "#/components/schemas/GattReadiness",
+            "description": "Present for physical enrollments. Historical status of the latest retained command and last retained acknowledged write; command records are kept for up to 24 hours subject to a 1000-record cap. It is not an active connection probe and does not confirm movement."
+          },
           "last_seen_at": {
             "type": "string",
             "format": "date-time"
           },
           "position": {
             "$ref": "#/components/schemas/ControlPosition"
+          }
+        }
+      },
+      "GattReadiness": {
+        "type": "object",
+        "required": [
+          "status",
+          "attempt_count"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "untested",
+              "queued",
+              "connecting",
+              "connection_failed",
+              "write_acknowledged",
+              "write_failed",
+              "outcome_unknown",
+              "expired",
+              "cancelled"
+            ],
+            "description": "Outcome of the latest retained physical command. Acknowledged is historical evidence of a successful GATT response, not current reachability or movement."
+          },
+          "last_command_accepted_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_attempt_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "last_write_acknowledged_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Most recent retained successful GATT write response, even if a later retained command failed."
+          },
+          "attempt_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failure_stage": {
+            "type": "string",
+            "description": "Stable phase of the latest failed command."
+          },
+          "error_code": {
+            "type": "string",
+            "description": "Stable code for the latest failed or cancelled command."
           }
         }
       },
@@ -2451,6 +2504,7 @@
           "accepted_at",
           "expires_at",
           "attempt",
+          "attempts",
           "write_state",
           "retryable"
         ],
@@ -2529,15 +2583,22 @@
           "attempt": {
             "type": "integer",
             "minimum": 0,
-            "description": "Number of execution attempts begun, including the single bounded service-discovery retry."
+            "description": "Number of execution attempts begun."
+          },
+          "attempts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CommandAttempt"
+            },
+            "description": "Persisted records for each attempt, including its phase, duration, write state, and stable failure details."
           },
           "error_code": {
             "type": "string",
-            "description": "Stable failure or cancellation code. preempted_by_stop means a queued open/close was cancelled by a later stop. Raw Bluetooth or operating-system errors are not exposed by the API."
+            "description": "Stable failure or cancellation code. preempted_by_stop means a queued or pre-write movement was cancelled by a later stop; command_timeout means the execution deadline expired before a write. Raw Bluetooth or operating-system errors are not exposed by the API."
           },
           "failure_stage": {
             "type": "string",
-            "description": "Stable execution stage such as device_connection, service_resolution, gatt_discovery, identity_verification, or gatt_write."
+            "description": "Stable execution stage such as device_connection, service_resolution, gatt_discovery, identity_verification, gatt_write, command_deadline, or command_preempted."
           },
           "write_state": {
             "type": "string",
@@ -2559,6 +2620,51 @@
           }
         }
       },
+      "CommandAttempt": {
+        "type": "object",
+        "required": [
+          "number",
+          "phase",
+          "started_at",
+          "write_state"
+        ],
+        "properties": {
+          "number": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "phase": {
+            "type": "string",
+            "description": "Last stable execution phase reached in this attempt; gatt_write_acknowledged marks a completed write response."
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "completed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "write_state": {
+            "type": "string",
+            "enum": [
+              "not_sent",
+              "possibly_sent",
+              "acknowledged"
+            ]
+          },
+          "failure_stage": {
+            "type": "string"
+          },
+          "error_code": {
+            "type": "string"
+          }
+        }
+      },
       "QueueDiagnostics": {
         "type": "object",
         "required": [
@@ -2569,7 +2675,8 @@
           "max_outstanding_commands",
           "max_queued_per_device",
           "adapter_concurrency",
-          "adapter_scan_window_ms"
+          "adapter_scan_window_ms",
+          "command_execution_timeout_seconds"
         ],
         "properties": {
           "pending_commands": {
@@ -2609,6 +2716,11 @@
             "minimum": 100,
             "maximum": 10000,
             "description": "Configured BLE adapter scan window in milliseconds. GATT operations take exclusive adapter access between scan windows."
+          },
+          "command_execution_timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Hard execution deadline after a command starts consuming adapter capacity. Queue wait uses its separate configured timeout."
           }
         }
       },

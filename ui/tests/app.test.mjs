@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, commandMessage, displayPreferenceFrom, escapeHtml, observationFor, resolveDisplayMode} from '../app.mjs';
+import {activityMessage, availability, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, observationFor, resolveDisplayMode} from '../app.mjs';
 
 test('automatic display mode distinguishes square panels from phones and desktop windows',()=>{
  assert.equal(resolveDisplayMode('auto', 800, 800), 'panel');
@@ -29,6 +29,13 @@ test('command messages distinguish acknowledgement and uncertain outcomes',()=>{
  assert.match(commandMessage({status:'outcome_unknown'})[0],/check.*position/i);
  assert.match(commandMessage({status:'write_failed'})[0],/uncertain/i);
  assert.match(commandMessage({status:'connection_failed',retryable:true})[0],/no command was sent/i);
+});
+test('fresh observations are not presented as GATT command readiness',()=>{
+ assert.equal(availability('ready')[0], 'Observed recently');
+ assert.equal(gattReadinessLabel({status:'untested'}), 'No command sent yet');
+ assert.equal(gattReadinessLabel({status:'connection_failed'}), 'Could not connect; no write sent');
+ assert.equal(gattReadinessLabel({status:'write_acknowledged'}), 'GATT write acknowledged');
+ assert.equal(gattReadinessLabel({status:'outcome_unknown'}), 'Write outcome unknown');
 });
 test('observations are associated only with a unique matching identity and source',()=>{
  const d={enrollment:{logical_id:'x',advertised_name:'Blind',is_simulated:false}};
