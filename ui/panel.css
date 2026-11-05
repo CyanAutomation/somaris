@@ -94,6 +94,46 @@ html[data-display-mode="panel"] .device-list--panel .grid {
   gap: 8px;
 }
 
+html[data-display-mode="panel"] .all-blinds-controls {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px 10px;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border-radius: 16px;
+}
+
+html[data-display-mode="panel"] .all-blinds-copy h2 {
+  margin-bottom: 3px;
+  font-size: 14px;
+}
+
+html[data-display-mode="panel"] .all-blinds-copy p {
+  font-size: 10px;
+}
+
+html[data-display-mode="panel"] .all-blinds-actions {
+  grid-template-columns: repeat(2, minmax(68px, 1fr));
+  gap: 5px;
+}
+
+html[data-display-mode="panel"] .all-blinds-actions .button {
+  min-height: 44px;
+  gap: 4px;
+  padding: 7px 9px;
+  font-size: 11px;
+}
+
+html[data-display-mode="panel"] .all-blinds-actions .ui-icon {
+  width: 16px;
+  height: 16px;
+}
+
+html[data-display-mode="panel"] .batch-feedback {
+  gap: 4px;
+  padding-top: 7px;
+  font-size: 11px;
+}
+
 html[data-display-mode="panel"] .card--panel {
   display: flex;
   min-width: 0;
@@ -225,5 +265,13 @@ html[data-display-mode="panel"] #app > .subtle {
 @media (max-width: 359px) {
   html[data-display-mode="panel"] .device-list--panel .grid {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  html[data-display-mode="panel"] .all-blinds-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  html[data-display-mode="panel"] .all-blinds-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

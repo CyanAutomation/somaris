@@ -68,7 +68,7 @@ export function renderButton({
   title = '',
 }) {
   const classes = ['button', variant, iconOnly ? 'icon-action' : ''].filter(Boolean).map(escapeHtml).join(' ');
-  const accessibility = iconOnly ? ` aria-label="${escapeHtml(accessibleLabel)}"` : '';
+  const accessibility = iconOnly || accessibleLabel !== label ? ` aria-label="${escapeHtml(accessibleLabel)}"` : '';
   const tooltipLabel = title || (iconOnly ? accessibleLabel : '');
   const titleAttribute = tooltipLabel
     ? ` title="${escapeHtml(tooltipLabel)}"`
@@ -183,7 +183,87 @@ export function renderBlindActions({deviceId, blindLabel, panelMode = false, dis
       iconOnly:panelMode,
       title:panelMode ? accessibleLabel : '',
     });
-  }).join('')}${supportsPosition ? `<div class="position-control"><label for="position-${escapeHtml(deviceId)}">Target position <output data-position-output="${escapeHtml(deviceId)}">${escapeHtml(positionClosedPercent)}%</output> closed</label><input id="position-${escapeHtml(deviceId)}" type="range" min="0" max="100" step="1" value="${escapeHtml(positionClosedPercent)}" data-position-input="${escapeHtml(deviceId)}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent closed"${disabled || movementDisabled || busy ? ' disabled' : ''}><button type="button" class="button secondary position-submit" data-action="position:${escapeHtml(deviceId)}"${disabled || movementDisabled || busy ? ' disabled' : ''}>Move to position</button></div>` : ''}</div>`;
+  }).join('')}${supportsPosition && !panelMode ? `<div class="position-control"><label for="position-${escapeHtml(deviceId)}">Target position <output data-position-output="${escapeHtml(deviceId)}">${escapeHtml(positionClosedPercent)}%</output> closed</label><input id="position-${escapeHtml(deviceId)}" type="range" min="0" max="100" step="1" value="${escapeHtml(positionClosedPercent)}" data-position-input="${escapeHtml(deviceId)}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent closed"${disabled || movementDisabled || busy ? ' disabled' : ''}><button type="button" class="button secondary position-submit" data-action="position:${escapeHtml(deviceId)}"${disabled || movementDisabled || busy ? ' disabled' : ''}>Move to position</button></div>` : ''}</div>`;
+}
+
+const batchFailureStatuses = new Set(['connection_failed', 'deferred', 'write_failed', 'outcome_unknown', 'expired', 'cancelled']);
+const batchSkipLabels = {
+  not_seen:'not seen recently',
+  stale:'stale observation',
+  ambiguous:'ambiguous device',
+  cooldown:'movement cooldown',
+  calibration_active:'calibration active',
+};
+
+export function renderBatchFeedback(batch) {
+  if (!batch) return '';
+  const data = batch.data || batch;
+  const action = batch.action || data.action;
+  const actionLabel = action === 'close' ? 'Close' : 'Open';
+  const status = batch.status || data.status;
+  let message = '';
+  let tone = '';
+
+  if (status === 'submitting') message = `Sending ${actionLabel.toLowerCase()} commands to ready blinds…`;
+  else if (status === 'checking') message = `Checking the ${actionLabel.toLowerCase()} batch…`;
+  else if (status === 'outcome_unknown') {
+    message = `The ${actionLabel.toLowerCase()} batch result is unknown. Check its status before starting another batch.`;
+    tone = 'warn';
+  } else if (status === 'rejected') {
+    message = `Could not start the ${actionLabel.toLowerCase()} batch: ${batch.error || 'The request was rejected.'}`;
+    tone = 'bad';
+  } else if (status === 'queued') {
+    message = `${actionLabel} batch queued for ${data.target_count || 0} ready blinds.`;
+  } else if (status === 'running') {
+    const acknowledged = data.acknowledged_count || 0;
+    const total = data.target_count || 0;
+    const failedCount = data.failed_count || 0;
+    const pending = data.pending_count || 0;
+    const movement = action === 'close' ? 'Closing' : 'Opening';
+    const failed = failedCount ? `${failedCount} failed, ` : '';
+    message = `${movement} blinds: commands acknowledged for ${acknowledged} of ${total} ready blinds; ${failed}${pending} pending.`;
+  } else if (status === 'completed') {
+    message = `${actionLabel} commands acknowledged for ${data.acknowledged_count || 0} of ${data.target_count || 0} ready blinds. Acknowledgement does not confirm movement.`;
+  } else if (status === 'partial') {
+    message = `${actionLabel} commands acknowledged for ${data.acknowledged_count || 0} of ${data.target_count || 0} ready blinds; ${data.failed_count || 0} failed. Acknowledgement does not confirm movement.`;
+    tone = 'warn';
+  } else if (status === 'failed') {
+    message = `No ${actionLabel.toLowerCase()} commands were acknowledged; ${data.failed_count || 0} failed.`;
+    tone = 'bad';
+  } else {
+    return '';
+  }
+
+  const skipped = (data.skipped || []).length
+    ? `<div class="batch-skipped"><span>Skipped blinds</span><ul>${data.skipped.map(item => `<li>${escapeHtml(item.label)} · ${escapeHtml(batchSkipLabels[item.availability] || item.availability || 'unavailable')}</li>`).join('')}</ul></div>`
+    : '';
+  const failures = (data.targets || []).filter(target => batchFailureStatuses.has(target.status));
+  const failed = failures.length
+    ? `<div class="batch-failures"><span>Unsuccessful blinds</span><ul>${failures.map(item => `<li>${escapeHtml(item.label)} · ${escapeHtml(item.status.replaceAll('_', ' '))}</li>`).join('')}</ul></div>`
+    : '';
+  const retry = status === 'outcome_unknown'
+    ? renderButton({label:batch.id ? 'Check batch status' : 'Retry original request', action:'batch:check', variant:'secondary'})
+    : '';
+  const errorDetail = status === 'outcome_unknown' && batch.error
+    ? `<span class="subtle">${escapeHtml(batch.error)}</span>`
+    : '';
+  const liveMode = tone === 'bad' ? 'assertive' : 'polite';
+  return `<div class="batch-feedback${tone ? ` batch-feedback--${tone}` : ''}" role="${tone === 'bad' ? 'alert' : 'status'}" aria-live="${liveMode}"><p>${escapeHtml(message)}</p>${errorDetail}${skipped}${failed}${retry}</div>`;
+}
+
+export function renderBatchControls({blindCount = 0, eligibleCount = 0, disabled = false, busy = false, panelMode = false, batch = null} = {}) {
+  if (blindCount < 1 && !batch) return '';
+  const unavailable = disabled || busy || eligibleCount < 1;
+  const description = eligibleCount === 1
+    ? 'Open or close the available blind.'
+    : eligibleCount > 1
+      ? `Open or close all ${eligibleCount} available blinds in sequence.`
+      : 'No enrolled blinds are currently ready to move.';
+  const panelVariant = panelMode ? ' all-blinds-controls--panel' : '';
+  const controls = blindCount > 0
+    ? `<section class="all-blinds-controls${panelVariant}" aria-label="All blinds controls"${busy ? ' aria-busy="true"' : ''}><div class="all-blinds-copy"><h2>All blinds</h2><p>${escapeHtml(description)}</p></div><div class="all-blinds-actions">${renderButton({label:'Open all', accessibleLabel:'Open all blinds', action:'batch:open', icon:'open', disabled:unavailable})}${renderButton({label:'Close all', accessibleLabel:'Close all blinds', action:'batch:close', icon:'close', variant:'secondary', disabled:unavailable})}</div>${renderBatchFeedback(batch)}</section>`
+    : '';
+  return `${controls}${blindCount < 1 ? renderBatchFeedback(batch) : ''}`;
 }
 
 export function renderBlindCard({
@@ -209,12 +289,12 @@ export function renderBlindCard({
   return `<article class="card${cardVariant}">${header}<div class="blind-display${displayVariant}">${status}<div class="blind-art" aria-hidden="true">${slats}</div></div>${controlsMarkup}${messageMarkup}<div class="card-foot">${footerMarkup}</div></article>`;
 }
 
-export function renderDeviceList({count, panelMode = false, cardsMarkup = '', emptyMarkup = '', title = 'Your blinds'}) {
+export function renderDeviceList({count, panelMode = false, cardsMarkup = '', emptyMarkup = '', toolbarMarkup = '', title = 'Your blinds'}) {
   const titleContent = panelMode ? '' : `<h2>${escapeHtml(title)}</h2>`;
   const countLabel = panelMode ? '' : `<span class="count">${count} ${count === 1 ? 'blind' : 'blinds'}</span>`;
   const content = cardsMarkup ? `<div class="grid">${cardsMarkup}</div>` : emptyMarkup;
   const heading = panelMode ? '' : `<div class="section-heading device-list-heading">${titleContent}${countLabel}</div>`;
-  return `<section class="device-list${panelMode ? ' device-list--panel' : ''}" aria-label="${escapeHtml(title)}">${heading}${content}</section>`;
+  return `<section class="device-list${panelMode ? ' device-list--panel' : ''}" aria-label="${escapeHtml(title)}">${heading}${toolbarMarkup}${content}</section>`;
 }
 
 export function renderHomeSupportingSections({panelMode = false, activityMarkup = '', serviceMarkup = ''}) {
