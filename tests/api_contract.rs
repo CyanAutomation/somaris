@@ -1370,3 +1370,74 @@ async fn durable_state_restores_enrollment_and_idempotent_commands() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(command.unwrap()["data"]["status"], "write_acknowledged");
 }
+
+#[tokio::test]
+async fn failed_command_lookup_and_idempotency_survive_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.json");
+    let app = router(AppState::from_data_path(&state_path).await.unwrap());
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let observed_id = devices.unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (_, _, enrollment) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": observed_id, "label": "Failed command blind"})),
+    )
+    .await;
+    let managed_id = enrollment.unwrap()["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _, _) = request(
+        &app,
+        Method::PUT,
+        "/api/dev/simulator/scenario",
+        &[],
+        Some(json!({"scenario": "gatt_write_error"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let command_url = format!("/api/control/v1/devices/{managed_id}/commands");
+    let (status, _, accepted) = request(
+        &app,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "persisted-write-failure")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = accepted.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    let terminal = wait_for_command(&app, &command_id).await;
+    assert_eq!(terminal["status"], "write_failed");
+    assert_eq!(terminal["write_state"], "possibly_sent");
+    assert_eq!(terminal["retryable"], false);
+    drop(app);
+
+    let restored = router(AppState::from_data_path(&state_path).await.unwrap());
+    let command_url = format!("/api/control/v1/commands/{command_id}");
+    let (status, _, command) = request(&restored, Method::GET, &command_url, &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(command.unwrap()["data"]["status"], "write_failed");
+
+    let (status, _, replay) = request(
+        &restored,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "persisted-write-failure")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(replay.unwrap()["data"]["id"], command_id);
+
+    let (status, _, command) = request(&restored, Method::GET, &command_url, &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(command.unwrap()["data"]["status"], "write_failed");
+}

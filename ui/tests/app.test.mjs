@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, motionFeedbackLabel, observationFor, resolveDisplayMode} from '../app.mjs';
+import {activityMessage, availability, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, observationFor, refreshCommandTelemetry, resolveDisplayMode} from '../app.mjs';
 
 test('automatic display mode distinguishes square panels from phones and desktop windows',()=>{
  assert.equal(resolveDisplayMode('auto', 800, 800), 'panel');
@@ -31,6 +31,70 @@ test('command messages distinguish acknowledgement and uncertain outcomes',()=>{
  assert.match(commandMessage({status:'connection_failed',retryable:true})[0],/no command was sent/i);
  assert.match(commandMessage({status:'connection_failed',failure_stage:'command_validation'})[0],/no bluetooth write was attempted/i);
  assert.match(commandMessage({status:'deferred'})[0],/cooldown/i);
+});
+test('command poll failure refreshes position before movement controls unlock', async()=>{
+ const id='blind-1';
+ const token=Symbol('command');
+ const state={
+  commands:{[id]:{status:'connecting'}},
+  busy:new Set([id]),
+  tokens:{[id]:token},
+  managed:[{enrollment:{id},position:{current_closed_percent:100}}],
+  observations:[{id:'old-observation'}],
+  actionError:null,
+  serviceError:null,
+ };
+ const calls=[];
+ const changes=[];
+ const request=async path=>{
+  calls.push(path);
+  if(path==='/api/control/v1/devices')return [{enrollment:{id},position:{current_closed_percent:95},position_freshness:'fresh'}];
+  if(path==='/api/v1/devices')return [{id:'fresh-observation'}];
+  throw new Error(`Unexpected request: ${path}`);
+ };
+
+ const handled=await handleCommandPollFailure(
+  state,
+  id,
+  token,
+  new Error('Command was not found.'),
+  ()=>refreshCommandTelemetry(state,request),
+  ()=>changes.push({busy:state.busy.has(id),status:state.commands[id]?.status,position:state.managed[0]?.position?.current_closed_percent}),
+ );
+
+ assert.equal(handled,true);
+ assert.deepEqual(calls,['/api/control/v1/devices','/api/v1/devices']);
+ assert.deepEqual(changes,[
+  {busy:true,status:'outcome_unknown',position:100},
+  {busy:false,status:'outcome_unknown',position:95},
+ ]);
+ assert.equal(state.commands[id].status,'outcome_unknown');
+ assert.equal(state.managed[0].position.current_closed_percent,95);
+ assert.equal(state.observations[0].id,'fresh-observation');
+ assert.equal(state.busy.has(id),false);
+ assert.match(state.actionError,/Could not check command status/);
+ assert.match(state.actionError,/latest reported position/);
+ assert.equal(state.serviceError,null);
+});
+
+test('stale command poll failure cannot clear a newer command state', async()=>{
+ const id='blind-1';
+ const token=Symbol('new command');
+ let refreshed=false;
+ const state={
+  commands:{[id]:{status:'queued'}},
+  busy:new Set([id]),
+  tokens:{[id]:token},
+  actionError:null,
+ };
+
+ const handled=await handleCommandPollFailure(state,id,Symbol('old command'),new Error('Not found.'),async()=>{refreshed=true;});
+
+ assert.equal(handled,false);
+ assert.equal(refreshed,false);
+ assert.equal(state.commands[id].status,'queued');
+ assert.equal(state.busy.has(id),true);
+ assert.equal(state.actionError,null);
 });
 test('fresh observations are not presented as GATT command readiness',()=>{
  assert.equal(availability('ready')[0], 'Observed recently');

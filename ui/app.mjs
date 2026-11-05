@@ -311,6 +311,40 @@ export async function refreshService(target, request) {
   }
 }
 
+export async function refreshCommandTelemetry(target, request) {
+  const [managedResult, observationsResult] = await Promise.allSettled([
+    request('/api/control/v1/devices'),
+    request('/api/v1/devices'),
+  ]);
+  const failures = [];
+  if (managedResult.status === 'fulfilled') target.managed = managedResult.value;
+  else failures.push(managedResult.reason);
+  if (observationsResult.status === 'fulfilled') target.observations = observationsResult.value;
+  else failures.push(observationsResult.reason);
+  target.serviceError = failures.length
+    ? `Could not refresh Somaris position data: ${failures.map(error => error?.message || String(error)).join('; ')}`
+    : null;
+  return failures.length === 0;
+}
+
+export async function handleCommandPollFailure(target, id, token, error, refreshData, onChange = () => {}) {
+  if (target.tokens?.[id] !== token) return false;
+  const reason = String(error?.message || error).replace(/[.!?]+$/, '');
+  target.commands[id] = {status:'outcome_unknown'};
+  target.actionError = `Could not check command status: ${reason}. Refreshing the latest position; check it before trying again.`;
+  onChange();
+  try {
+    await refreshData();
+  } catch (refreshError) {
+    target.serviceError = `Could not refresh Somaris position data: ${refreshError?.message || String(refreshError)}`;
+  }
+  if (target.tokens?.[id] !== token) return false;
+  target.busy?.delete(id);
+  target.actionError = `Could not check command status: ${reason}. Check the latest reported position before trying again.`;
+  onChange();
+  return true;
+}
+
 export function dismissEnrollmentError(target) { target.enrollmentError = null; }
 
 export async function enrollBlind(target, request, refreshData, observedDeviceId, label) {
@@ -367,7 +401,7 @@ export async function removeEnrolledBlind(target, request, refreshData, managedD
 
 async function refresh(quiet=false){ await refreshService(state, api); if(!quiet || !app?.querySelector('input:focus, select:focus')) render(); }
 async function sendCommand(id,action,positionClosedPercent,motorSpeedPercent){ if(state.busy.has(id) && action!=='stop') return; const token=Symbol(); state.busy.add(id); state.actionError=null; state.tokens[id]=token; state.commands[id]={status:'queued'}; render(); try { const key=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`; const body=action==='set_position'?{action,position_closed_percent:positionClosedPercent}:action==='set_motor_speed'?{action,motor_speed_percent:motorSpeedPercent}:{action}; const command=await api(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify(body)}); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); pollCommand(id,command.id,token); } catch(e) { if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.actionError=`Command request failed: ${e.message}. Its outcome may be unknown; check telemetry before trying again.`; state.busy.delete(id); render(); } }
-async function pollCommand(id,commandId,token){ try { const command=await api(`/api/control/v1/commands/${encodeURIComponent(commandId)}`); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); if(!terminal.has(command.status)){ setTimeout(()=>pollCommand(id,commandId,token),1500); return; } state.busy.delete(id); await refresh(true); } catch(e){ if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.busy.delete(id); state.actionError=`Could not check command status: ${e.message}. Check telemetry before trying again.`; render(); } }
+async function pollCommand(id,commandId,token){ try { const command=await api(`/api/control/v1/commands/${encodeURIComponent(commandId)}`); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); if(!terminal.has(command.status)){ setTimeout(()=>pollCommand(id,commandId,token),1500); return; } state.busy.delete(id); await refresh(true); } catch(e){ await handleCommandPollFailure(state,id,token,e,()=>refreshCommandTelemetry(state,api),render); } }
 async function simulatorReset(id){state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_closed_percent:100})}); await refresh();}catch(error){state.actionError=`Simulator reset failed: ${error.message}`; render();}}
 async function confirmEnrollmentRemoval(id){
  if(state.removingEnrollmentId===id)return;
