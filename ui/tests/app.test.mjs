@@ -29,6 +29,7 @@ test('command messages distinguish acknowledgement and uncertain outcomes',()=>{
  assert.match(commandMessage({status:'outcome_unknown'})[0],/check.*position/i);
  assert.match(commandMessage({status:'write_failed'})[0],/uncertain/i);
  assert.match(commandMessage({status:'connection_failed',retryable:true})[0],/no command was sent/i);
+ assert.match(commandMessage({status:'connection_failed',failure_stage:'command_validation'})[0],/no bluetooth write was attempted/i);
  assert.match(commandMessage({status:'deferred'})[0],/cooldown/i);
 });
 test('fresh observations are not presented as GATT command readiness',()=>{

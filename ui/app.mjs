@@ -61,7 +61,9 @@ export function commandMessage(command) {
     case 'deferred': return ['Movement paused by the Bluetooth cooldown. Stop remains available.', 'warn'];
     case 'write_acknowledged': return ['Command acknowledged. Movement is shown when reported by the blind.', ''];
     case 'outcome_unknown': case 'write_failed': return ['The outcome is uncertain. Check the reported position before trying again.', 'warn'];
-    case 'connection_failed': return [command.retryable ? 'Could not connect. No command was sent; you can try again.' : 'Could not connect to the blind.', 'bad'];
+    case 'connection_failed':
+      if (command.failure_stage === 'command_validation') return ['Command data is missing or invalid. No Bluetooth write was attempted.', 'bad'];
+      return [command.retryable ? 'Could not connect. No command was sent; you can try again.' : 'Could not connect to the blind.', 'bad'];
     case 'expired': return ['The command expired before it could be sent.', 'bad'];
     case 'cancelled': return ['The command was cancelled.', 'warn'];
     default: return ['Checking command status…', ''];
