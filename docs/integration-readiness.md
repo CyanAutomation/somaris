@@ -53,9 +53,9 @@ retry rules remain authoritative.
 Rust consumers may call `AppState::subscribe_state_changes`. The bounded Tokio
 broadcast channel sends monotonically increasing process-local revision
 notifications after persisted transitions and meaningful position or
-availability changes. Unchanged advertisements and simulator position samples
-unchanged simulator samples do not generate notifications. Notifications contain no device payload and
-are not a durable event log. Receivers must read current managed-device and
+availability changes. Unchanged advertisements and unchanged simulator
+position samples do not generate notifications. Notifications contain no
+device payload and are not a durable event log. Receivers must read current managed-device and
 command state after subscribing, after restart, and after a broadcast lag
 error. `AppState::managed_devices_snapshot` provides an immutable typed
 snapshot for native consumers and backs the HTTP list route. Publication is

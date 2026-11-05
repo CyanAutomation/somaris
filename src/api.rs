@@ -5038,7 +5038,10 @@ fn requested_target(inner: &Inner, managed_device_id: &str) -> (Option<u8>, Opti
     let latest = inner
         .commands
         .values()
-        .filter(|command| command.managed_device_id == managed_device_id)
+        .filter(|command| {
+            command.managed_device_id == managed_device_id
+                && matches!(command.action, Action::Open | Action::Close)
+        })
         .max_by_key(|command| (command.accepted_at, command.id.as_str()));
     let Some(command) = latest else {
         return (None, None);
