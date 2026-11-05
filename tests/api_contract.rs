@@ -499,6 +499,20 @@ async fn motor_speed_and_endpoint_calibration_are_typed_and_sequenced() {
         "calibration_not_active"
     );
 
+    let (status, _, stop_before_start) = request(
+        &app,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "calibration-stop-before-start")],
+        Some(json!({"action": "calibration_stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        stop_before_start.unwrap()["error"]["code"],
+        "calibration_not_active"
+    );
+
     let (status, _, response) = request(
         &app,
         Method::POST,

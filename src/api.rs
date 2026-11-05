@@ -4270,6 +4270,13 @@ async fn submit_command(
         return Err(ApiFailure::new(StatusCode::CONFLICT, code, message));
     }
     let calibration_session = inner.calibration_sessions.get(managed_device_id).copied();
+    if action == Action::CalibrationStop && calibration_session.is_none() {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "calibration_not_active",
+            "There is no active or uncertain endpoint calibration session to stop.",
+        ));
+    }
     if action.requires_calibration()
         && calibration_session != Some(CalibrationSessionStatus::Active)
     {
@@ -5162,6 +5169,53 @@ struct PhysicalCommandRetry {
     failure_streak: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandPayloadError {
+    MissingPositionTarget,
+    InvalidPositionTarget,
+    MissingMotorSpeed,
+    InvalidMotorSpeed,
+}
+
+impl CommandPayloadError {
+    fn error_code(self) -> &'static str {
+        match self {
+            Self::MissingPositionTarget => "missing_position_target",
+            Self::InvalidPositionTarget => "invalid_position_target",
+            Self::MissingMotorSpeed => "missing_motor_speed",
+            Self::InvalidMotorSpeed => "invalid_motor_speed",
+        }
+    }
+}
+
+fn physical_service_action(
+    action: Action,
+    target_closed_percent: Option<u8>,
+    motor_speed_percent: Option<u8>,
+) -> Result<ServiceAction, CommandPayloadError> {
+    Ok(match action {
+        Action::Open => ServiceAction::Open,
+        Action::Close => ServiceAction::Close,
+        Action::Stop => ServiceAction::Stop,
+        Action::SetPosition => match target_closed_percent {
+            Some(percent @ 0..=100) => ServiceAction::SetTargetClosedPercent(percent),
+            Some(_) => return Err(CommandPayloadError::InvalidPositionTarget),
+            None => return Err(CommandPayloadError::MissingPositionTarget),
+        },
+        Action::SetMotorSpeed => match motor_speed_percent {
+            Some(percent @ 0..=100) => ServiceAction::SetMotorSpeedPercent(percent),
+            Some(_) => return Err(CommandPayloadError::InvalidMotorSpeed),
+            None => return Err(CommandPayloadError::MissingMotorSpeed),
+        },
+        Action::CalibrationStart => ServiceAction::CalibrationStart,
+        Action::CalibrationStop => ServiceAction::CalibrationStop,
+        Action::CalibrationNudgeOpen => ServiceAction::CalibrationNudgeOpen,
+        Action::CalibrationNudgeClosed => ServiceAction::CalibrationNudgeClosed,
+        Action::CalibrationSetOpenLimit => ServiceAction::CalibrationSetOpenLimit,
+        Action::CalibrationSetClosedLimit => ServiceAction::CalibrationSetClosedLimit,
+    })
+}
+
 async fn process_physical_command(
     state: &AppState,
     command_id: &str,
@@ -5187,22 +5241,21 @@ async fn process_physical_command(
             command.motor_speed_percent,
         )
     };
-    let service_action = match action {
-        Action::Open => ServiceAction::Open,
-        Action::Close => ServiceAction::Close,
-        Action::Stop => ServiceAction::Stop,
-        Action::SetPosition => ServiceAction::SetTargetClosedPercent(
-            command_target_closed_percent.expect("set_position commands include a target"),
-        ),
-        Action::SetMotorSpeed => ServiceAction::SetMotorSpeedPercent(
-            motor_speed_percent.expect("set_motor_speed commands include a percentage"),
-        ),
-        Action::CalibrationStart => ServiceAction::CalibrationStart,
-        Action::CalibrationStop => ServiceAction::CalibrationStop,
-        Action::CalibrationNudgeOpen => ServiceAction::CalibrationNudgeOpen,
-        Action::CalibrationNudgeClosed => ServiceAction::CalibrationNudgeClosed,
-        Action::CalibrationSetOpenLimit => ServiceAction::CalibrationSetOpenLimit,
-        Action::CalibrationSetClosedLimit => ServiceAction::CalibrationSetClosedLimit,
+    let service_action = match physical_service_action(
+        action,
+        command_target_closed_percent,
+        motor_speed_percent,
+    ) {
+        Ok(service_action) => service_action,
+        Err(error) => {
+            tracing::error!(
+                command_id,
+                error_code = error.error_code(),
+                "Physical command has invalid required parameters; no BLE write will be attempted"
+            );
+            complete_command_validation_failure(state, command_id, error).await;
+            return;
+        }
     };
     let mut attempt = first_attempt;
     let mut failure_code_override = None;
@@ -5472,6 +5525,35 @@ async fn finish_command_attempt(
     if state.persist(&inner).await.is_err() {
         tracing::warn!(%command_id, attempt = number, "Command attempt result could not be persisted.");
     }
+}
+
+async fn complete_command_validation_failure(
+    state: &AppState,
+    command_id: &str,
+    error: CommandPayloadError,
+) {
+    let mut inner = state.inner.lock().await;
+    let Some(command) = inner.commands.get_mut(command_id) else {
+        return;
+    };
+    let now = Utc::now();
+    command.status = CommandStatus::ConnectionFailed;
+    command.completed_at = Some(now);
+    command.duration_ms = Some(
+        now.signed_duration_since(command.started_at.unwrap_or(command.accepted_at))
+            .num_milliseconds()
+            .max(0) as u64,
+    );
+    command.error_code = Some(error.error_code().into());
+    command.failure_stage = Some("command_validation".into());
+    command.write_state = WriteState::NotSent;
+    command.retryable = false;
+    update_activity_status(&mut inner, command_id, "connection_failed", now);
+    if state.persist(&inner).await.is_err() {
+        tracing::warn!(%command_id, "Invalid physical command result could not be persisted.");
+    }
+    drop(inner);
+    state.command_controls.lock().await.remove(command_id);
 }
 
 async fn complete_physical_failure(
@@ -6010,22 +6092,26 @@ fn gatt_readiness(inner: &Inner, managed_device_id: &str) -> GattReadiness {
     match latest {
         Some(command) => GattReadiness {
             status: command_status_text(command.status).to_owned(),
-            transport_evidence: match command.status {
-                CommandStatus::Queued | CommandStatus::Connecting => "command_pending".into(),
-                CommandStatus::Deferred => "cooldown".into(),
-                CommandStatus::WriteAcknowledged => {
-                    if command.completed_at.is_some_and(|at| {
-                        now.signed_duration_since(at) <= ChronoDuration::minutes(10)
-                    }) {
-                        "recently_acknowledged".into()
-                    } else {
-                        "acknowledgement_aged".into()
+            transport_evidence: if command.failure_stage.as_deref() == Some("command_validation") {
+                "no_recent_write".into()
+            } else {
+                match command.status {
+                    CommandStatus::Queued | CommandStatus::Connecting => "command_pending".into(),
+                    CommandStatus::Deferred => "cooldown".into(),
+                    CommandStatus::WriteAcknowledged => {
+                        if command.completed_at.is_some_and(|at| {
+                            now.signed_duration_since(at) <= ChronoDuration::minutes(10)
+                        }) {
+                            "recently_acknowledged".into()
+                        } else {
+                            "acknowledgement_aged".into()
+                        }
                     }
+                    CommandStatus::ConnectionFailed => "prewrite_failure".into(),
+                    CommandStatus::WriteFailed => "write_failed".into(),
+                    CommandStatus::OutcomeUnknown => "outcome_unknown".into(),
+                    CommandStatus::Expired | CommandStatus::Cancelled => "no_recent_write".into(),
                 }
-                CommandStatus::ConnectionFailed => "prewrite_failure".into(),
-                CommandStatus::WriteFailed => "write_failed".into(),
-                CommandStatus::OutcomeUnknown => "outcome_unknown".into(),
-                CommandStatus::Expired | CommandStatus::Cancelled => "no_recent_write".into(),
             },
             last_command_accepted_at: Some(command.accepted_at),
             last_attempt_at: command
@@ -6112,6 +6198,76 @@ mod security_hardening_tests {
         assert_eq!(cooldown_duration_seconds(3), None);
         assert_eq!(cooldown_duration_seconds(4), Some(15));
         assert_eq!(cooldown_duration_seconds(20), Some(120));
+    }
+
+    #[test]
+    fn physical_service_actions_reject_missing_or_out_of_range_parameters() {
+        assert_eq!(
+            physical_service_action(Action::SetPosition, None, None),
+            Err(CommandPayloadError::MissingPositionTarget)
+        );
+        assert_eq!(
+            physical_service_action(Action::SetPosition, Some(101), None),
+            Err(CommandPayloadError::InvalidPositionTarget)
+        );
+        assert_eq!(
+            physical_service_action(Action::SetMotorSpeed, None, None),
+            Err(CommandPayloadError::MissingMotorSpeed)
+        );
+        assert_eq!(
+            physical_service_action(Action::SetMotorSpeed, None, Some(101)),
+            Err(CommandPayloadError::InvalidMotorSpeed)
+        );
+        assert_eq!(
+            physical_service_action(Action::SetPosition, Some(50), None),
+            Ok(ServiceAction::SetTargetClosedPercent(50))
+        );
+        assert_eq!(
+            physical_service_action(Action::SetMotorSpeed, None, Some(37)),
+            Ok(ServiceAction::SetMotorSpeedPercent(37))
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_physical_command_parameters_fail_without_recording_a_write() {
+        let state = AppState::new();
+        let mut command = make_command(
+            "managed-1",
+            Action::SetPosition,
+            state.queue_config.queue_wait_timeout_seconds,
+        );
+        command.status = CommandStatus::Connecting;
+        command.started_at = Some(Utc::now());
+        let command_id = command.id.clone();
+        state
+            .inner
+            .lock()
+            .await
+            .commands
+            .insert(command_id.clone(), command);
+
+        complete_command_validation_failure(
+            &state,
+            &command_id,
+            CommandPayloadError::MissingPositionTarget,
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let command = inner.commands.get(&command_id).unwrap();
+        assert_eq!(command.status, CommandStatus::ConnectionFailed);
+        assert_eq!(command.write_state, WriteState::NotSent);
+        assert!(!command.retryable);
+        assert_eq!(
+            command.error_code.as_deref(),
+            Some("missing_position_target")
+        );
+        assert_eq!(command.failure_stage.as_deref(), Some("command_validation"));
+        assert!(command.completed_at.is_some());
+        assert_eq!(
+            gatt_readiness(&inner, "managed-1").transport_evidence,
+            "no_recent_write"
+        );
     }
 
     #[test]
