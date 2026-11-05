@@ -18,7 +18,7 @@ Set `SOMARIS_ALLOWED_ORIGINS` to a comma-separated list of exact HTTP or HTTPS o
 
 ## Dashboard
 
-Open `http://127.0.0.1:8080/` after starting Somaris (or use your configured address). Add a freshly discovered blind to control it; both simulators are available by default and can be added independently. The dashboard is included in the binary and container and uses the same-origin API. Position is last-reported telemetry, and a command acknowledgement does not confirm movement. Choose Auto, Panel, Mobile, or Desktop from the display menu; the selection is saved in this browser. Auto selects Panel for small, near-square viewports. Add `?view=panel` to the URL to pin Panel mode on a kiosk. Run the UI unit tests with `node --test ui/tests/*.test.mjs`.
+Open `http://127.0.0.1:8080/` after starting Somaris (or use your configured address). Add a freshly discovered blind to control it; both simulators are available by default and can be added independently. The dashboard is included in the binary and container and uses the same-origin API. Position is last-reported telemetry, and a command acknowledgement does not confirm movement. Choose Auto, Panel, Mobile, or Desktop from the display menu; the selection is saved in this browser. Auto selects Panel for small, near-square viewports. Add `?view=panel` to the URL to pin Panel mode on a kiosk. Use Node.js 24 for UI development and tests; `.nvmrc` selects the same version line in local tools and CI. Run the UI unit tests with `node --test ui/tests/*.test.mjs`.
 
 The dashboard and control API have no authentication. Keep the default loopback binding or put the service behind a trusted access boundary before exposing it.
 
@@ -40,7 +40,7 @@ The control API and MCP tools do not authenticate callers. This deployment is in
 
 ## Container image
 
-The GitHub Actions workflow tests pull requests targeting `main`, audits `Cargo.lock`, and builds the Docker image for `linux/amd64` and `linux/arm64` without publishing. When changes reach `main`, it publishes both architectures under `cyanautomation/somaris:latest` and a commit tag with SBOM and provenance attestations. Docker selects the matching image automatically, so a Raspberry Pi running 64-bit Raspberry Pi OS can use the regular `docker pull cyanautomation/somaris` command. 32-bit Raspberry Pi OS (`linux/arm/v7`) is not currently supported.
+The GitHub Actions workflow tests pull requests targeting `main` and audits `Cargo.lock`. When image inputs change, it builds the Docker image for `linux/amd64` on the pull request without publishing. Pushes to `main` continue to run tests and the dependency audit, and publish both architectures only when image inputs change. Published images use `cyanautomation/somaris:latest` and a commit tag with SBOM and provenance attestations. Docker selects the matching image automatically, so a Raspberry Pi running 64-bit Raspberry Pi OS can use the regular `docker pull cyanautomation/somaris` command. 32-bit Raspberry Pi OS (`linux/arm/v7`) is not currently supported.
 
 ```sh
 docker pull cyanautomation/somaris
