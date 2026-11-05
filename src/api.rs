@@ -296,6 +296,9 @@ struct Inner {
     batch_idempotency: HashMap<String, String>,
     #[serde(default)]
     audit_log: VecDeque<AuditEntry>,
+    /// Persist calibration status so a restart cannot silently re-enable ordinary movement.
+    #[serde(default)]
+    calibration_sessions: HashMap<String, CalibrationSessionStatus>,
     history: VecDeque<HistoryObservation>,
     #[serde(skip)]
     latest_history_by_device: HashMap<String, HistoryObservation>,
@@ -303,6 +306,14 @@ struct Inner {
     scanner: ScannerCounters,
     #[serde(skip)]
     devices: HashMap<String, Device>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CalibrationSessionStatus {
+    Starting,
+    Active,
+    Stopping,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -474,6 +485,7 @@ impl AppState {
             batches: HashMap::new(),
             batch_idempotency: HashMap::new(),
             audit_log: VecDeque::new(),
+            calibration_sessions: HashMap::new(),
             history: VecDeque::new(),
             latest_history_by_device: HashMap::new(),
             next_cursor: 1,
@@ -561,6 +573,23 @@ impl AppState {
                     attempt.error_code = Some("outcome_unknown".into());
                 }
             }
+        }
+        let calibration_commands: Vec<_> = persisted
+            .commands
+            .values()
+            .filter(|command| {
+                matches!(
+                    command.action,
+                    Action::CalibrationStart | Action::CalibrationStop
+                ) && !matches!(
+                    command.status,
+                    CommandStatus::Queued | CommandStatus::Connecting
+                )
+            })
+            .map(|command| command.id.clone())
+            .collect();
+        for command_id in calibration_commands {
+            update_calibration_session(&mut persisted, &command_id);
         }
         let completed_commands: Vec<_> = persisted
             .commands
@@ -2372,6 +2401,7 @@ pub struct ManagedDevice {
     pub enrollment: Enrollment,
     pub availability: String,
     pub capabilities: DeviceCapabilities,
+    pub calibration_mode_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gatt_readiness: Option<GattReadiness>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2462,15 +2492,69 @@ enum Action {
     Open,
     Close,
     Stop,
+    SetPosition,
+    SetMotorSpeed,
+    CalibrationStart,
+    CalibrationStop,
+    CalibrationNudgeOpen,
+    CalibrationNudgeClosed,
+    CalibrationSetOpenLimit,
+    CalibrationSetClosedLimit,
 }
 
 impl Action {
-    fn target_closed_percent(self, current: u8) -> u8 {
+    fn target_closed_percent(self, current: u8, requested: Option<u8>) -> u8 {
         match self {
             Self::Open => 0,
             Self::Close => 100,
             Self::Stop => current,
+            Self::SetPosition => requested.unwrap_or(current),
+            Self::SetMotorSpeed
+            | Self::CalibrationStart
+            | Self::CalibrationStop
+            | Self::CalibrationNudgeOpen
+            | Self::CalibrationNudgeClosed
+            | Self::CalibrationSetOpenLimit
+            | Self::CalibrationSetClosedLimit => current,
         }
+    }
+
+    fn is_movement(self) -> bool {
+        matches!(
+            self,
+            Self::Open
+                | Self::Close
+                | Self::SetPosition
+                | Self::CalibrationNudgeOpen
+                | Self::CalibrationNudgeClosed
+        )
+    }
+
+    fn is_position_movement(self) -> bool {
+        matches!(self, Self::Open | Self::Close | Self::SetPosition)
+    }
+
+    fn requires_calibration(self) -> bool {
+        matches!(
+            self,
+            Self::CalibrationNudgeOpen
+                | Self::CalibrationNudgeClosed
+                | Self::CalibrationSetOpenLimit
+                | Self::CalibrationSetClosedLimit
+        )
+    }
+
+    fn allowed_during_calibration(self) -> bool {
+        matches!(
+            self,
+            Self::Stop
+                | Self::CalibrationStart
+                | Self::CalibrationStop
+                | Self::CalibrationNudgeOpen
+                | Self::CalibrationNudgeClosed
+                | Self::CalibrationSetOpenLimit
+                | Self::CalibrationSetClosedLimit
+        )
     }
 }
 
@@ -2478,6 +2562,10 @@ impl Action {
 #[serde(deny_unknown_fields)]
 struct CommandRequest {
     action: Action,
+    #[serde(default)]
+    position_closed_percent: Option<u8>,
+    #[serde(default)]
+    motor_speed_percent: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2507,6 +2595,10 @@ struct Command {
     id: String,
     managed_device_id: String,
     action: Action,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_closed_percent: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    motor_speed_percent: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     toggle_basis: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3497,6 +3589,13 @@ async fn remove_enrollment(
             "The enrollment has queued or running commands.",
         );
     }
+    if inner.calibration_sessions.contains_key(&id) {
+        return error_response(
+            StatusCode::CONFLICT,
+            "calibration_active",
+            "End endpoint calibration before removing this enrollment.",
+        );
+    }
     let enrollment = inner
         .enrollments
         .remove(&id)
@@ -3530,6 +3629,57 @@ async fn queue_command(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    match request.action {
+        Action::SetPosition => match request.position_closed_percent {
+            Some(0..=100) if request.motor_speed_percent.is_none() => {}
+            Some(_) => {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_position",
+                    "position_closed_percent must be from 0 to 100 and motor_speed_percent must be omitted.",
+                );
+            }
+            None => {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "position_required",
+                    "set_position requires position_closed_percent from 0 to 100.",
+                );
+            }
+        },
+        Action::SetMotorSpeed => match request.motor_speed_percent {
+            Some(0..=100) if request.position_closed_percent.is_none() => {}
+            Some(_) => {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_motor_speed",
+                    "motor_speed_percent must be from 0 to 100 and position_closed_percent must be omitted.",
+                );
+            }
+            None => {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "motor_speed_required",
+                    "set_motor_speed requires motor_speed_percent from 0 to 100.",
+                );
+            }
+        },
+        _ if request.position_closed_percent.is_some() => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unexpected_position",
+                "position_closed_percent is only valid for set_position.",
+            );
+        }
+        _ if request.motor_speed_percent.is_some() => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unexpected_motor_speed",
+                "motor_speed_percent is only valid for set_motor_speed.",
+            );
+        }
+        _ => {}
+    }
     let Some(key) = idempotency_key(&headers) else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -3537,7 +3687,17 @@ async fn queue_command(
             "Idempotency-Key must contain 1 to 128 characters.",
         );
     };
-    match submit_command(&state, &id, request.action, key, None).await {
+    match submit_command(
+        &state,
+        &id,
+        request.action,
+        request.position_closed_percent,
+        request.motor_speed_percent,
+        key,
+        None,
+    )
+    .await
+    {
         Ok((command, is_new)) => {
             if is_new {
                 tokio::spawn(process_command(state.clone(), command.id.clone()));
@@ -3592,6 +3752,8 @@ async fn toggle_device(
         &state,
         &id,
         action,
+        None,
+        None,
         key,
         Some((basis, position, observed_at)),
     )
@@ -3619,6 +3781,13 @@ async fn queue_batch(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    if !matches!(request.action, Action::Open | Action::Close | Action::Stop) {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "batch_action_unsupported",
+            "Only open, close, and stop may target multiple devices.",
+        );
+    }
     let Some(key) = idempotency_key(&headers) else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -3651,6 +3820,8 @@ async fn queue_batch(
             .filter(|enrollment| {
                 managed_device(&inner, (*enrollment).clone()).availability == "ready"
                     && (request.action == Action::Stop
+                        || !inner.calibration_sessions.contains_key(&enrollment.id))
+                    && (request.action == Action::Stop
                         || cooldown_remaining_seconds(&inner, &enrollment.id, Utc::now()).is_none())
             })
             .count();
@@ -3669,15 +3840,17 @@ async fn queue_batch(
         let mut preemptible_movements = Vec::new();
         for enrollment in enrollments {
             let managed = managed_device(&inner, enrollment.clone());
+            let calibration_active = request.action != Action::Stop
+                && inner.calibration_sessions.contains_key(&enrollment.id);
             let cooling_down = request.action != Action::Stop
                 && cooldown_remaining_seconds(&inner, &enrollment.id, Utc::now()).is_some();
-            if managed.availability == "ready" && !cooling_down {
+            if managed.availability == "ready" && !cooling_down && !calibration_active {
                 if request.action == Action::Stop {
                     let mut cancelled = Vec::new();
                     for command in inner.commands.values_mut().filter(|command| {
                         command.managed_device_id == enrollment.id
                             && command.status == CommandStatus::Queued
-                            && matches!(command.action, Action::Open | Action::Close)
+                            && command.action.is_movement()
                     }) {
                         command.status = CommandStatus::Cancelled;
                         command.completed_at = Some(Utc::now());
@@ -3700,7 +3873,7 @@ async fn queue_batch(
                                 command.managed_device_id == enrollment.id
                                     && command.status == CommandStatus::Connecting
                                     && command.write_state == WriteState::NotSent
-                                    && matches!(command.action, Action::Open | Action::Close)
+                                    && command.action.is_movement()
                             })
                             .map(|command| command.id.clone()),
                     );
@@ -3728,7 +3901,9 @@ async fn queue_batch(
                 skipped.push(BatchSkipped {
                     managed_device_id: enrollment.id,
                     label: enrollment.label,
-                    availability: if cooling_down {
+                    availability: if calibration_active {
+                        "calibration_active".into()
+                    } else if cooling_down {
                         "cooldown".into()
                     } else {
                         managed.availability
@@ -3933,6 +4108,8 @@ fn make_command(
         id: Uuid::new_v4().to_string(),
         managed_device_id: managed_device_id.to_owned(),
         action,
+        target_closed_percent: None,
+        motor_speed_percent: None,
         toggle_basis: None,
         toggle_position: None,
         toggle_observed_at: None,
@@ -4032,6 +4209,8 @@ async fn submit_command(
     state: &AppState,
     managed_device_id: &str,
     action: Action,
+    target_closed_percent: Option<u8>,
+    motor_speed_percent: Option<u8>,
     key: String,
     toggle: Option<(String, ControlPosition, DateTime<Utc>)>,
 ) -> Result<(Command, bool), ApiFailure> {
@@ -4040,7 +4219,10 @@ async fn submit_command(
     if let Some(command_id) = inner.command_idempotency.get(&key_id)
         && let Some(command) = inner.commands.get(command_id)
     {
-        if command.action == action {
+        if command.action == action
+            && command.target_closed_percent == target_closed_percent
+            && command.motor_speed_percent == motor_speed_percent
+        {
             return Ok((command.clone(), false));
         }
         return Err(ApiFailure::new(
@@ -4087,6 +4269,37 @@ async fn submit_command(
         };
         return Err(ApiFailure::new(StatusCode::CONFLICT, code, message));
     }
+    let calibration_session = inner.calibration_sessions.get(managed_device_id).copied();
+    if action == Action::CalibrationStop && calibration_session.is_none() {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "calibration_not_active",
+            "There is no active or uncertain endpoint calibration session to stop.",
+        ));
+    }
+    if action.requires_calibration()
+        && calibration_session != Some(CalibrationSessionStatus::Active)
+    {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "calibration_not_active",
+            "Start endpoint calibration and wait for its acknowledgement before nudging or setting a limit.",
+        ));
+    }
+    if action == Action::CalibrationStart && calibration_session.is_some() {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "calibration_active",
+            "Endpoint calibration is already active or changing state.",
+        ));
+    }
+    if calibration_session.is_some() && !action.allowed_during_calibration() {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "calibration_active",
+            "Stop endpoint calibration before issuing normal movement or motor-speed commands.",
+        ));
+    }
     if action != Action::Stop
         && let Some(retry_after) = cooldown_remaining_seconds(&inner, managed_device_id, Utc::now())
     {
@@ -4132,7 +4345,7 @@ async fn submit_command(
         for command in inner.commands.values_mut().filter(|command| {
             command.managed_device_id == managed_device_id
                 && command.status == CommandStatus::Queued
-                && matches!(command.action, Action::Open | Action::Close)
+                && command.action.is_movement()
         }) {
             command.status = CommandStatus::Cancelled;
             command.completed_at = Some(Utc::now());
@@ -4155,7 +4368,7 @@ async fn submit_command(
                     command.managed_device_id == managed_device_id
                         && command.status == CommandStatus::Connecting
                         && command.write_state == WriteState::NotSent
-                        && matches!(command.action, Action::Open | Action::Close)
+                        && command.action.is_movement()
                 })
                 .map(|command| command.id.clone()),
         );
@@ -4165,6 +4378,8 @@ async fn submit_command(
         action,
         state.queue_config.queue_wait_timeout_seconds,
     );
+    command.target_closed_percent = target_closed_percent;
+    command.motor_speed_percent = motor_speed_percent;
     if let Some((basis, position, observed_at)) = toggle {
         command.toggle_basis = Some(basis);
         command.toggle_position = Some(position);
@@ -4172,6 +4387,22 @@ async fn submit_command(
     }
     inner.command_idempotency.insert(key_id, command.id.clone());
     inner.commands.insert(command.id.clone(), command.clone());
+    match action {
+        Action::CalibrationStart => {
+            inner.calibration_sessions.insert(
+                managed_device_id.to_owned(),
+                CalibrationSessionStatus::Starting,
+            );
+        }
+        Action::CalibrationStop if calibration_session.is_some() => {
+            inner.calibration_sessions.insert(
+                managed_device_id.to_owned(),
+                CalibrationSessionStatus::Stopping,
+            );
+        }
+        Action::CalibrationStop => {}
+        _ => {}
+    }
     record_activity(
         &mut inner,
         Some(command.id.clone()),
@@ -4227,6 +4458,13 @@ fn resolve_toggle(
             StatusCode::CONFLICT,
             "device_unavailable",
             "A unique fresh observation is not available.",
+        ));
+    }
+    if inner.calibration_sessions.contains_key(managed_device_id) {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "calibration_active",
+            "Stop endpoint calibration before toggling normal movement.",
         ));
     }
     let device = if enrollment.is_simulated {
@@ -4322,9 +4560,9 @@ fn resolve_toggle(
         if matches!(
             command.status,
             CommandStatus::Queued | CommandStatus::Connecting
-        ) && matches!(command.action, Action::Open | Action::Close)
+        ) && command.action.is_position_movement()
         {
-            let next = opposite(command.action);
+            let next = reverse_command_intent(command);
             return Ok((
                 next,
                 "command_intent".into(),
@@ -4335,7 +4573,7 @@ fn resolve_toggle(
         if command.status == CommandStatus::WriteAcknowledged
             && position.current_closed_percent != position.target_closed_percent
         {
-            let next = opposite(command.action);
+            let next = reverse_command_intent(command);
             return Ok((
                 next,
                 "command_intent".into(),
@@ -4357,11 +4595,18 @@ fn resolve_toggle(
     ))
 }
 
-fn opposite(action: Action) -> Action {
-    match action {
+fn reverse_command_intent(command: &Command) -> Action {
+    match command.action {
         Action::Open => Action::Close,
         Action::Close => Action::Open,
-        Action::Stop => Action::Stop,
+        Action::SetPosition => {
+            if command.target_closed_percent.unwrap_or(50) < 50 {
+                Action::Close
+            } else {
+                Action::Open
+            }
+        }
+        _ => Action::Stop,
     }
 }
 
@@ -4415,6 +4660,7 @@ async fn process_command_with_retry_budget(
     };
     let (
         action,
+        command_target_closed_percent,
         simulator_id,
         scenario,
         connection_delay_ms,
@@ -4505,6 +4751,7 @@ async fn process_command_with_retry_budget(
         });
         let execution_deadline = tokio::time::Instant::now() + COMMAND_EXECUTION_TIMEOUT;
         let action = command.action;
+        let command_target_closed_percent = command.target_closed_percent;
         let scenario = config
             .as_ref()
             .map_or(SimulatorScenario::Normal, |config| config.scenario);
@@ -4518,6 +4765,7 @@ async fn process_command_with_retry_budget(
         let _ = state.persist(&inner).await;
         (
             action,
+            command_target_closed_percent,
             simulator_id,
             scenario,
             connection_delay_ms,
@@ -4532,6 +4780,7 @@ async fn process_command_with_retry_budget(
             &state,
             &command_id,
             action,
+            command_target_closed_percent,
             control,
             execution_deadline,
             PhysicalCommandRetry {
@@ -4617,7 +4866,10 @@ async fn process_command_with_retry_budget(
     ) && simulator_enabled
     {
         device.position.as_mut().map(|position| {
-            let target = action.target_closed_percent(position.current_closed_percent);
+            let target = action.target_closed_percent(
+                position.current_closed_percent,
+                command_target_closed_percent,
+            );
             position.target_closed_percent = target;
             if update_simulator_telemetry {
                 position.observed_at = now;
@@ -4699,6 +4951,7 @@ async fn process_command_with_retry_budget(
             }
         }
     }
+    update_calibration_session(&mut inner, &command_id);
     if let Some((status, completed_at)) = inner
         .commands
         .get(&command_id)
@@ -4916,10 +5169,58 @@ struct PhysicalCommandRetry {
     failure_streak: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandPayloadError {
+    MissingPositionTarget,
+    InvalidPositionTarget,
+    MissingMotorSpeed,
+    InvalidMotorSpeed,
+}
+
+impl CommandPayloadError {
+    fn error_code(self) -> &'static str {
+        match self {
+            Self::MissingPositionTarget => "missing_position_target",
+            Self::InvalidPositionTarget => "invalid_position_target",
+            Self::MissingMotorSpeed => "missing_motor_speed",
+            Self::InvalidMotorSpeed => "invalid_motor_speed",
+        }
+    }
+}
+
+fn physical_service_action(
+    action: Action,
+    target_closed_percent: Option<u8>,
+    motor_speed_percent: Option<u8>,
+) -> Result<ServiceAction, CommandPayloadError> {
+    Ok(match action {
+        Action::Open => ServiceAction::Open,
+        Action::Close => ServiceAction::Close,
+        Action::Stop => ServiceAction::Stop,
+        Action::SetPosition => match target_closed_percent {
+            Some(percent @ 0..=100) => ServiceAction::SetTargetClosedPercent(percent),
+            Some(_) => return Err(CommandPayloadError::InvalidPositionTarget),
+            None => return Err(CommandPayloadError::MissingPositionTarget),
+        },
+        Action::SetMotorSpeed => match motor_speed_percent {
+            Some(percent @ 0..=100) => ServiceAction::SetMotorSpeedPercent(percent),
+            Some(_) => return Err(CommandPayloadError::InvalidMotorSpeed),
+            None => return Err(CommandPayloadError::MissingMotorSpeed),
+        },
+        Action::CalibrationStart => ServiceAction::CalibrationStart,
+        Action::CalibrationStop => ServiceAction::CalibrationStop,
+        Action::CalibrationNudgeOpen => ServiceAction::CalibrationNudgeOpen,
+        Action::CalibrationNudgeClosed => ServiceAction::CalibrationNudgeClosed,
+        Action::CalibrationSetOpenLimit => ServiceAction::CalibrationSetOpenLimit,
+        Action::CalibrationSetClosedLimit => ServiceAction::CalibrationSetClosedLimit,
+    })
+}
+
 async fn process_physical_command(
     state: &AppState,
     command_id: &str,
     action: Action,
+    command_target_closed_percent: Option<u8>,
     control: BleCommandControl,
     deadline: tokio::time::Instant,
     retry: PhysicalCommandRetry,
@@ -4929,7 +5230,7 @@ async fn process_physical_command(
         retry_budget,
         failure_streak,
     } = retry;
-    let (managed_device_id, started_at) = {
+    let (managed_device_id, started_at, motor_speed_percent) = {
         let inner = state.inner.lock().await;
         let Some(command) = inner.commands.get(command_id) else {
             return;
@@ -4937,12 +5238,24 @@ async fn process_physical_command(
         (
             command.managed_device_id.clone(),
             command.started_at.unwrap_or(command.accepted_at),
+            command.motor_speed_percent,
         )
     };
-    let service_action = match action {
-        Action::Open => ServiceAction::Open,
-        Action::Close => ServiceAction::Close,
-        Action::Stop => ServiceAction::Stop,
+    let service_action = match physical_service_action(
+        action,
+        command_target_closed_percent,
+        motor_speed_percent,
+    ) {
+        Ok(service_action) => service_action,
+        Err(error) => {
+            tracing::error!(
+                command_id,
+                error_code = error.error_code(),
+                "Physical command has invalid required parameters; no BLE write will be attempted"
+            );
+            complete_command_validation_failure(state, command_id, error).await;
+            return;
+        }
     };
     let mut attempt = first_attempt;
     let mut failure_code_override = None;
@@ -5126,6 +5439,7 @@ async fn process_physical_command(
             }
         }
     }
+    update_calibration_session(&mut inner, command_id);
     if let Some((status, completed_at)) = inner
         .commands
         .get(command_id)
@@ -5213,6 +5527,35 @@ async fn finish_command_attempt(
     }
 }
 
+async fn complete_command_validation_failure(
+    state: &AppState,
+    command_id: &str,
+    error: CommandPayloadError,
+) {
+    let mut inner = state.inner.lock().await;
+    let Some(command) = inner.commands.get_mut(command_id) else {
+        return;
+    };
+    let now = Utc::now();
+    command.status = CommandStatus::ConnectionFailed;
+    command.completed_at = Some(now);
+    command.duration_ms = Some(
+        now.signed_duration_since(command.started_at.unwrap_or(command.accepted_at))
+            .num_milliseconds()
+            .max(0) as u64,
+    );
+    command.error_code = Some(error.error_code().into());
+    command.failure_stage = Some("command_validation".into());
+    command.write_state = WriteState::NotSent;
+    command.retryable = false;
+    update_activity_status(&mut inner, command_id, "connection_failed", now);
+    if state.persist(&inner).await.is_err() {
+        tracing::warn!(%command_id, "Invalid physical command result could not be persisted.");
+    }
+    drop(inner);
+    state.command_controls.lock().await.remove(command_id);
+}
+
 async fn complete_physical_failure(
     state: &AppState,
     command_id: &str,
@@ -5253,6 +5596,7 @@ async fn complete_physical_failure(
         command.retryable = false;
     }
     let status = command_status_text(command.status);
+    update_calibration_session(&mut inner, command_id);
     update_activity_status(&mut inner, command_id, status, now);
     if state.persist(&inner).await.is_err() {
         tracing::warn!(%command_id, "Physical command failure could not be persisted.");
@@ -5398,6 +5742,7 @@ async fn finish_batch(state: &AppState, batch_id: &str) {
 
 fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
     let gatt_readiness = (!enrollment.is_simulated).then(|| gatt_readiness(inner, &enrollment.id));
+    let calibration_mode_active = inner.calibration_sessions.contains_key(&enrollment.id);
     let capabilities = if enrollment.is_simulated {
         DeviceCapabilities::SIMULATOR
     } else {
@@ -5429,6 +5774,7 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
             enrollment,
             availability: "ambiguous".into(),
             capabilities,
+            calibration_mode_active,
             gatt_readiness,
             last_seen_at: matching.iter().map(|device| device.last_seen_at).max(),
             advertisement_age_ms: None,
@@ -5453,6 +5799,7 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
                 enrollment,
                 availability: if fresh { "ready" } else { "stale" }.into(),
                 capabilities,
+                calibration_mode_active,
                 gatt_readiness,
                 last_seen_at: Some(device.last_seen_at),
                 advertisement_age_ms: Some(
@@ -5483,6 +5830,7 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
             enrollment,
             availability: "not_seen".into(),
             capabilities,
+            calibration_mode_active,
             gatt_readiness,
             last_seen_at: None,
             advertisement_age_ms: None,
@@ -5505,8 +5853,7 @@ fn requested_target(inner: &Inner, managed_device_id: &str) -> (Option<u8>, Opti
         .commands
         .values()
         .filter(|command| {
-            command.managed_device_id == managed_device_id
-                && matches!(command.action, Action::Open | Action::Close)
+            command.managed_device_id == managed_device_id && command.action.is_position_movement()
         })
         .max_by_key(|command| (command.accepted_at, command.id.as_str()));
     let Some(command) = latest else {
@@ -5516,11 +5863,52 @@ fn requested_target(inner: &Inner, managed_device_id: &str) -> (Option<u8>, Opti
         Action::Open => Some(0),
         Action::Close => Some(100),
         Action::Stop => None,
+        Action::SetPosition => command.target_closed_percent,
+        _ => None,
     };
     (
         requested,
         Some(command_status_text(command.status).to_owned()),
     )
+}
+
+fn update_calibration_session(inner: &mut Inner, command_id: &str) {
+    let Some(command) = inner.commands.get(command_id) else {
+        return;
+    };
+    let managed_device_id = command.managed_device_id.clone();
+    let action = command.action;
+    let status = command.status;
+    let write_state = command.write_state;
+    match action {
+        Action::CalibrationStart => match status {
+            CommandStatus::WriteAcknowledged => {
+                inner
+                    .calibration_sessions
+                    .insert(managed_device_id, CalibrationSessionStatus::Active);
+            }
+            CommandStatus::Queued | CommandStatus::Connecting => {}
+            _ if write_state == WriteState::PossiblySent => {
+                // The start may have reached the motor. Keep movement locked until an explicit stop.
+                inner
+                    .calibration_sessions
+                    .insert(managed_device_id, CalibrationSessionStatus::Active);
+            }
+            _ => {
+                inner.calibration_sessions.remove(&managed_device_id);
+            }
+        },
+        Action::CalibrationStop => {
+            if status == CommandStatus::WriteAcknowledged {
+                inner.calibration_sessions.remove(&managed_device_id);
+            } else if inner.calibration_sessions.contains_key(&managed_device_id) {
+                inner
+                    .calibration_sessions
+                    .insert(managed_device_id, CalibrationSessionStatus::Stopping);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn motion_feedback(inner: &Inner, device: &Device) -> Option<MotionFeedback> {
@@ -5704,22 +6092,26 @@ fn gatt_readiness(inner: &Inner, managed_device_id: &str) -> GattReadiness {
     match latest {
         Some(command) => GattReadiness {
             status: command_status_text(command.status).to_owned(),
-            transport_evidence: match command.status {
-                CommandStatus::Queued | CommandStatus::Connecting => "command_pending".into(),
-                CommandStatus::Deferred => "cooldown".into(),
-                CommandStatus::WriteAcknowledged => {
-                    if command.completed_at.is_some_and(|at| {
-                        now.signed_duration_since(at) <= ChronoDuration::minutes(10)
-                    }) {
-                        "recently_acknowledged".into()
-                    } else {
-                        "acknowledgement_aged".into()
+            transport_evidence: if command.failure_stage.as_deref() == Some("command_validation") {
+                "no_recent_write".into()
+            } else {
+                match command.status {
+                    CommandStatus::Queued | CommandStatus::Connecting => "command_pending".into(),
+                    CommandStatus::Deferred => "cooldown".into(),
+                    CommandStatus::WriteAcknowledged => {
+                        if command.completed_at.is_some_and(|at| {
+                            now.signed_duration_since(at) <= ChronoDuration::minutes(10)
+                        }) {
+                            "recently_acknowledged".into()
+                        } else {
+                            "acknowledgement_aged".into()
+                        }
                     }
+                    CommandStatus::ConnectionFailed => "prewrite_failure".into(),
+                    CommandStatus::WriteFailed => "write_failed".into(),
+                    CommandStatus::OutcomeUnknown => "outcome_unknown".into(),
+                    CommandStatus::Expired | CommandStatus::Cancelled => "no_recent_write".into(),
                 }
-                CommandStatus::ConnectionFailed => "prewrite_failure".into(),
-                CommandStatus::WriteFailed => "write_failed".into(),
-                CommandStatus::OutcomeUnknown => "outcome_unknown".into(),
-                CommandStatus::Expired | CommandStatus::Cancelled => "no_recent_write".into(),
             },
             last_command_accepted_at: Some(command.accepted_at),
             last_attempt_at: command
@@ -5806,6 +6198,76 @@ mod security_hardening_tests {
         assert_eq!(cooldown_duration_seconds(3), None);
         assert_eq!(cooldown_duration_seconds(4), Some(15));
         assert_eq!(cooldown_duration_seconds(20), Some(120));
+    }
+
+    #[test]
+    fn physical_service_actions_reject_missing_or_out_of_range_parameters() {
+        assert_eq!(
+            physical_service_action(Action::SetPosition, None, None),
+            Err(CommandPayloadError::MissingPositionTarget)
+        );
+        assert_eq!(
+            physical_service_action(Action::SetPosition, Some(101), None),
+            Err(CommandPayloadError::InvalidPositionTarget)
+        );
+        assert_eq!(
+            physical_service_action(Action::SetMotorSpeed, None, None),
+            Err(CommandPayloadError::MissingMotorSpeed)
+        );
+        assert_eq!(
+            physical_service_action(Action::SetMotorSpeed, None, Some(101)),
+            Err(CommandPayloadError::InvalidMotorSpeed)
+        );
+        assert_eq!(
+            physical_service_action(Action::SetPosition, Some(50), None),
+            Ok(ServiceAction::SetTargetClosedPercent(50))
+        );
+        assert_eq!(
+            physical_service_action(Action::SetMotorSpeed, None, Some(37)),
+            Ok(ServiceAction::SetMotorSpeedPercent(37))
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_physical_command_parameters_fail_without_recording_a_write() {
+        let state = AppState::new();
+        let mut command = make_command(
+            "managed-1",
+            Action::SetPosition,
+            state.queue_config.queue_wait_timeout_seconds,
+        );
+        command.status = CommandStatus::Connecting;
+        command.started_at = Some(Utc::now());
+        let command_id = command.id.clone();
+        state
+            .inner
+            .lock()
+            .await
+            .commands
+            .insert(command_id.clone(), command);
+
+        complete_command_validation_failure(
+            &state,
+            &command_id,
+            CommandPayloadError::MissingPositionTarget,
+        )
+        .await;
+
+        let inner = state.inner.lock().await;
+        let command = inner.commands.get(&command_id).unwrap();
+        assert_eq!(command.status, CommandStatus::ConnectionFailed);
+        assert_eq!(command.write_state, WriteState::NotSent);
+        assert!(!command.retryable);
+        assert_eq!(
+            command.error_code.as_deref(),
+            Some("missing_position_target")
+        );
+        assert_eq!(command.failure_stage.as_deref(), Some("command_validation"));
+        assert!(command.completed_at.is_some());
+        assert_eq!(
+            gatt_readiness(&inner, "managed-1").transport_evidence,
+            "no_recent_write"
+        );
     }
 
     #[test]

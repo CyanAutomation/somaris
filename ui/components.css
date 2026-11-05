@@ -8,6 +8,11 @@
 .topbar-icon-button .ui-icon{width:21px;height:21px}
 .topbar-device-count{color:var(--color-muted);font-size:13px;font-weight:700;white-space:nowrap}
 .controls .button{display:flex;align-items:center;justify-content:center;gap:8px}
+.position-control{display:grid;grid-template-columns:1fr auto;align-items:center;gap:8px 12px;width:100%;margin-top:8px;padding-top:10px;border-top:1px solid var(--color-border)}
+.position-control label{font-size:13px;color:var(--color-muted)}
+.position-control output{font-variant-numeric:tabular-nums;color:var(--color-text);font-weight:600}
+.position-control input[type=range]{grid-column:1/-1;width:100%;accent-color:var(--color-accent)}
+.position-control .position-submit{grid-column:1/-1;justify-self:start}
 .blind-state{display:grid;gap:5px;min-width:0}
 .blind-state__label{font-size:clamp(26px,3vw,36px);font-weight:780;line-height:1;letter-spacing:-.04em}
 .blind-state__percent{color:var(--color-muted);font-size:14px;line-height:1.2}
@@ -23,6 +28,7 @@
 .enrollment-actions h2{font-size:18px;letter-spacing:-.02em;margin:0}
 .enrollment-actions>p{color:var(--color-muted);line-height:1.5;margin:0 0 4px;max-width:620px}
 .enrollment-actions>.button{justify-self:start}
+.device-settings{margin-top:18px}.device-settings form{display:grid;grid-template-columns:minmax(120px,1fr) auto;gap:12px;align-items:end}.device-settings form .field{margin:0}.calibration-actions{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px}
 .confirmation-panel{display:grid;gap:16px;margin:8px 0 0;border-color:#693d38}
 .confirmation-copy h2{font-size:18px;letter-spacing:-.02em;margin:0 0 8px}
 .confirmation-copy p{color:var(--color-muted);line-height:1.5;margin:0}

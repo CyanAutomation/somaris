@@ -3,7 +3,7 @@
   "info": {
     "title": "Somaris API",
     "version": "1.2.0",
-    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes only the documented fixed actions. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. Two built-in simulators remain available for software development under the distinct names Somaris Simulator 1 and Somaris Simulator 2. Their positions and failure settings are independent, and simulated commands never use Bluetooth. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. BLE scans use bounded windows and yield exclusive adapter access to GATT operations between windows. The control API has no authentication and is intended for a trusted network; CORS is not authentication."
+    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, percentage-position, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes typed supported commands. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. Two built-in simulators remain available for software development under the distinct names Somaris Simulator 1 and Somaris Simulator 2. Their positions and failure settings are independent, and simulated commands never use Bluetooth. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. BLE scans use bounded windows and yield exclusive adapter access to GATT operations between windows. The control API has no authentication and is intended for a trusted network; CORS is not authentication."
   },
   "servers": [
     {
@@ -791,8 +791,8 @@
       ],
       "post": {
         "operationId": "submitBlindCommand",
-        "summary": "Queue a validated open, close, or stop command",
-        "description": "Commands are serialized per managed device and recheck freshness and identity before each physical attempt. Adapter concurrency is bounded. Stop cancels queued movements and can preempt an in-flight movement only before its GATT write starts; after that the stop runs behind it. Queued commands expire after the configured queue wait timeout. On service restart, queued commands resume after a fresh observation; a command that was connecting is recovered as outcome_unknown and is never replayed. Physical commands receive at most one automatic retry after a confirmed connection or service-discovery failure before any GATT write. Retry delay uses capped exponential backoff with deterministic jitter, increasing with recent confirmed pre-write failures. After four such failed attempts within ten minutes, Open and Close requests are throttled for an increasing cooldown (15 seconds to 120 seconds); Stop remains available. Stop batches make one attempt for every target before retrying eligible pre-write failures. A Stop's first connection window is 12 seconds and its recovery window is 20 seconds; Open and Close retain a 30-second connection window. A shared 45-second execution deadline covers each command's attempts and backoff; queue wait has a separate timeout. After cancellation, Somaris allows up to 10 additional seconds for adapter cleanup before finalizing the command. If the execution deadline expires before a write, the command is connection_failed with error_code command_timeout and is safe to resubmit with a new idempotency key. If a write may have started, the outcome is outcome_unknown and must be checked against telemetry before retrying. Command attempts include phase timing and the advertisement age and RSSI used. Managed physical-device entries expose distinct advertisement, transport, and movement evidence; none is a live GATT probe. Movement feedback learns a per-blind rate from observed position samples and reports stalls without issuing corrective commands. For physical devices, stop uses the one-byte 00 payload on the separately discovered motor-control characteristic. Simulated commands use the in-memory model and never invoke BlueZ.",
+        "summary": "Queue an open, close, stop, or percentage-position command",
+        "description": "Commands are serialized per managed device and recheck freshness and identity before each physical attempt. set_position accepts position_closed_percent from 0 to 100, where 0 is fully open and 100 is fully closed. set_motor_speed accepts a percentage from 0 to 100. Endpoint calibration is an explicit sequence: start, nudge, set open/closed limits, then stop. Normal movement and motor-speed changes are blocked while calibration is active; use the Stop action to halt movement and calibration_stop to exit calibration. Calibration status is persisted with service state and an uncertain start remains locked until explicitly stopped. Adapter concurrency is bounded. Stop cancels queued movements and can preempt an in-flight movement only before its GATT write starts; after that the stop runs behind it. Queued commands expire after the configured queue wait timeout. On service restart, queued commands resume after a fresh observation; a command that was connecting is recovered as outcome_unknown and is never replayed. Physical commands receive at most one automatic retry after a confirmed connection or service-discovery failure before any GATT write. Retry delay uses capped exponential backoff with deterministic jitter, increasing with recent confirmed pre-write failures. After four such failed attempts within ten minutes, movement requests are throttled for an increasing cooldown (15 seconds to 120 seconds); Stop remains available. Stop batches make one attempt for every target before retrying eligible pre-write failures. A Stop's first connection window is 12 seconds and its recovery window is 20 seconds; movement actions retain a 30-second connection window. A shared 45-second execution deadline covers each command's attempts and backoff; queue wait has a separate timeout. After cancellation, Somaris allows up to 10 additional seconds for adapter cleanup before finalizing the command. If the execution deadline expires before a write, the command is connection_failed with error_code command_timeout and is safe to resubmit with a new idempotency key. If a write may have started, the outcome is outcome_unknown and must be checked against telemetry before retrying. Command attempts include phase timing and the advertisement age and RSSI used. Managed physical-device entries expose distinct advertisement, transport, and movement evidence; none is a live GATT probe. Movement feedback learns a per-blind rate from observed position samples and reports stalls without issuing corrective commands. Percentage targets use the V2 motor target characteristic and one-byte closed-percent payload. Motor speed uses the Shade Config characteristic. Calibration uses typed Motor Calibration and Motor Control writes. Simulated commands use the in-memory model and never invoke BlueZ.",
         "parameters": [
           {
             "name": "Idempotency-Key",
@@ -1822,8 +1822,15 @@
             "enum": [
               "open",
               "close",
-              "stop"
+              "stop",
+              "set_position"
             ]
+          },
+          "target_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Target requested by a set_position command."
           },
           "status": {
             "type": "string",
@@ -2229,6 +2236,10 @@
             "$ref": "#/components/schemas/DeviceCapabilities",
             "description": "Operations supported by Somaris for this managed device."
           },
+          "calibration_mode_active": {
+            "type": "boolean",
+            "description": "True when Somaris has an active or uncertain calibration session; normal movement is blocked until calibration_stop is acknowledged. Calibration status is persisted with service state."
+          },
           "gatt_readiness": {
             "$ref": "#/components/schemas/GattReadiness",
             "description": "Present for physical enrollments. Historical status of the latest retained command and last retained acknowledged write; command records are kept for up to 24 hours subject to a 1000-record cap. It is not an active connection probe and does not confirm movement."
@@ -2278,7 +2289,7 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 100,
-            "description": "Latest retained open or close command intent; this is not motor telemetry."
+            "description": "Latest retained movement command intent, including percentage-position requests; this is not motor telemetry."
           },
           "requested_command_status": {
             "type": "string",
@@ -2288,12 +2299,14 @@
       },
       "DeviceCapabilities": {
         "type": "object",
-        "required": ["open", "close", "stop", "set_position", "position_feedback"],
+        "required": ["open", "close", "stop", "set_position", "set_motor_speed", "calibrate_endpoints", "position_feedback"],
         "properties": {
           "open": {"type": "boolean"},
           "close": {"type": "boolean"},
           "stop": {"type": "boolean"},
-          "set_position": {"type": "boolean", "description": "False for current physical Wazombi motors."},
+          "set_position": {"type": "boolean", "description": "Whether this controller supports arbitrary V2 percentage positioning."},
+          "set_motor_speed": {"type": "boolean", "description": "Whether this controller supports setting motor speed as a percentage; SOMA firmware 2.2.0 or later is required."},
+          "calibrate_endpoints": {"type": "boolean", "description": "Whether this controller supports supervised endpoint calibration."},
           "position_feedback": {"type": "boolean"}
         }
       },
@@ -2439,9 +2452,29 @@
             "enum": [
               "open",
               "close",
-              "stop"
+              "stop",
+              "set_position",
+              "set_motor_speed",
+              "calibration_start",
+              "calibration_stop",
+              "calibration_nudge_open",
+              "calibration_nudge_closed",
+              "calibration_set_open_limit",
+              "calibration_set_closed_limit"
             ],
-            "description": "Open and close use the tested three-byte payloads. Stop uses the tested one-byte 00 payload. Percentage positioning and arbitrary GATT writes are not exposed."
+            "description": "Open and close use the tested three-byte payloads. Stop uses the tested one-byte 00 payload. set_position writes one closed-percent byte to the V2 target characteristic. set_motor_speed writes a typed percentage through Shade Config. Calibration actions write fixed, typed command bytes to Motor Calibration or Motor Control. Arbitrary GATT writes are not exposed."
+          },
+          "position_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Required only for set_position. 0 is fully open; 100 is fully closed."
+          },
+          "motor_speed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Required only for set_motor_speed. This writes the motor speed setting; SOMA firmware 2.2.0 or later is required. The current setting is not read back by Somaris yet."
           }
         }
       },
@@ -2640,8 +2673,28 @@
             "enum": [
               "open",
               "close",
-              "stop"
+              "stop",
+              "set_position",
+              "set_motor_speed",
+              "calibration_start",
+              "calibration_stop",
+              "calibration_nudge_open",
+              "calibration_nudge_closed",
+              "calibration_set_open_limit",
+              "calibration_set_closed_limit"
             ]
+          },
+          "target_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Target requested by a set_position command."
+          },
+          "motor_speed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Requested speed percentage for a set_motor_speed command."
           },
           "toggle_basis": {
             "type": "string",

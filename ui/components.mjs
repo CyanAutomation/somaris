@@ -95,6 +95,38 @@ export function renderDestructiveButton({label, action, disabled = false, icon =
   return renderButton({label, action, variant:'danger', disabled, icon});
 }
 
+export function renderMotorSpeedControl({deviceId, busy = false, calibrationActive = false}) {
+  const id = escapeHtml(deviceId);
+  const disabled = busy || calibrationActive;
+  return `<section class="panel device-settings"><h2>Motor speed</h2><p>Set the motor speed from 0% to 100%. SOMA controllers need firmware 2.2.0 or later. The current setting is not read by Somaris yet.</p><form data-motor-speed="${id}"><label class="field">Speed (%)<input name="motor_speed_percent" type="number" min="0" max="100" step="1" required placeholder="0–100"${disabled ? ' disabled' : ''}></label><button class="button"${disabled ? ' disabled' : ''}>Set speed</button></form></section>`;
+}
+
+export function renderCalibrationControls({deviceId, active = false, busy = false}) {
+  const id = String(deviceId ?? '');
+  if (!active) {
+    return renderButton({
+      label:'Start endpoint calibration',
+      action:`command:calibration_start:${id}`,
+      variant:'secondary',
+      disabled:busy,
+    });
+  }
+  const controls = [
+    ['Nudge open', 'calibration_nudge_open'],
+    ['Set open limit', 'calibration_set_open_limit'],
+    ['Nudge closed', 'calibration_nudge_closed'],
+    ['Set closed limit', 'calibration_set_closed_limit'],
+    ['Stop movement', 'stop'],
+    ['End calibration', 'calibration_stop'],
+  ];
+  return `<div class="calibration-actions">${controls.map(([label, action]) => renderButton({
+    label,
+    action:`command:${action}:${id}`,
+    variant:action === 'calibration_stop' ? 'danger' : 'secondary',
+    disabled:busy,
+  })).join('')}</div>`;
+}
+
 export function renderConfirmationPanel({
   title,
   message,
@@ -133,7 +165,7 @@ export function renderTopbarActions({
   return `${status}${panelCount}${renderAddBlindButton()}${displayMenu}${refreshButton}`;
 }
 
-export function renderBlindActions({deviceId, blindLabel, panelMode = false, disabled = false, busy = false, movementDisabled = false}) {
+export function renderBlindActions({deviceId, blindLabel, panelMode = false, disabled = false, busy = false, movementDisabled = false, supportsPosition = false, positionClosedPercent = 100}) {
   const actions = [
     ['open', 'Open', ''],
     ['stop', 'Stop', 'secondary'],
@@ -151,7 +183,7 @@ export function renderBlindActions({deviceId, blindLabel, panelMode = false, dis
       iconOnly:panelMode,
       title:panelMode ? accessibleLabel : '',
     });
-  }).join('')}</div>`;
+  }).join('')}${supportsPosition ? `<div class="position-control"><label for="position-${escapeHtml(deviceId)}">Target position <output data-position-output="${escapeHtml(deviceId)}">${escapeHtml(positionClosedPercent)}%</output> closed</label><input id="position-${escapeHtml(deviceId)}" type="range" min="0" max="100" step="1" value="${escapeHtml(positionClosedPercent)}" data-position-input="${escapeHtml(deviceId)}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent closed"${disabled || movementDisabled || busy ? ' disabled' : ''}><button type="button" class="button secondary position-submit" data-action="position:${escapeHtml(deviceId)}"${disabled || movementDisabled || busy ? ' disabled' : ''}>Move to position</button></div>` : ''}</div>`;
 }
 
 export function renderBlindCard({

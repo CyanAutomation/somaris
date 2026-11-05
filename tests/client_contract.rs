@@ -9,7 +9,9 @@ use axum::{
     routing::any,
 };
 use serde_json::{Value, json};
-use somaris::client::{ClientOptions, RemoteAction, RemoteApiClient, validate_device_id};
+use somaris::client::{
+    CalibrationAction, ClientOptions, RemoteAction, RemoteApiClient, validate_device_id,
+};
 use tokio::sync::Mutex;
 
 type CapturedRequest = (String, String, HeaderMap, Value);
@@ -140,6 +142,76 @@ async fn control_client_posts_only_fixed_actions_with_idempotency_key() {
     assert_eq!(requests[1].2.get("idempotency-key").unwrap(), "toggle-1");
     assert_eq!(requests[2].0, "GET");
     assert_eq!(requests[2].1, "/api/control/v1/commands/cmd-123");
+}
+
+#[tokio::test]
+async fn control_client_sets_validated_closed_percent_targets() {
+    let requests: Requests = Arc::default();
+    let client = test_client(requests.clone()).await;
+    client
+        .submit_position("managed A", 50, "position-1")
+        .await
+        .unwrap();
+    assert!(
+        client
+            .submit_position("managed A", 101, "position-invalid")
+            .await
+            .is_err()
+    );
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].0, "POST");
+    assert_eq!(
+        requests[0].1,
+        "/api/control/v1/devices/managed%20A/commands"
+    );
+    assert_eq!(requests[0].2.get("idempotency-key").unwrap(), "position-1");
+    assert_eq!(
+        requests[0].3,
+        json!({"action": "set_position", "position_closed_percent": 50})
+    );
+}
+
+#[tokio::test]
+async fn control_client_sets_motor_speed_and_uses_fixed_calibration_actions() {
+    let requests: Requests = Arc::default();
+    let client = test_client(requests.clone()).await;
+    client
+        .submit_motor_speed("managed A", 37, "speed-1")
+        .await
+        .unwrap();
+    client
+        .submit_motor_speed("managed A", 0, "speed-zero")
+        .await
+        .unwrap();
+    assert!(
+        client
+            .submit_motor_speed("managed A", 101, "speed-invalid")
+            .await
+            .is_err()
+    );
+    client
+        .submit_calibration_action("managed A", CalibrationAction::Start, "cal-start")
+        .await
+        .unwrap();
+    client
+        .submit_calibration_action("managed A", CalibrationAction::NudgeOpen, "cal-nudge-open")
+        .await
+        .unwrap();
+
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests[0].3,
+        json!({"action": "set_motor_speed", "motor_speed_percent": 37})
+    );
+    assert_eq!(
+        requests[1].3,
+        json!({"action": "set_motor_speed", "motor_speed_percent": 0})
+    );
+    assert_eq!(requests[2].3, json!({"action": "calibration_start"}));
+    assert_eq!(requests[3].3, json!({"action": "calibration_nudge_open"}));
 }
 
 #[tokio::test]

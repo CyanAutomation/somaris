@@ -10,6 +10,8 @@ import {
   renderTopbarActions,
   renderHomeSupportingSections,
   renderInfoGrid,
+  renderMotorSpeedControl,
+  renderCalibrationControls,
   movementStatusFromPositions,
 } from './components.mjs';
 
@@ -59,7 +61,9 @@ export function commandMessage(command) {
     case 'deferred': return ['Movement paused by the Bluetooth cooldown. Stop remains available.', 'warn'];
     case 'write_acknowledged': return ['Command acknowledged. Movement is shown when reported by the blind.', ''];
     case 'outcome_unknown': case 'write_failed': return ['The outcome is uncertain. Check the reported position before trying again.', 'warn'];
-    case 'connection_failed': return [command.retryable ? 'Could not connect. No command was sent; you can try again.' : 'Could not connect to the blind.', 'bad'];
+    case 'connection_failed':
+      if (command.failure_stage === 'command_validation') return ['Command data is missing or invalid. No Bluetooth write was attempted.', 'bad'];
+      return [command.retryable ? 'Could not connect. No command was sent; you can try again.' : 'Could not connect to the blind.', 'bad'];
     case 'expired': return ['The command expired before it could be sent.', 'bad'];
     case 'cancelled': return ['The command was cancelled.', 'warn'];
     default: return ['Checking command status…', ''];
@@ -150,23 +154,27 @@ function card(device) {
  const cooldownUntil=device.gatt_readiness?.cooldown_until;
  const movementCooldown=!!cooldownUntil && new Date(cooldownUntil).getTime()>Date.now();
  const command=state.commands[e.id]; const [message,msgTone]=command ? commandMessage(command) : ['', ''];
+ const targetPercent=device.position?.target_closed_percent ?? p ?? 100;
  const lines=Number.isInteger(p) ? Math.max(1, Math.round(p/100*11)) : 0;
  const disabled=!!state.serviceError||device.availability!=='ready';
  const controlsMarkup=renderBlindActions({
   deviceId:e.id, blindLabel:e.label,
   panelMode,
   disabled, busy:state.busy.has(e.id),
-  movementDisabled:movementCooldown,
+  movementDisabled:movementCooldown||device.calibration_mode_active===true,
+  supportsPosition:device.capabilities?.set_position === true,
+  positionClosedPercent:targetPercent,
  });
  const messageMarkup=message?`<p class="message ${msgTone}" role="status">${esc(message)}</p>`:'';
  const availabilityMessage=device.availability!=='ready'?'<p class="message warn">Controls are unavailable until this blind is uniquely observed again.</p>':'';
  const cooldownMessage=movementCooldown?`<p class="message warn">Repeated Bluetooth connection failures. Open and Close are paused until ${esc(dateTimeLabel(cooldownUntil,'the cooldown ends'))}; Stop remains available.</p>`:'';
+ const calibrationMessage=device.calibration_mode_active?'<p class="message warn">Endpoint calibration is active. Normal movement is paused until calibration ends.</p>':'';
  const footerMarkup=`${batteryDisplay(o?.battery)}<button type="button" class="text-button" data-action="details:${esc(e.id)}">View details &nbsp; ↗</button>`;
  return renderBlindCard({
   id:e.id, label:e.label, isSimulated:e.is_simulated, lastSeen:relative(device.last_seen_at),
   availabilityLabel:label, availabilityTone:tone,
   positionPercent:p, movementStatus:o?.movement_status, blindLines:lines,
-  controlsMarkup, messageMarkup:`${messageMarkup}${availabilityMessage}${cooldownMessage}`, footerMarkup, panelMode,
+  controlsMarkup, messageMarkup:`${messageMarkup}${availabilityMessage}${cooldownMessage}${calibrationMessage}`, footerMarkup, panelMode,
  });
 }
 function activityPanel() {
@@ -232,7 +240,10 @@ function detailPage(id){
    disabled:state.removingEnrollmentId===id,
   })
   : renderDestructiveButton({label:'Remove blind', action:`remove:${encodedId}`});
- return `${back()}${notice(state.serviceError)}${notice(state.removalError,'dismiss-removal')}<h1 class="page-title">${esc(d.enrollment.label)}</h1><p class="page-intro">The latest observations reported by your blind.</p>${renderInfoGrid(fields)}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p><section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${confirmationMarkup}</section>`;
+ const busy=state.busy.has(id);
+ const motorSettings=d.capabilities?.set_motor_speed?renderMotorSpeedControl({deviceId:id,busy,calibrationActive:d.calibration_mode_active===true}):'';
+ const calibrationSettings=d.capabilities?.calibrate_endpoints?`<section class="panel device-settings"><h2>Endpoint calibration</h2><p>Calibration changes the blind’s stored open and closed limits. Stay with the blind while adjusting it. Use the small nudges to reach each endpoint, mark both limits, then end calibration.</p>${d.calibration_mode_active?'<p class="message warn" role="status">Calibration mode is active. Watch the blind while nudging it, then mark each endpoint.</p>':''}${renderCalibrationControls({deviceId:id,active:d.calibration_mode_active===true,busy})}</section>`:'';
+ return `${back()}${notice(state.serviceError)}${notice(state.removalError,'dismiss-removal')}${notice(state.actionError,'dismiss-action')}<h1 class="page-title">${esc(d.enrollment.label)}</h1><p class="page-intro">The latest observations reported by your blind.</p>${renderInfoGrid(fields)}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>${motorSettings}${calibrationSettings}<section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${confirmationMarkup}</section>`;
 }
 function simulatorControls(){
  if(!state.simulators?.length)return '';
@@ -355,7 +366,7 @@ export async function removeEnrolledBlind(target, request, refreshData, managedD
 }
 
 async function refresh(quiet=false){ await refreshService(state, api); if(!quiet || !app?.querySelector('input:focus, select:focus')) render(); }
-async function sendCommand(id,action){ if(state.busy.has(id) && action!=='stop') return; const token=Symbol(); state.busy.add(id); state.actionError=null; state.tokens[id]=token; state.commands[id]={status:'queued'}; render(); try { const key=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`; const command=await api(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify({action})}); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); pollCommand(id,command.id,token); } catch(e) { if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.actionError=`Command request failed: ${e.message}. Its outcome may be unknown; check telemetry before trying again.`; state.busy.delete(id); render(); } }
+async function sendCommand(id,action,positionClosedPercent,motorSpeedPercent){ if(state.busy.has(id) && action!=='stop') return; const token=Symbol(); state.busy.add(id); state.actionError=null; state.tokens[id]=token; state.commands[id]={status:'queued'}; render(); try { const key=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`; const body=action==='set_position'?{action,position_closed_percent:positionClosedPercent}:action==='set_motor_speed'?{action,motor_speed_percent:motorSpeedPercent}:{action}; const command=await api(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify(body)}); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); pollCommand(id,command.id,token); } catch(e) { if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.actionError=`Command request failed: ${e.message}. Its outcome may be unknown; check telemetry before trying again.`; state.busy.delete(id); render(); } }
 async function pollCommand(id,commandId,token){ try { const command=await api(`/api/control/v1/commands/${encodeURIComponent(commandId)}`); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); if(!terminal.has(command.status)){ setTimeout(()=>pollCommand(id,commandId,token),1500); return; } state.busy.delete(id); await refresh(true); } catch(e){ if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.busy.delete(id); state.actionError=`Could not check command status: ${e.message}. Check telemetry before trying again.`; render(); } }
 async function simulatorReset(id){state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_closed_percent:100})}); await refresh();}catch(error){state.actionError=`Simulator reset failed: ${error.message}`; render();}}
 async function confirmEnrollmentRemoval(id){
@@ -389,6 +400,11 @@ if(app){
   const [action,arg,id]=target.dataset.action.split(':');
   const managedDeviceId=arg ? decodeURIComponent(arg) : '';
   if(action==='command')sendCommand(id,arg);
+  else if(action==='position'){
+   const input=app.querySelector(`[data-position-input="${CSS.escape(arg)}"]`);
+   const position=Number(input?.value);
+   if(Number.isInteger(position)&&position>=0&&position<=100)sendCommand(arg,'set_position',position);
+  }
   else if(action==='details')location.hash=`details/${encodeURIComponent(arg)}`;
   else if(action==='refresh')refresh();
   else if(action==='sim-reset')simulatorReset(arg);
@@ -412,6 +428,12 @@ if(app){
   else if(action==='dismiss-action'){state.actionError=null;render();}
   else location.hash=action;
  });
- app.addEventListener('submit',async e=>{ if(e.target.matches('[data-simulator]')){e.preventDefault(); const values=Object.fromEntries(new FormData(e.target)); const id=e.target.dataset.simulator; state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/scenario`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)}); await refresh();}catch(error){state.actionError=`Simulator settings could not be saved: ${error.message}`; render();} return;} const form=e.target.closest('[data-enroll]'); if(!form)return; e.preventDefault(); const b=form.querySelector('button'); b.disabled=true; const id=form.dataset.enroll, label=new FormData(form).get('label').trim(); const added=await enrollBlind(state,api,()=>refreshService(state,api),id,label); if(added) location.hash='home'; render();});
+ actionRoot.addEventListener('input',e=>{
+  const input=e.target.closest('[data-position-input]');
+  if(!input)return;
+  const output=app.querySelector(`[data-position-output="${CSS.escape(input.dataset.positionInput)}"]`);
+  if(output)output.value=`${input.value}%`;
+ });
+ app.addEventListener('submit',async e=>{ if(e.target.matches('[data-simulator]')){e.preventDefault(); const values=Object.fromEntries(new FormData(e.target)); const id=e.target.dataset.simulator; state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/scenario`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)}); await refresh();}catch(error){state.actionError=`Simulator settings could not be saved: ${error.message}`; render();} return;} const speedForm=e.target.closest('[data-motor-speed]'); if(speedForm){e.preventDefault();const id=speedForm.dataset.motorSpeed;const speed=Number(new FormData(speedForm).get('motor_speed_percent'));if(Number.isInteger(speed)&&speed>=0&&speed<=100)sendCommand(id,'set_motor_speed',undefined,speed);return;} const form=e.target.closest('[data-enroll]'); if(!form)return; e.preventDefault(); const b=form.querySelector('button'); b.disabled=true; const id=form.dataset.enroll, label=new FormData(form).get('label').trim(); const added=await enrollBlind(state,api,()=>refreshService(state,api),id,label); if(added) location.hash='home'; render();});
  refresh(); setInterval(()=>refresh(true),5000);
 }
