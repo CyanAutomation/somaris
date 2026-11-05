@@ -38,6 +38,7 @@ struct FakeBleAdapter {
     scan_finished: Notify,
     writes: Mutex<Vec<ServiceAction>>,
     gate: Mutex<Option<Arc<ActionGate>>>,
+    battery_gate: Mutex<Option<Arc<BatteryGate>>>,
 }
 
 struct ActionGate {
@@ -47,6 +48,12 @@ struct ActionGate {
     paused: AtomicBool,
     entered: Notify,
     cancel_seen: Notify,
+    release: Notify,
+}
+
+#[derive(Default)]
+struct BatteryGate {
+    entered: Notify,
     release: Notify,
 }
 
@@ -99,12 +106,19 @@ impl FakeBleAdapter {
             scan_finished: Notify::default(),
             writes: Mutex::default(),
             gate: Mutex::default(),
+            battery_gate: Mutex::default(),
         }
     }
 
     fn with_gate(observations: Vec<BleObservation>, gate: Arc<ActionGate>) -> Self {
         let adapter = Self::with_observations(observations);
         *adapter.gate.lock().unwrap() = Some(gate);
+        adapter
+    }
+
+    fn with_battery_gate(observations: Vec<BleObservation>, gate: Arc<BatteryGate>) -> Self {
+        let adapter = Self::with_observations(observations);
+        *adapter.battery_gate.lock().unwrap() = Some(gate);
         adapter
     }
 
@@ -153,15 +167,6 @@ impl BleAdapter for FakeBleAdapter {
         action: ServiceAction,
         control: &BleCommandControl,
     ) -> Result<(), BleFailure> {
-        control.record_timings(BleAttemptTimings {
-            peripheral_lookup_ms: Some(1),
-            connect_ms: Some(2),
-            service_discovery_ms: Some(3),
-            identity_verification_ms: Some(4),
-            gatt_discovery_ms: Some(5),
-            gatt_write_ms: Some(6),
-            disconnect_ms: Some(7),
-        });
         if self.scan_active.load(Ordering::SeqCst) {
             self.gatt_overlapped_scan.store(true, Ordering::SeqCst);
         }
@@ -207,6 +212,15 @@ impl BleAdapter for FakeBleAdapter {
                 outcome_unknown: false,
             });
         }
+        control.record_timings(BleAttemptTimings {
+            peripheral_lookup_ms: Some(1),
+            connect_ms: Some(2),
+            service_discovery_ms: Some(3),
+            identity_verification_ms: Some(4),
+            gatt_discovery_ms: Some(5),
+            gatt_write_ms: Some(6),
+            disconnect_ms: Some(7),
+        });
         self.writes.lock().unwrap().push(action);
         if should_pause && gate.as_ref().unwrap().after_write {
             let gate = gate.as_ref().unwrap();
@@ -237,6 +251,25 @@ impl BleAdapter for FakeBleAdapter {
         _expected_name: &str,
     ) -> Result<Vec<u8>, BleFailure> {
         Ok(vec![0x8e, 0x01])
+    }
+
+    async fn read_battery_with_control(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        control: &BleCommandControl,
+    ) -> Result<Vec<u8>, BleFailure> {
+        let gate = self.battery_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            tokio::select! {
+                biased;
+                _ = control.cancelled() => Err(control.cancellation_failure()),
+                _ = gate.release.notified() => self.read_battery(peripheral_id, expected_name).await,
+            }
+        } else {
+            self.read_battery(peripheral_id, expected_name).await
+        }
     }
 }
 
@@ -385,7 +418,13 @@ async fn transient_service_discovery_failure_retries_only_before_a_write() {
         "service_resolution_failed"
     );
     assert_eq!(command["attempts"][0]["write_state"], "not_sent");
+    assert!(
+        command["attempts"][0]["phase_timings"]
+            .get("connect_ms")
+            .is_none()
+    );
     assert_eq!(command["attempts"][1]["phase"], "gatt_write_acknowledged");
+    assert_eq!(command["attempts"][1]["phase_timings"]["connect_ms"], 2);
     assert!(command["attempts"][0]["duration_ms"].is_number());
     assert!(command["attempts"][1]["duration_ms"].is_number());
 }
@@ -861,6 +900,37 @@ async fn retry_is_refused_when_write_may_have_been_sent() {
     assert_eq!(command["attempt"], 1);
     assert_eq!(command["status"], "outcome_unknown");
     assert_eq!(adapter.actions().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stop_preempts_an_in_flight_battery_read() {
+    let gate = Arc::new(BatteryGate::default());
+    let adapter = Arc::new(FakeBleAdapter::with_battery_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+        .await
+        .expect("battery poll should start");
+
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "stop-during-battery-read")],
+        Some(json!({"action": "stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    let command = wait_for_command(&app, &command_id).await;
+
+    assert_eq!(command["status"], "write_acknowledged");
+    assert_eq!(adapter.writes(), [ServiceAction::Stop]);
 }
 
 #[tokio::test]

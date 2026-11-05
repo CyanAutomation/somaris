@@ -274,6 +274,7 @@ impl BleCommandControl {
         match self.state.load(Ordering::Acquire) {
             CONTROL_DEADLINE_BEFORE_WRITE => BleFailure::command_deadline(false),
             CONTROL_DEADLINE_AFTER_WRITE => BleFailure::command_deadline(true),
+            CONTROL_WRITE_STARTED => BleFailure::during_write(true),
             _ => BleFailure::command_preempted(),
         }
     }
@@ -329,6 +330,20 @@ pub trait BleAdapter: Send + Sync {
         peripheral_id: &str,
         expected_name: &str,
     ) -> Result<Vec<u8>, BleFailure>;
+
+    /// Reads battery telemetry while allowing an accepted Stop to release the adapter early.
+    /// Existing adapters keep their implementation through this default method.
+    async fn read_battery_with_control(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        control: &BleCommandControl,
+    ) -> Result<Vec<u8>, BleFailure> {
+        if control.is_cancelled() {
+            return Err(control.cancellation_failure());
+        }
+        self.read_battery(peripheral_id, expected_name).await
+    }
 }
 
 #[derive(Clone)]
@@ -510,63 +525,6 @@ impl BtleplugAdapter {
                 false,
             ))
         }
-    }
-
-    async fn connect_and_discover(
-        &self,
-        peripheral_id: &str,
-        expected_name: &str,
-    ) -> Result<Peripheral, BleFailure> {
-        let peripheral = self.peripheral_at(peripheral_id).await?;
-        match tokio::time::timeout(Duration::from_secs(30), peripheral.connect()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(operation = "connect", %error, "BLE operation failed before write");
-                return Err(BleFailure::before_write(
-                    BleFailureStage::DeviceConnection,
-                    true,
-                ));
-            }
-            Err(_) => {
-                tracing::warn!(
-                    operation = "connect",
-                    timeout_seconds = 30,
-                    "BLE operation timed out before write"
-                );
-                return Err(BleFailure::before_write(
-                    BleFailureStage::DeviceConnection,
-                    true,
-                ));
-            }
-        }
-        match tokio::time::timeout(Duration::from_secs(15), peripheral.discover_services()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(operation = "discover_services", %error, "BLE service discovery failed before write");
-                Self::disconnect(&peripheral).await;
-                return Err(BleFailure::before_write(
-                    BleFailureStage::ServiceResolution,
-                    true,
-                ));
-            }
-            Err(_) => {
-                tracing::warn!(
-                    operation = "discover_services",
-                    timeout_seconds = 15,
-                    "BLE service discovery timed out before write"
-                );
-                Self::disconnect(&peripheral).await;
-                return Err(BleFailure::before_write(
-                    BleFailureStage::ServiceResolution,
-                    true,
-                ));
-            }
-        }
-        if let Err(error) = Self::verify_identity(&peripheral, expected_name).await {
-            Self::disconnect(&peripheral).await;
-            return Err(error);
-        }
-        Ok(peripheral)
     }
 
     async fn connect_and_discover_cancellable(
@@ -976,23 +934,47 @@ impl BleAdapter for BtleplugAdapter {
         peripheral_id: &str,
         expected_name: &str,
     ) -> Result<Vec<u8>, BleFailure> {
+        let control = BleCommandControl::new();
+        self.read_battery_with_control(peripheral_id, expected_name, &control)
+            .await
+    }
+
+    async fn read_battery_with_control(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        control: &BleCommandControl,
+    ) -> Result<Vec<u8>, BleFailure> {
         let peripheral = self
-            .connect_and_discover(peripheral_id, expected_name)
+            .connect_and_discover_cancellable(
+                peripheral_id,
+                expected_name,
+                ServiceAction::Stop,
+                1,
+                control,
+            )
             .await?;
+        let mut disconnect_guard = DisconnectGuard::new(&peripheral);
         let characteristic = peripheral
             .characteristics()
             .into_iter()
             .find(is_battery_characteristic);
         let Some(characteristic) = characteristic else {
-            Self::disconnect(&peripheral).await;
+            disconnect_guard.disconnect().await;
             return Err(BleFailure::before_write(
                 BleFailureStage::BatteryDiscovery,
                 false,
             ));
         };
-        let result =
-            tokio::time::timeout(Duration::from_secs(10), peripheral.read(&characteristic)).await;
-        Self::disconnect(&peripheral).await;
+        let result = tokio::select! {
+            biased;
+            _ = control.cancelled() => {
+                disconnect_guard.disconnect().await;
+                return Err(control.cancellation_failure());
+            }
+            result = tokio::time::timeout(Duration::from_secs(10), peripheral.read(&characteristic)) => result,
+        };
+        disconnect_guard.disconnect().await;
         match result {
             Err(_) => {
                 tracing::warn!(
@@ -1036,6 +1018,19 @@ mod battery_tests {
             connect_timeout(ServiceAction::Close, 1),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn cancellation_after_write_boundary_is_reported_as_uncertain() {
+        let control = BleCommandControl::new();
+        assert!(control.begin_write());
+        assert!(!control.request_prewrite_cancel());
+
+        let failure = control.cancellation_failure();
+        assert_eq!(failure.stage, BleFailureStage::GattWrite);
+        assert!(failure.write_may_have_been_sent);
+        assert!(failure.outcome_unknown);
+        assert!(!failure.retryable_before_write);
     }
 
     #[test]
