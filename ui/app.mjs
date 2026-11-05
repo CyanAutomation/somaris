@@ -100,7 +100,26 @@ function button(label, action, extra='', disabled=false, icon=null) {
  return renderButton({label, action, variant:extra, disabled, icon});
 }
 function notice(message, dismissAction) { return message ? `<div class="notice" role="alert">${esc(message)}${dismissAction?` <button class="text-button" data-action="${dismissAction}">Dismiss</button>`:''}</div>` : ''; }
-function availability(value) { return ({ready:['Ready',''],stale:['Stale','warn'],not_seen:['Not seen','warn'],ambiguous:['Ambiguous','bad']})[value] || ['Unavailable','warn']; }
+export function availability(value) { return ({ready:['Observed recently',''],stale:['Stale','warn'],not_seen:['Not seen','warn'],ambiguous:['Ambiguous','bad']})[value] || ['Unavailable','warn']; }
+export function gattReadinessLabel(readiness) {
+ switch (readiness?.status) {
+  case 'untested': return 'No command sent yet';
+  case 'queued': return 'Command queued';
+  case 'connecting': return 'Command in progress';
+  case 'connection_failed': return 'Could not connect; no write sent';
+  case 'write_acknowledged': return 'GATT write acknowledged';
+  case 'write_failed': return 'Write failed; delivery uncertain';
+  case 'outcome_unknown': return 'Write outcome unknown';
+  case 'expired': return 'Expired before attempt';
+  case 'cancelled': return 'Cancelled before write';
+  default: return 'No command result available';
+ }
+}
+function dateTimeLabel(value, fallback) {
+ if (!value) return fallback;
+ const date = new Date(value);
+ return Number.isNaN(date.getTime()) ? 'Time unavailable' : date.toLocaleString();
+}
 function card(device) {
  const e=device.enrollment, o=observationFor(device,state.observations), [label,tone]=availability(device.availability), p=device.position?.current_closed_percent;
  const panelMode=document.documentElement.dataset.displayMode==='panel';
@@ -163,6 +182,12 @@ function detailPage(id){
   {label:'Signal',value:o?.rssi_dbm!=null?`${o.rssi_dbm} dBm`:'Unavailable'},
   {label:'Battery voltage',value:o?.battery?.voltage_mv!=null?`${o.battery.voltage_mv} mV${o.battery.status!=='observed'?' (cached)':''}`:'Unavailable'},
   {label:'Source',value:d.enrollment.is_simulated?'Simulator':'Bluetooth'},
+ ...(d.gatt_readiness ? [
+  {label:'Last GATT command',value:gattReadinessLabel(d.gatt_readiness)},
+  {label:'Last command attempt',value:dateTimeLabel(d.gatt_readiness.last_attempt_at,'Not attempted yet')},
+  {label:'Last acknowledged GATT write',value:dateTimeLabel(d.gatt_readiness.last_write_acknowledged_at,'None recorded')},
+  {label:'Latest failure',value:d.gatt_readiness.error_code?`${d.gatt_readiness.error_code} · ${d.gatt_readiness.failure_stage||'unknown phase'}`:'None recorded'},
+ ] : []),
  ];
  const confirmationMarkup=state.confirmingRemovalId===id
   ? renderConfirmationPanel({
