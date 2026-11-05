@@ -59,6 +59,16 @@ test('icon-only blind actions have named controls, visible glyphs and disabled s
   assert.equal((disabled.match(/ disabled/g) || []).length, 3);
 });
 
+test('movement cooldown disables Open and Close while leaving Stop available', () => {
+  const controls = renderBlindActions({
+    deviceId:'blind-1', blindLabel:'Bedroom Left', movementDisabled:true,
+  });
+  assert.match(controls, /data-action="command:open:blind-1"[^>]*disabled/);
+  assert.match(controls, /data-action="command:close:blind-1"[^>]*disabled/);
+  assert.match(controls, /data-action="command:stop:blind-1"[^>]*>/);
+  assert.doesNotMatch(controls, /data-action="command:stop:blind-1"[^>]*disabled/);
+});
+
 test('shared button primitive escapes user text and supports icon-only accessible labels', () => {
   const markup = renderButton({
     label:'Open', accessibleLabel:'Open <Bedroom>', action:'command:open:<id>',

@@ -772,6 +772,8 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
     let managed = &contract["components"]["schemas"]["ManagedDevice"]["properties"];
     for field in [
         "capabilities",
+        "advertisement_age_ms",
+        "motion_feedback",
         "position_freshness",
         "position_source",
         "position_confidence",
@@ -787,6 +789,21 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
     assert_eq!(
         contract["components"]["schemas"]["DeviceCapabilities"]["properties"]["set_position"]["type"],
         "boolean"
+    );
+    assert!(
+        contract["components"]["schemas"]["GattReadiness"]["properties"]
+            .get("transport_evidence")
+            .is_some()
+    );
+    assert!(
+        contract["components"]["schemas"]["CommandAttempt"]["properties"]
+            .get("phase_timings")
+            .is_some()
+    );
+    assert!(
+        contract["paths"]["/api/control/v1/devices/{id}/commands"]["post"]["responses"]
+            .get("429")
+            .is_some()
     );
 
     for (path, methods) in expected {

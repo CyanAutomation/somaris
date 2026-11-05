@@ -133,7 +133,7 @@ export function renderTopbarActions({
   return `${status}${panelCount}${renderAddBlindButton()}${displayMenu}${refreshButton}`;
 }
 
-export function renderBlindActions({deviceId, blindLabel, panelMode = false, disabled = false, busy = false}) {
+export function renderBlindActions({deviceId, blindLabel, panelMode = false, disabled = false, busy = false, movementDisabled = false}) {
   const actions = [
     ['open', 'Open', ''],
     ['stop', 'Stop', 'secondary'],
@@ -146,7 +146,7 @@ export function renderBlindActions({deviceId, blindLabel, panelMode = false, dis
       accessibleLabel,
       action:`command:${action}:${deviceId}`,
       variant,
-      disabled:disabled || (busy && action !== 'stop'),
+      disabled:disabled || (movementDisabled && action !== 'stop') || (busy && action !== 'stop'),
       icon:action,
       iconOnly:panelMode,
       title:panelMode ? accessibleLabel : '',
