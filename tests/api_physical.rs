@@ -40,8 +40,10 @@ struct FakeBleAdapter {
 struct ActionGate {
     action: ServiceAction,
     after_write: bool,
+    ignore_cancellation: bool,
     paused: AtomicBool,
     entered: Notify,
+    cancel_seen: Notify,
     release: Notify,
 }
 
@@ -50,8 +52,22 @@ impl ActionGate {
         Arc::new(Self {
             action,
             after_write,
+            ignore_cancellation: false,
             paused: AtomicBool::new(true),
             entered: Notify::new(),
+            cancel_seen: Notify::new(),
+            release: Notify::new(),
+        })
+    }
+
+    fn unresponsive_after_write(action: ServiceAction) -> Arc<Self> {
+        Arc::new(Self {
+            action,
+            after_write: true,
+            ignore_cancellation: true,
+            paused: AtomicBool::new(true),
+            entered: Notify::new(),
+            cancel_seen: Notify::new(),
             release: Notify::new(),
         })
     }
@@ -183,10 +199,21 @@ impl BleAdapter for FakeBleAdapter {
         if should_pause && gate.as_ref().unwrap().after_write {
             let gate = gate.as_ref().unwrap();
             gate.entered.notify_one();
-            tokio::select! {
-                biased;
-                _ = control.cancelled() => return Err(control.cancellation_failure()),
-                _ = gate.release.notified() => {}
+            if gate.ignore_cancellation {
+                tokio::select! {
+                    biased;
+                    _ = control.cancelled() => {
+                        gate.cancel_seen.notify_one();
+                        gate.release.notified().await;
+                    }
+                    _ = gate.release.notified() => {}
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = control.cancelled() => return Err(control.cancellation_failure()),
+                    _ = gate.release.notified() => {}
+                }
             }
         }
         result
@@ -552,6 +579,43 @@ async fn command_deadline_after_write_start_is_reported_as_uncertain() {
     assert_eq!(command["write_state"], "possibly_sent");
     assert_eq!(command["retryable"], false);
     assert_eq!(command["attempts"][0]["write_state"], "possibly_sent");
+    assert_eq!(adapter.writes(), [ServiceAction::Open]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn command_deadline_bounds_wait_for_an_unresponsive_adapter_cleanup() {
+    let gate = ActionGate::unresponsive_after_write(ServiceAction::Open);
+    let adapter = Arc::new(FakeBleAdapter::with_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "unresponsive-cleanup")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .expect("command should reach the post-write gate");
+
+    tokio::time::advance(Duration::from_secs(46)).await;
+    tokio::time::timeout(Duration::from_secs(2), gate.cancel_seen.notified())
+        .await
+        .expect("adapter should observe deadline cancellation but remain stuck");
+    tokio::time::advance(Duration::from_secs(11)).await;
+
+    let command = wait_for_command(&app, &command_id).await;
+    assert_eq!(command["status"], "outcome_unknown");
+    assert_eq!(command["write_state"], "possibly_sent");
+    assert_eq!(command["retryable"], false);
     assert_eq!(adapter.writes(), [ServiceAction::Open]);
 }
 
