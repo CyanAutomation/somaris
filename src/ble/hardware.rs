@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
     time::Duration,
@@ -15,6 +15,7 @@ use btleplug::{
     platform::{Adapter, Manager, Peripheral},
 };
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
@@ -76,6 +77,35 @@ pub struct BleFailure {
     pub outcome_unknown: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BleAttemptTimings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peripheral_lookup_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_discovery_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_verification_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gatt_discovery_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gatt_write_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disconnect_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum BlePhase {
+    PeripheralLookup,
+    Connect,
+    ServiceDiscovery,
+    IdentityVerification,
+    GattDiscovery,
+    GattWrite,
+    Disconnect,
+}
+
 impl BleFailure {
     fn before_write(stage: BleFailureStage, retryable: bool) -> Self {
         Self {
@@ -130,11 +160,50 @@ const CONTROL_DEADLINE_AFTER_WRITE: u8 = 4;
 pub struct BleCommandControl {
     state: Arc<AtomicU8>,
     cancelled: Arc<Notify>,
+    timings: Arc<Mutex<BleAttemptTimings>>,
 }
 
 impl BleCommandControl {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn reset_timings(&self) {
+        *self
+            .timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = BleAttemptTimings::default();
+    }
+
+    pub fn record_timings(&self, timings: BleAttemptTimings) {
+        *self
+            .timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = timings;
+    }
+
+    pub fn record_phase(&self, phase: BlePhase, elapsed: Duration) {
+        let millis = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        let mut timings = self
+            .timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match phase {
+            BlePhase::PeripheralLookup => timings.peripheral_lookup_ms = Some(millis),
+            BlePhase::Connect => timings.connect_ms = Some(millis),
+            BlePhase::ServiceDiscovery => timings.service_discovery_ms = Some(millis),
+            BlePhase::IdentityVerification => timings.identity_verification_ms = Some(millis),
+            BlePhase::GattDiscovery => timings.gatt_discovery_ms = Some(millis),
+            BlePhase::GattWrite => timings.gatt_write_ms = Some(millis),
+            BlePhase::Disconnect => timings.disconnect_ms = Some(millis),
+        }
+    }
+
+    pub fn timings(&self) -> BleAttemptTimings {
+        *self
+            .timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn request_prewrite_cancel(&self) -> bool {
@@ -205,6 +274,7 @@ impl BleCommandControl {
         match self.state.load(Ordering::Acquire) {
             CONTROL_DEADLINE_BEFORE_WRITE => BleFailure::command_deadline(false),
             CONTROL_DEADLINE_AFTER_WRITE => BleFailure::command_deadline(true),
+            CONTROL_WRITE_STARTED => BleFailure::during_write(true),
             _ => BleFailure::command_preempted(),
         }
     }
@@ -240,16 +310,53 @@ pub trait BleAdapter: Send + Sync {
         control: &BleCommandControl,
     ) -> Result<(), BleFailure>;
 
+    /// Executes an action with the current retry number available to adapters that tune
+    /// connection setup by attempt. Existing adapters remain compatible through this default.
+    async fn write_action_with_attempt(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        action: ServiceAction,
+        attempt: u8,
+        control: &BleCommandControl,
+    ) -> Result<(), BleFailure> {
+        let _ = attempt;
+        self.write_action(peripheral_id, expected_name, action, control)
+            .await
+    }
+
     async fn read_battery(
         &self,
         peripheral_id: &str,
         expected_name: &str,
     ) -> Result<Vec<u8>, BleFailure>;
+
+    /// Reads battery telemetry while allowing an accepted Stop to release the adapter early.
+    /// Existing adapters keep their implementation through this default method.
+    async fn read_battery_with_control(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        control: &BleCommandControl,
+    ) -> Result<Vec<u8>, BleFailure> {
+        if control.is_cancelled() {
+            return Err(control.cancellation_failure());
+        }
+        self.read_battery(peripheral_id, expected_name).await
+    }
 }
 
 #[derive(Clone)]
 pub struct BtleplugAdapter {
     adapter: Adapter,
+}
+
+fn connect_timeout(action: ServiceAction, attempt: u8) -> Duration {
+    match (action, attempt) {
+        (ServiceAction::Stop, 1) => Duration::from_secs(12),
+        (ServiceAction::Stop, _) => Duration::from_secs(20),
+        _ => Duration::from_secs(30),
+    }
 }
 
 struct DisconnectGuard(Option<Peripheral>);
@@ -420,88 +527,44 @@ impl BtleplugAdapter {
         }
     }
 
-    async fn connect_and_discover(
-        &self,
-        peripheral_id: &str,
-        expected_name: &str,
-    ) -> Result<Peripheral, BleFailure> {
-        let peripheral = self.peripheral_at(peripheral_id).await?;
-        match tokio::time::timeout(Duration::from_secs(30), peripheral.connect()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(operation = "connect", %error, "BLE operation failed before write");
-                return Err(BleFailure::before_write(
-                    BleFailureStage::DeviceConnection,
-                    true,
-                ));
-            }
-            Err(_) => {
-                tracing::warn!(
-                    operation = "connect",
-                    timeout_seconds = 30,
-                    "BLE operation timed out before write"
-                );
-                return Err(BleFailure::before_write(
-                    BleFailureStage::DeviceConnection,
-                    true,
-                ));
-            }
-        }
-        match tokio::time::timeout(Duration::from_secs(15), peripheral.discover_services()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(operation = "discover_services", %error, "BLE service discovery failed before write");
-                Self::disconnect(&peripheral).await;
-                return Err(BleFailure::before_write(
-                    BleFailureStage::ServiceResolution,
-                    true,
-                ));
-            }
-            Err(_) => {
-                tracing::warn!(
-                    operation = "discover_services",
-                    timeout_seconds = 15,
-                    "BLE service discovery timed out before write"
-                );
-                Self::disconnect(&peripheral).await;
-                return Err(BleFailure::before_write(
-                    BleFailureStage::ServiceResolution,
-                    true,
-                ));
-            }
-        }
-        if let Err(error) = Self::verify_identity(&peripheral, expected_name).await {
-            Self::disconnect(&peripheral).await;
-            return Err(error);
-        }
-        Ok(peripheral)
-    }
-
     async fn connect_and_discover_cancellable(
         &self,
         peripheral_id: &str,
         expected_name: &str,
+        action: ServiceAction,
+        attempt: u8,
         control: &BleCommandControl,
     ) -> Result<Peripheral, BleFailure> {
-        let peripheral = tokio::select! {
+        let lookup_started = std::time::Instant::now();
+        let lookup_result = tokio::select! {
             biased;
             _ = control.cancelled() => return Err(control.cancellation_failure()),
-            result = self.peripheral_at(peripheral_id) => result?,
+            result = self.peripheral_at(peripheral_id) => result,
         };
+        control.record_phase(BlePhase::PeripheralLookup, lookup_started.elapsed());
+        let peripheral = lookup_result?;
         let mut disconnect_guard = DisconnectGuard::new(&peripheral);
+        let connect_timeout = connect_timeout(action, attempt);
+        let connect_started = std::time::Instant::now();
         let connection = tokio::select! {
             biased;
             _ = control.cancelled() => {
+                control.record_phase(BlePhase::Connect, connect_started.elapsed());
+                let disconnect_started = std::time::Instant::now();
                 disconnect_guard.abort_connection().await;
+                control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
                 return Err(control.cancellation_failure());
             }
-            result = tokio::time::timeout(Duration::from_secs(30), peripheral.connect()) => result,
+            result = tokio::time::timeout(connect_timeout, peripheral.connect()) => result,
         };
+        control.record_phase(BlePhase::Connect, connect_started.elapsed());
         match connection {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(operation = "connect", %error, "BLE operation failed before write");
+                let disconnect_started = std::time::Instant::now();
                 disconnect_guard.abort_connection().await;
+                control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
                 return Err(BleFailure::before_write(
                     BleFailureStage::DeviceConnection,
                     true,
@@ -510,29 +573,44 @@ impl BtleplugAdapter {
             Err(_) => {
                 tracing::warn!(
                     operation = "connect",
-                    timeout_seconds = 30,
+                    timeout_seconds = connect_timeout.as_secs(),
                     "BLE operation timed out before write"
                 );
+                let disconnect_started = std::time::Instant::now();
                 disconnect_guard.abort_connection().await;
+                control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
                 return Err(BleFailure::before_write(
                     BleFailureStage::DeviceConnection,
                     true,
                 ));
             }
         }
+        let service_discovery_started = std::time::Instant::now();
         let discovery = tokio::select! {
             biased;
             _ = control.cancelled() => {
+                control.record_phase(
+                    BlePhase::ServiceDiscovery,
+                    service_discovery_started.elapsed(),
+                );
+                let disconnect_started = std::time::Instant::now();
                 disconnect_guard.disconnect().await;
+                control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
                 return Err(control.cancellation_failure());
             }
             result = tokio::time::timeout(Duration::from_secs(15), peripheral.discover_services()) => result,
         };
+        control.record_phase(
+            BlePhase::ServiceDiscovery,
+            service_discovery_started.elapsed(),
+        );
         match discovery {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(operation = "discover_services", %error, "BLE service discovery failed before write");
+                let disconnect_started = std::time::Instant::now();
                 disconnect_guard.disconnect().await;
+                control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
                 return Err(BleFailure::before_write(
                     BleFailureStage::ServiceResolution,
                     true,
@@ -544,23 +622,35 @@ impl BtleplugAdapter {
                     timeout_seconds = 15,
                     "BLE service discovery timed out before write"
                 );
+                let disconnect_started = std::time::Instant::now();
                 disconnect_guard.disconnect().await;
+                control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
                 return Err(BleFailure::before_write(
                     BleFailureStage::ServiceResolution,
                     true,
                 ));
             }
         }
+        let identity_started = std::time::Instant::now();
         let identity = tokio::select! {
             biased;
             _ = control.cancelled() => {
+                control.record_phase(
+                    BlePhase::IdentityVerification,
+                    identity_started.elapsed(),
+                );
+                let disconnect_started = std::time::Instant::now();
                 disconnect_guard.disconnect().await;
+                control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
                 return Err(control.cancellation_failure());
             }
             result = Self::verify_identity(&peripheral, expected_name) => result,
         };
+        control.record_phase(BlePhase::IdentityVerification, identity_started.elapsed());
         if let Err(error) = identity {
+            let disconnect_started = std::time::Instant::now();
             disconnect_guard.disconnect().await;
+            control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
             return Err(error);
         }
         disconnect_guard.disarm();
@@ -735,8 +825,26 @@ impl BleAdapter for BtleplugAdapter {
         action: ServiceAction,
         control: &BleCommandControl,
     ) -> Result<(), BleFailure> {
+        self.write_action_with_attempt(peripheral_id, expected_name, action, 1, control)
+            .await
+    }
+
+    async fn write_action_with_attempt(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        action: ServiceAction,
+        attempt: u8,
+        control: &BleCommandControl,
+    ) -> Result<(), BleFailure> {
         let peripheral = self
-            .connect_and_discover_cancellable(peripheral_id, expected_name, control)
+            .connect_and_discover_cancellable(
+                peripheral_id,
+                expected_name,
+                action,
+                attempt,
+                control,
+            )
             .await?;
         let mut disconnect_guard = DisconnectGuard::new(&peripheral);
         let (service_uuid, characteristic_uuid) = match action {
@@ -749,6 +857,7 @@ impl BleAdapter for BtleplugAdapter {
             .map_err(|_| BleFailure::before_write(BleFailureStage::GattDiscovery, false))?;
         let characteristic_uuid = Uuid::parse_str(characteristic_uuid)
             .map_err(|_| BleFailure::before_write(BleFailureStage::GattDiscovery, false))?;
+        let discovery_started = std::time::Instant::now();
         let characteristics = peripheral.characteristics();
         let characteristic = characteristics.iter().find(|characteristic| {
             characteristic.service_uuid == service_uuid
@@ -763,21 +872,31 @@ impl BleAdapter for BtleplugAdapter {
                 ?characteristics,
                 "No writable SOMA command characteristic was found after service discovery"
             );
+            control.record_phase(BlePhase::GattDiscovery, discovery_started.elapsed());
+            let disconnect_started = std::time::Instant::now();
             disconnect_guard.disconnect().await;
+            control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
             return Err(BleFailure::before_write(
                 BleFailureStage::GattDiscovery,
                 false,
             ));
         };
+        control.record_phase(BlePhase::GattDiscovery, discovery_started.elapsed());
         if !control.begin_write() {
+            let disconnect_started = std::time::Instant::now();
             disconnect_guard.disconnect().await;
+            control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
             return Err(control.cancellation_failure());
         }
         let payload = encode_service_action(action);
+        let write_started = std::time::Instant::now();
         let result = tokio::select! {
             biased;
             _ = control.cancelled() => {
+                control.record_phase(BlePhase::GattWrite, write_started.elapsed());
+                let disconnect_started = std::time::Instant::now();
                 disconnect_guard.disconnect().await;
+                control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
                 return Err(control.cancellation_failure());
             }
             result = tokio::time::timeout(
@@ -789,7 +908,10 @@ impl BleAdapter for BtleplugAdapter {
                 ),
             ) => result,
         };
+        control.record_phase(BlePhase::GattWrite, write_started.elapsed());
+        let disconnect_started = std::time::Instant::now();
         disconnect_guard.disconnect().await;
+        control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
         match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
@@ -812,23 +934,47 @@ impl BleAdapter for BtleplugAdapter {
         peripheral_id: &str,
         expected_name: &str,
     ) -> Result<Vec<u8>, BleFailure> {
+        let control = BleCommandControl::new();
+        self.read_battery_with_control(peripheral_id, expected_name, &control)
+            .await
+    }
+
+    async fn read_battery_with_control(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        control: &BleCommandControl,
+    ) -> Result<Vec<u8>, BleFailure> {
         let peripheral = self
-            .connect_and_discover(peripheral_id, expected_name)
+            .connect_and_discover_cancellable(
+                peripheral_id,
+                expected_name,
+                ServiceAction::Stop,
+                1,
+                control,
+            )
             .await?;
+        let mut disconnect_guard = DisconnectGuard::new(&peripheral);
         let characteristic = peripheral
             .characteristics()
             .into_iter()
             .find(is_battery_characteristic);
         let Some(characteristic) = characteristic else {
-            Self::disconnect(&peripheral).await;
+            disconnect_guard.disconnect().await;
             return Err(BleFailure::before_write(
                 BleFailureStage::BatteryDiscovery,
                 false,
             ));
         };
-        let result =
-            tokio::time::timeout(Duration::from_secs(10), peripheral.read(&characteristic)).await;
-        Self::disconnect(&peripheral).await;
+        let result = tokio::select! {
+            biased;
+            _ = control.cancelled() => {
+                disconnect_guard.disconnect().await;
+                return Err(control.cancellation_failure());
+            }
+            result = tokio::time::timeout(Duration::from_secs(10), peripheral.read(&characteristic)) => result,
+        };
+        disconnect_guard.disconnect().await;
         match result {
             Err(_) => {
                 tracing::warn!(
@@ -857,6 +1003,35 @@ mod battery_tests {
     use super::*;
     use btleplug::api::Characteristic;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn stop_uses_a_short_first_connection_window_then_a_bounded_recovery_window() {
+        assert_eq!(
+            connect_timeout(ServiceAction::Stop, 1),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            connect_timeout(ServiceAction::Stop, 2),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            connect_timeout(ServiceAction::Close, 1),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn cancellation_after_write_boundary_is_reported_as_uncertain() {
+        let control = BleCommandControl::new();
+        assert!(control.begin_write());
+        assert!(!control.request_prewrite_cancel());
+
+        let failure = control.cancellation_failure();
+        assert_eq!(failure.stage, BleFailureStage::GattWrite);
+        assert!(failure.write_may_have_been_sent);
+        assert!(failure.outcome_unknown);
+        assert!(!failure.retryable_before_write);
+    }
 
     #[test]
     fn finds_readable_soma_vendor_battery_characteristic() {

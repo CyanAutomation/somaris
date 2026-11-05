@@ -17,7 +17,10 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use somaris::{
     api::{AppState, QueueConfig, router},
-    ble::{BleAdapter, BleCommandControl, BleFailure, BleFailureStage, BleObservation},
+    ble::{
+        BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureStage,
+        BleObservation,
+    },
     controller::ServiceAction,
 };
 use tokio::sync::{Notify, mpsc};
@@ -35,6 +38,7 @@ struct FakeBleAdapter {
     scan_finished: Notify,
     writes: Mutex<Vec<ServiceAction>>,
     gate: Mutex<Option<Arc<ActionGate>>>,
+    battery_gate: Mutex<Option<Arc<BatteryGate>>>,
 }
 
 struct ActionGate {
@@ -44,6 +48,12 @@ struct ActionGate {
     paused: AtomicBool,
     entered: Notify,
     cancel_seen: Notify,
+    release: Notify,
+}
+
+#[derive(Default)]
+struct BatteryGate {
+    entered: Notify,
     release: Notify,
 }
 
@@ -96,12 +106,19 @@ impl FakeBleAdapter {
             scan_finished: Notify::default(),
             writes: Mutex::default(),
             gate: Mutex::default(),
+            battery_gate: Mutex::default(),
         }
     }
 
     fn with_gate(observations: Vec<BleObservation>, gate: Arc<ActionGate>) -> Self {
         let adapter = Self::with_observations(observations);
         *adapter.gate.lock().unwrap() = Some(gate);
+        adapter
+    }
+
+    fn with_battery_gate(observations: Vec<BleObservation>, gate: Arc<BatteryGate>) -> Self {
+        let adapter = Self::with_observations(observations);
+        *adapter.battery_gate.lock().unwrap() = Some(gate);
         adapter
     }
 
@@ -195,6 +212,15 @@ impl BleAdapter for FakeBleAdapter {
                 outcome_unknown: false,
             });
         }
+        control.record_timings(BleAttemptTimings {
+            peripheral_lookup_ms: Some(1),
+            connect_ms: Some(2),
+            service_discovery_ms: Some(3),
+            identity_verification_ms: Some(4),
+            gatt_discovery_ms: Some(5),
+            gatt_write_ms: Some(6),
+            disconnect_ms: Some(7),
+        });
         self.writes.lock().unwrap().push(action);
         if should_pause && gate.as_ref().unwrap().after_write {
             let gate = gate.as_ref().unwrap();
@@ -225,6 +251,25 @@ impl BleAdapter for FakeBleAdapter {
         _expected_name: &str,
     ) -> Result<Vec<u8>, BleFailure> {
         Ok(vec![0x8e, 0x01])
+    }
+
+    async fn read_battery_with_control(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        control: &BleCommandControl,
+    ) -> Result<Vec<u8>, BleFailure> {
+        let gate = self.battery_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            tokio::select! {
+                biased;
+                _ = control.cancelled() => Err(control.cancellation_failure()),
+                _ = gate.release.notified() => self.read_battery(peripheral_id, expected_name).await,
+            }
+        } else {
+            self.read_battery(peripheral_id, expected_name).await
+        }
     }
 }
 
@@ -294,6 +339,7 @@ async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
     let managed = managed.unwrap()["data"][0].clone();
     assert_eq!(managed["availability"], "ready");
     assert_eq!(managed["gatt_readiness"]["status"], "untested");
+    assert_eq!(managed["gatt_readiness"]["transport_evidence"], "untested");
 
     for (key, action, expected) in [
         ("physical-open", "open", ServiceAction::Open),
@@ -317,6 +363,9 @@ async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
         assert_eq!(command["attempt"], 1);
         assert_eq!(command["attempts"].as_array().unwrap().len(), 1);
         assert_eq!(command["attempts"][0]["phase"], "gatt_write_acknowledged");
+        assert_eq!(command["attempts"][0]["phase_timings"]["connect_ms"], 2);
+        assert_eq!(command["attempts"][0]["advertisement_rssi_dbm"], -56);
+        assert!(command["attempts"][0]["advertisement_age_ms"].is_number());
         assert_eq!(adapter.actions().last().unwrap().2, expected);
     }
 
@@ -336,6 +385,7 @@ async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
     let (_, managed) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
     let gatt = &managed.unwrap()["data"][0]["gatt_readiness"];
     assert_eq!(gatt["status"], "write_acknowledged");
+    assert_eq!(gatt["transport_evidence"], "recently_acknowledged");
     assert_eq!(gatt["attempt_count"], 1);
     assert!(gatt["last_write_acknowledged_at"].is_string());
 }
@@ -368,7 +418,13 @@ async fn transient_service_discovery_failure_retries_only_before_a_write() {
         "service_resolution_failed"
     );
     assert_eq!(command["attempts"][0]["write_state"], "not_sent");
+    assert!(
+        command["attempts"][0]["phase_timings"]
+            .get("connect_ms")
+            .is_none()
+    );
     assert_eq!(command["attempts"][1]["phase"], "gatt_write_acknowledged");
+    assert_eq!(command["attempts"][1]["phase_timings"]["connect_ms"], 2);
     assert!(command["attempts"][0]["duration_ms"].is_number());
     assert!(command["attempts"][1]["duration_ms"].is_number());
 }
@@ -398,6 +454,7 @@ async fn gatt_readiness_keeps_last_ack_after_a_later_connection_failure() {
     let (_, response) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
     let gatt = &response.unwrap()["data"][0]["gatt_readiness"];
     assert_eq!(gatt["status"], "connection_failed");
+    assert_eq!(gatt["transport_evidence"], "prewrite_failure");
     assert_eq!(gatt["failure_stage"], "device_connection");
     assert_eq!(gatt["error_code"], "device_connection_failed");
     assert_eq!(gatt["attempt_count"], 1);
@@ -405,6 +462,210 @@ async fn gatt_readiness_keeps_last_ack_after_a_later_connection_failure() {
     let (ready_status, readiness) = request(&app, Method::GET, "/api/v1/ready", &[], None).await;
     assert_eq!(ready_status, StatusCode::OK);
     assert_eq!(readiness.unwrap()["data"]["status"], "healthy");
+}
+
+#[tokio::test]
+async fn repeated_confirmed_prewrite_failures_open_a_per_device_cooldown() {
+    let failure = BleFailure {
+        stage: BleFailureStage::DeviceConnection,
+        retryable_before_write: true,
+        write_may_have_been_sent: false,
+        outcome_unknown: false,
+    };
+    let adapter = Arc::new(FakeBleAdapter::with_results(
+        vec![closed_blind()],
+        [
+            Err(failure.clone()),
+            Err(failure.clone()),
+            Err(failure.clone()),
+            Err(failure),
+        ],
+    ));
+    let app = app_with_adapter(adapter).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+
+    assert_eq!(
+        submit(&app, &managed_id, "cooldown-fail-1", "close").await["status"],
+        "connection_failed"
+    );
+    assert_eq!(
+        submit(&app, &managed_id, "cooldown-fail-2", "close").await["status"],
+        "connection_failed"
+    );
+
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "cooldown-blocked")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.unwrap()["error"]["code"], "device_cooldown");
+
+    let (_, managed) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    assert!(managed.unwrap()["data"][0]["gatt_readiness"]["cooldown_until"].is_string());
+}
+
+#[tokio::test]
+async fn already_queued_movement_is_deferred_if_prior_commands_open_cooldown() {
+    let failure = BleFailure {
+        stage: BleFailureStage::DeviceConnection,
+        retryable_before_write: true,
+        write_may_have_been_sent: false,
+        outcome_unknown: false,
+    };
+    let adapter = Arc::new(FakeBleAdapter::with_results(
+        vec![closed_blind()],
+        [
+            Err(failure.clone()),
+            Err(failure.clone()),
+            Err(failure.clone()),
+            Err(failure.clone()),
+            Err(failure.clone()),
+            Err(failure),
+        ],
+    ));
+    let gate = ActionGate::new(ServiceAction::Close, false);
+    *adapter.gate.lock().unwrap() = Some(gate.clone());
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+
+    let queue = |key: &'static str| {
+        let app = app.clone();
+        let managed_id = managed_id.clone();
+        async move {
+            let (status, response) = request(
+                &app,
+                Method::POST,
+                &format!("/api/control/v1/devices/{managed_id}/commands"),
+                &[("idempotency-key", key)],
+                Some(json!({"action": "close"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            response.unwrap()["data"]["id"].as_str().unwrap().to_owned()
+        }
+    };
+    let first_id = queue("queued-before-cooldown-1").await;
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    let second_id = queue("queued-before-cooldown-2").await;
+    let third_id = queue("queued-before-cooldown-3").await;
+    gate.release.notify_one();
+
+    assert_eq!(
+        wait_for_command(&app, &first_id).await["status"],
+        "connection_failed"
+    );
+    assert_eq!(
+        wait_for_command(&app, &second_id).await["status"],
+        "connection_failed"
+    );
+    let deferred = wait_for_command(&app, &third_id).await;
+    assert_eq!(deferred["status"], "deferred");
+    assert_eq!(deferred["error_code"], "device_cooldown");
+    assert_eq!(deferred["write_state"], "not_sent");
+    assert_eq!(adapter.actions().len(), 4);
+    let (_, managed) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    assert!(managed.unwrap()["data"][0]["gatt_readiness"]["cooldown_until"].is_string());
+    let (status, _) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "queued-after-cooldown")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn stop_batch_attempts_each_blind_before_retrying_a_failed_stop() {
+    let failure = BleFailure {
+        stage: BleFailureStage::DeviceConnection,
+        retryable_before_write: true,
+        write_may_have_been_sent: false,
+        outcome_unknown: false,
+    };
+    let adapter = Arc::new(FakeBleAdapter::with_results(
+        vec![
+            blind("Bedroom Left0", "AA:BB:CC:DD:EE:11"),
+            blind("Bedroom Right0", "AA:BB:CC:DD:EE:12"),
+        ],
+        [Err(failure), Ok(()), Ok(())],
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let left_blind = wait_for_blind(&app, "Bedroom Left0").await;
+    let right_blind = wait_for_blind(&app, "Bedroom Right0").await;
+    enroll_with_label(&app, &left_blind, "Bedroom Left").await;
+    enroll_with_label(&app, &right_blind, "Bedroom Right").await;
+
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "stop-fairness")],
+        Some(json!({"action": "stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let batch_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    let batch = wait_for_batch(&app, &batch_id).await;
+    assert_eq!(batch["status"], "completed");
+    let calls = adapter.actions();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].0, "AA:BB:CC:DD:EE:11");
+    assert_eq!(calls[1].0, "AA:BB:CC:DD:EE:12");
+    assert_eq!(calls[2].0, "AA:BB:CC:DD:EE:11");
+}
+
+#[tokio::test]
+async fn stop_batch_preempts_a_queued_movement_before_reserving_the_adapter() {
+    let gate = ActionGate::new(ServiceAction::Close, false);
+    let adapter = Arc::new(FakeBleAdapter::with_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "batch-stop-preempt-close")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let movement_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "batch-stop-preempts-movement")],
+        Some(json!({"action": "stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let batch_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&app, &movement_id).await["status"],
+        "cancelled"
+    );
+    let batch = wait_for_batch(&app, &batch_id).await;
+    assert_eq!(batch["status"], "completed");
+    assert_eq!(batch["targets"][0]["status"], "write_acknowledged");
+    assert_eq!(adapter.writes(), [ServiceAction::Stop]);
 }
 
 #[tokio::test]
@@ -641,6 +902,37 @@ async fn retry_is_refused_when_write_may_have_been_sent() {
     assert_eq!(adapter.actions().len(), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn stop_preempts_an_in_flight_battery_read() {
+    let gate = Arc::new(BatteryGate::default());
+    let adapter = Arc::new(FakeBleAdapter::with_battery_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::time::timeout(Duration::from_secs(3), gate.entered.notified())
+        .await
+        .expect("battery poll should start");
+
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "stop-during-battery-read")],
+        Some(json!({"action": "stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    let command = wait_for_command(&app, &command_id).await;
+
+    assert_eq!(command["status"], "write_acknowledged");
+    assert_eq!(adapter.writes(), [ServiceAction::Stop]);
+}
+
 #[tokio::test]
 async fn gatt_commands_wait_until_the_adapter_scan_window_ends() {
     let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
@@ -805,6 +1097,10 @@ async fn wait_for_blind(app: &Router, name: &str) -> Value {
 }
 
 async fn enroll(app: &Router, blind: &Value) -> String {
+    enroll_with_label(app, blind, "Test blind").await
+}
+
+async fn enroll_with_label(app: &Router, blind: &Value, label: &str) -> String {
     let (status, response) = request(
         app,
         Method::POST,
@@ -812,12 +1108,31 @@ async fn enroll(app: &Router, blind: &Value) -> String {
         &[],
         Some(json!({
             "observed_device_id": blind["id"],
-            "label": "Test blind"
+            "label": label
         })),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
     response.unwrap()["data"]["id"].as_str().unwrap().to_owned()
+}
+
+async fn wait_for_batch(app: &Router, batch_id: &str) -> Value {
+    for _ in 0..2_000 {
+        let (_, response) = request(
+            app,
+            Method::GET,
+            &format!("/api/control/v1/batches/{batch_id}"),
+            &[],
+            None,
+        )
+        .await;
+        let batch = response.unwrap()["data"].clone();
+        if !matches!(batch["status"].as_str(), Some("queued" | "running")) {
+            return batch;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("batch did not reach a terminal state");
 }
 
 async fn submit(app: &Router, managed_id: &str, key: &str, action: &str) -> Value {
