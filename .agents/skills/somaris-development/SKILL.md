@@ -12,6 +12,8 @@ Use this skill for changes to the Somaris repository. Read `README.md` and inspe
 - `src/api.rs`: HTTP routes, application state, simulator, persistence, command queue, and API documentation handlers.
 - `src/controller.rs` and `src/ble/`: controller boundary, physical Bluetooth adapter, and Soma advertisement protocol.
 - `src/client.rs`: HTTP client used to communicate with the service.
+- `src/device_info.rs`: cached GATT reads and normalization of device metadata.
+- `src/telemetry.rs`: normalization and labeling of controller reason-code telemetry.
 - `src/mcp.rs`: stdio MCP tools and resources, forwarded through the HTTP API.
 - `src/integration.rs`: transport-neutral device capabilities and process-local state-change notifications.
 - `ui/`: browser dashboard and its JavaScript and CSS components.
@@ -32,21 +34,22 @@ Use this skill for changes to the Somaris repository. Read `README.md` and inspe
 ## Change workflow
 
 1. Read the relevant source, tests, and current README or operational docs. Check for existing contract expectations before changing behavior.
-2. For behavior changes, write or update the smallest relevant regression test first, confirm it fails for the intended reason, then implement the change. Prefer simulators, fakes, and deterministic tests; never make a hardware command a test fixture.
+2. For behavior changes, use TDD when the behavior can be exercised deterministically: write or update the smallest relevant regression test first, confirm it fails for the intended reason, then implement the change. Prefer simulators and fakes; never make a hardware command a test fixture. If behavior cannot be covered safely by an automated test, explain why and add the closest deterministic coverage available.
 3. For HTTP route, schema, status, or response changes, update `openapi.json` and the relevant API contract tests. Check both served OpenAPI formats; YAML is derived from the JSON document.
 4. For MCP changes, preserve the HTTP API as the service boundary and update the MCP unit tests and documented tool contract. Do not add simulator configuration tools to MCP without an explicit product requirement.
 5. For dashboard behavior, update the relevant `ui/tests/` cases and keep browser behavior aligned with API semantics, especially telemetry freshness and asynchronous command outcomes.
 6. For BLE changes, cover protocol decoding and adapter outcomes with tests. Keep uncertain writes distinct from confirmed pre-write failures, and preserve serialized adapter access and safe cancellation behavior.
 7. For integration changes, remember that state-change notifications are bounded, process-local hints rather than a durable event log; consumers must refresh authoritative state after startup or lag.
-8. Run focused checks first. Before finishing, run the same relevant checks as CI:
+8. Run focused checks first, then select checks by the changed area. Keep tool versions aligned with the Rust toolchain and Node version configured in CI (`.github/workflows/publish-image.yml` and `.nvmrc`):
 
-   ```sh
-   cargo fmt --all -- --check
-   cargo clippy --all-targets --locked -- -D warnings
-   cargo test --locked
-   node --test ui/tests/*.test.mjs
-   ```
+   | Changed area | Relevant checks |
+   | --- | --- |
+   | Rust service, API, BLE, MCP, client, device info, telemetry, or integrations | `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked -- -D warnings`, and `cargo test --locked` |
+   | Dashboard behavior | `node --test ui/tests/*.test.mjs` with the Node version in `.nvmrc`; also run `cargo test --locked` when changing bundled UI assets |
+   | `Cargo.toml` or `Cargo.lock` | Run the Rust checks above and `cargo audit` |
+   | HTTP route, schema, status, or response | Update `openapi.json` and relevant API contract tests; verify both served OpenAPI formats |
+   | Docker, Compose, or image workflow | Check the relevant Docker/Compose configuration and workflow path filter. For applicable pull requests, CI builds the image for `linux/amd64` without publishing; eligible pushes to `main` publish `linux/amd64` and `linux/arm64`. |
 
-   Container or dependency-workflow changes should also be checked against `.github/workflows/publish-image.yml` and the relevant Docker or Compose configuration.
+   For broad changes, run all checks used by CI: formatting, Clippy, Rust tests, UI tests, and the dependency audit. Check the workflow before assuming a particular file change triggers an image build.
 
 When a requested change conflicts with a device-safety or deployment constraint, explain the conflict and propose the smallest safe alternative before changing that boundary.
