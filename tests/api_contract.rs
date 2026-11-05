@@ -269,6 +269,31 @@ async fn simulators_have_distinct_names_independent_settings_and_positions() {
     assert_eq!(first["requested_command_status"], "write_acknowledged");
     assert_eq!(first["position"]["target_closed_percent"], 0);
 
+    let (status, _, stop) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{first_id}/commands"),
+        &[("idempotency-key", "stop-after-open-simulator-1")],
+        Some(json!({"action": "stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let stop_id = stop.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&app, &stop_id).await["status"],
+        "write_acknowledged"
+    );
+    let (_, _, stopped) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let stopped = stopped.unwrap()["data"].clone();
+    let first = stopped
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["enrollment"]["id"] == first_id)
+        .unwrap();
+    assert_eq!(first["requested_position_closed_percent"], 0);
+    assert_eq!(first["requested_command_status"], "write_acknowledged");
+
     let (status, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     let devices = devices.unwrap()["data"].clone();
@@ -284,7 +309,7 @@ async fn simulators_have_distinct_names_independent_settings_and_positions() {
         .iter()
         .find(|device| device["id"] == "simulator-2")
         .unwrap();
-    assert_eq!(first["position"]["target_closed_percent"], 0);
+    assert_eq!(first["position"]["target_closed_percent"], 25);
     assert_eq!(second["position"]["current_closed_percent"], 65);
     assert_eq!(second["position"]["target_closed_percent"], 65);
 }
