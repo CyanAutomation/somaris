@@ -2205,6 +2205,10 @@
             ],
             "description": "ready means a unique fresh physical or simulated observation is available; it does not mean the service is connected over GATT."
           },
+          "capabilities": {
+            "$ref": "#/components/schemas/DeviceCapabilities",
+            "description": "Operations supported by Somaris for this managed device."
+          },
           "gatt_readiness": {
             "$ref": "#/components/schemas/GattReadiness",
             "description": "Present for physical enrollments. Historical status of the latest retained command and last retained acknowledged write; command records are kept for up to 24 hours subject to a 1000-record cap. It is not an active connection probe and does not confirm movement."
@@ -2215,7 +2219,53 @@
           },
           "position": {
             "$ref": "#/components/schemas/ControlPosition"
+          },
+          "movement_status": {
+            "type": "string",
+            "enum": ["closing", "opening", "at_target", "unavailable"],
+            "description": "Derived from motor-reported current and target positions."
+          },
+          "position_status": {
+            "type": "string",
+            "enum": ["observed", "unsupported", "invalid_payload", "not_observed"]
+          },
+          "position_freshness": {
+            "type": "string",
+            "enum": ["fresh", "stale"]
+          },
+          "position_source": {
+            "type": "string",
+            "enum": ["ble_advertisement", "simulator"]
+          },
+          "position_confidence": {
+            "type": "string",
+            "enum": ["project_confirmed", "simulated"]
+          },
+          "position_observed_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "requested_position_closed_percent": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "Latest retained open or close command intent; this is not motor telemetry."
+          },
+          "requested_command_status": {
+            "type": "string",
+            "description": "Transport lifecycle status for the latest retained command."
           }
+        }
+      },
+      "DeviceCapabilities": {
+        "type": "object",
+        "required": ["open", "close", "stop", "set_position", "position_feedback"],
+        "properties": {
+          "open": {"type": "boolean"},
+          "close": {"type": "boolean"},
+          "stop": {"type": "boolean"},
+          "set_position": {"type": "boolean", "description": "False for current physical Wazombi motors."},
+          "position_feedback": {"type": "boolean"}
         }
       },
       "GattReadiness": {
