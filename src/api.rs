@@ -4387,14 +4387,13 @@ async fn submit_command(
                 CalibrationSessionStatus::Starting,
             );
         }
-        Action::CalibrationStop => {
-            if calibration_session.is_some() {
-                inner.calibration_sessions.insert(
-                    managed_device_id.to_owned(),
-                    CalibrationSessionStatus::Stopping,
-                );
-            }
+        Action::CalibrationStop if calibration_session.is_some() => {
+            inner.calibration_sessions.insert(
+                managed_device_id.to_owned(),
+                CalibrationSessionStatus::Stopping,
+            );
         }
+        Action::CalibrationStop => {}
         _ => {}
     }
     record_activity(
