@@ -4,6 +4,12 @@ pub const OPEN_CLOSE_SERVICE_UUID: &str = "00001890-b87f-490c-92cb-11ba5ea5167c"
 pub const OPEN_CLOSE_CHARACTERISTIC_UUID: &str = "00001896-b87f-490c-92cb-11ba5ea5167c";
 pub const STOP_SERVICE_UUID: &str = "00001861-b87f-490c-92cb-11ba5ea5167c";
 pub const STOP_CHARACTERISTIC_UUID: &str = "00001530-b87f-490c-92cb-11ba5ea5167c";
+pub const MOTOR_SERVICE_UUID: &str = STOP_SERVICE_UUID;
+pub const MOTOR_CONTROL_CHARACTERISTIC_UUID: &str = STOP_CHARACTERISTIC_UUID;
+pub const POSITION_TARGET_CHARACTERISTIC_UUID: &str = "00001526-b87f-490c-92cb-11ba5ea5167c";
+pub const CALIBRATION_CHARACTERISTIC_UUID: &str = "00001529-b87f-490c-92cb-11ba5ea5167c";
+pub const SHADE_CONFIG_SERVICE_UUID: &str = OPEN_CLOSE_SERVICE_UUID;
+pub const SHADE_CONFIG_CHARACTERISTIC_UUID: &str = OPEN_CLOSE_CHARACTERISTIC_UUID;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerCommand {
@@ -19,6 +25,14 @@ pub enum ServiceAction {
     Open,
     Close,
     Stop,
+    SetTargetClosedPercent(u8),
+    SetMotorSpeedPercent(u8),
+    CalibrationStart,
+    CalibrationStop,
+    CalibrationNudgeOpen,
+    CalibrationNudgeClosed,
+    CalibrationSetOpenLimit,
+    CalibrationSetClosedLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +74,38 @@ pub fn encode_service_action(action: ServiceAction) -> Vec<u8> {
         ServiceAction::Open => vec![0x1a, 0x01, 0x00],
         ServiceAction::Close => vec![0x1a, 0x01, 0x64],
         ServiceAction::Stop => vec![0x00],
+        ServiceAction::SetTargetClosedPercent(percent) => vec![percent],
+        ServiceAction::SetMotorSpeedPercent(percent) => vec![0x01, 0x01, percent],
+        ServiceAction::CalibrationStart => vec![0x76],
+        ServiceAction::CalibrationStop => vec![0x36],
+        ServiceAction::CalibrationNudgeOpen => vec![0x68],
+        ServiceAction::CalibrationNudgeClosed => vec![0x86],
+        ServiceAction::CalibrationSetOpenLimit => vec![0x69],
+        ServiceAction::CalibrationSetClosedLimit => vec![0x96],
+    }
+}
+
+pub fn service_action_target(action: ServiceAction) -> (&'static str, &'static str) {
+    match action {
+        ServiceAction::Open | ServiceAction::Close => {
+            (OPEN_CLOSE_SERVICE_UUID, OPEN_CLOSE_CHARACTERISTIC_UUID)
+        }
+        ServiceAction::Stop => (STOP_SERVICE_UUID, STOP_CHARACTERISTIC_UUID),
+        ServiceAction::SetTargetClosedPercent(_) => {
+            (MOTOR_SERVICE_UUID, POSITION_TARGET_CHARACTERISTIC_UUID)
+        }
+        ServiceAction::SetMotorSpeedPercent(_) => {
+            (SHADE_CONFIG_SERVICE_UUID, SHADE_CONFIG_CHARACTERISTIC_UUID)
+        }
+        ServiceAction::CalibrationStart
+        | ServiceAction::CalibrationStop
+        | ServiceAction::CalibrationSetOpenLimit
+        | ServiceAction::CalibrationSetClosedLimit => {
+            (MOTOR_SERVICE_UUID, CALIBRATION_CHARACTERISTIC_UUID)
+        }
+        ServiceAction::CalibrationNudgeOpen | ServiceAction::CalibrationNudgeClosed => {
+            (MOTOR_SERVICE_UUID, MOTOR_CONTROL_CHARACTERISTIC_UUID)
+        }
     }
 }
 

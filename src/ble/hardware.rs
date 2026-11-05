@@ -19,10 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
-use crate::controller::{
-    OPEN_CLOSE_CHARACTERISTIC_UUID, OPEN_CLOSE_SERVICE_UUID, STOP_CHARACTERISTIC_UUID,
-    STOP_SERVICE_UUID, ServiceAction, encode_service_action,
-};
+use crate::controller::{ServiceAction, encode_service_action, service_action_target};
 
 use super::{BA71_CHARACTERISTIC_UUID, SOMA_MANUFACTURER_ID, parse_soma_payload};
 
@@ -847,12 +844,7 @@ impl BleAdapter for BtleplugAdapter {
             )
             .await?;
         let mut disconnect_guard = DisconnectGuard::new(&peripheral);
-        let (service_uuid, characteristic_uuid) = match action {
-            ServiceAction::Open | ServiceAction::Close => {
-                (OPEN_CLOSE_SERVICE_UUID, OPEN_CLOSE_CHARACTERISTIC_UUID)
-            }
-            ServiceAction::Stop => (STOP_SERVICE_UUID, STOP_CHARACTERISTIC_UUID),
-        };
+        let (service_uuid, characteristic_uuid) = service_action_target(action);
         let service_uuid = Uuid::parse_str(service_uuid)
             .map_err(|_| BleFailure::before_write(BleFailureStage::GattDiscovery, false))?;
         let characteristic_uuid = Uuid::parse_str(characteristic_uuid)

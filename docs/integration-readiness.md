@@ -20,15 +20,23 @@ file to preserve enrollment mappings.
 ## Capabilities and positions
 
 Managed device responses include explicit `capabilities`. Current physical
-Wazombi support is open, close, stop, and position feedback. Arbitrary
-percentage positioning is unsupported even though controller encoding helpers
-exist in the source. Simulators expose the same command contract.
+Wazombi support is open, close, stop, percentage positioning, motor-speed
+settings, supervised endpoint calibration, and position feedback. A target is a
+closed-percent integer from 0 (fully open) to 100 (fully closed). Motor speed
+accepts 0% to 100%; SOMA firmware 2.2.0 or later is required, and Somaris
+does not yet read the existing motor-speed setting.
+Calibration uses fixed Motor Calibration and Motor Control writes. It must be
+performed while watching the blind; the API requires an acknowledged start,
+uses short nudges, requires explicit limit marking, and blocks normal movement
+until an acknowledged stop. Calibration status is persisted so a restart does
+not silently unlock normal movement. Simulators expose the same command
+contract.
 
 Positions use percent closed: 0 is fully open and 100 is fully closed. The
 existing `position.current_closed_percent` and
 `position.target_closed_percent` are motor-reported observation values.
-`requested_position_closed_percent` is the most recent retained open/close
-command intent and is reported separately. `position_observed_at`, source,
+`requested_position_closed_percent` is the most recent retained movement
+command intent, including percentage targets, and is reported separately. `position_observed_at`, source,
 confidence, status, and freshness clarify whether telemetry is present and
 current. Stale observations remain explicitly stale; missing observations are
 omitted rather than represented as zero.

@@ -5,7 +5,9 @@ import {
   movementStatusFromPositions,
   renderBlindActions,
   renderBlindCard,
+  renderCalibrationControls,
   renderBlindStatus,
+  renderMotorSpeedControl,
   renderBadge,
   renderDeviceCardHeader,
   renderButton,
@@ -67,6 +69,48 @@ test('movement cooldown disables Open and Close while leaving Stop available', (
   assert.match(controls, /data-action="command:close:blind-1"[^>]*disabled/);
   assert.match(controls, /data-action="command:stop:blind-1"[^>]*>/);
   assert.doesNotMatch(controls, /data-action="command:stop:blind-1"[^>]*disabled/);
+});
+
+test('percentage-position control reflects the observed target and has an accessible label', () => {
+  const controls = renderBlindActions({
+    deviceId:'blind-1', blindLabel:'Hallway', supportsPosition:true,
+    positionClosedPercent:47,
+  });
+  assert.match(controls, /type="range" min="0" max="100" step="1" value="47"/);
+  assert.match(controls, /aria-label="Target position for Hallway in percent closed"/);
+  assert.match(controls, /data-position-output="blind-1">47%/);
+  assert.match(controls, /data-action="position:blind-1"/);
+
+  const disabled = renderBlindActions({
+    deviceId:'blind-1', blindLabel:'Hallway', supportsPosition:true,
+    positionClosedPercent:47, movementDisabled:true,
+  });
+  assert.match(disabled, /data-position-input="blind-1"[^>]*disabled/);
+  assert.match(disabled, /data-action="position:blind-1"[^>]*disabled/);
+});
+
+test('motor speed control uses a typed percentage and disables during calibration', () => {
+  const html = renderMotorSpeedControl({deviceId:'managed-1', calibrationActive:true});
+  assert.match(html, /data-motor-speed="managed-1"/);
+  assert.match(html, /min="0" max="100"/);
+  assert.match(html, /current setting is not read/);
+  assert.match(html, /<input[^>]* disabled/);
+  assert.match(html, /<button[^>]* disabled/);
+});
+
+test('endpoint calibration controls expose only Start until an explicit calibration start', () => {
+  const start = renderCalibrationControls({deviceId:'managed-1'});
+  assert.match(start, /command:calibration_start:managed-1/);
+  assert.doesNotMatch(start, /calibration_nudge_open/);
+
+  const active = renderCalibrationControls({deviceId:'managed-1', active:true});
+  for (const action of [
+    'calibration_nudge_open', 'calibration_set_open_limit',
+    'calibration_nudge_closed', 'calibration_set_closed_limit',
+    'stop', 'calibration_stop',
+  ]) {
+    assert.match(active, new RegExp(`command:${action}:managed-1`));
+  }
 });
 
 test('shared button primitive escapes user text and supports icon-only accessible labels', () => {
