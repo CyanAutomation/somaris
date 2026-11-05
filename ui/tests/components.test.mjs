@@ -16,6 +16,8 @@ import {
   renderDestructiveButton,
   renderConfirmationPanel,
   renderDeviceList,
+  renderBatchControls,
+  renderBatchFeedback,
   renderTopbarActions,
   renderHomeSupportingSections,
   renderInfoGrid,
@@ -87,6 +89,23 @@ test('percentage-position control reflects the observed target and has an access
   });
   assert.match(disabled, /data-position-input="blind-1"[^>]*disabled/);
   assert.match(disabled, /data-action="position:blind-1"[^>]*disabled/);
+});
+
+test('panel blind controls omit percentage positioning while other views retain it', () => {
+  const panel = renderBlindActions({
+    deviceId:'blind-1', blindLabel:'Hallway', panelMode:true,
+    supportsPosition:true, positionClosedPercent:47,
+  });
+  assert.doesNotMatch(panel, /position-control|position-input|position-submit|Move to position/);
+  assert.match(panel, /data-action="command:open:blind-1"/);
+  assert.match(panel, /data-action="command:stop:blind-1"/);
+  assert.match(panel, /data-action="command:close:blind-1"/);
+
+  const regular = renderBlindActions({
+    deviceId:'blind-1', blindLabel:'Hallway', supportsPosition:true,
+    positionClosedPercent:47,
+  });
+  assert.match(regular, /data-action="position:blind-1"/);
 });
 
 test('motor speed control uses a typed percentage and disables during calibration', () => {
@@ -221,6 +240,56 @@ test('panel device list omits its heading because panel count and add action liv
 
   const regular = renderDeviceList({count:1, panelMode:false, addButton:'', cardsMarkup:'<article>Blind</article>', emptyMarkup:''});
   assert.match(regular, /<h2>Your blinds<\/h2>/);
+});
+
+test('all-blinds batch controls are reusable, accessible, and disabled while unavailable or busy', () => {
+  const controls = renderBatchControls({blindCount:3, eligibleCount:2});
+  assert.match(controls, /aria-label="All blinds controls"/);
+  assert.match(controls, /data-action="batch:open"/);
+  assert.match(controls, /aria-label="Open all blinds"/);
+  assert.match(controls, /data-action="batch:close"/);
+  assert.match(controls, /aria-label="Close all blinds"/);
+  assert.match(controls, /2 available blinds in sequence/);
+
+  const unavailable = renderBatchControls({blindCount:3, eligibleCount:0});
+  assert.match(unavailable, /data-action="batch:open"[^>]*disabled/);
+  assert.match(unavailable, /data-action="batch:close"[^>]*disabled/);
+  const busy = renderBatchControls({blindCount:3, eligibleCount:2, busy:true, panelMode:true});
+  assert.match(busy, /all-blinds-controls--panel/);
+  assert.match(busy, /data-action="batch:open"[^>]*disabled/);
+  assert.match(renderBatchControls({blindCount:1, eligibleCount:1}), /the available blind/);
+
+  const panelList = renderDeviceList({count:3, panelMode:true, toolbarMarkup:controls, cardsMarkup:'<article>Blind</article>'});
+  const regularList = renderDeviceList({count:3, panelMode:false, toolbarMarkup:controls, cardsMarkup:'<article>Blind</article>'});
+  for (const list of [panelList, regularList]) {
+    assert.ok(list.indexOf('data-action="batch:open"') < list.indexOf('<article>Blind</article>'));
+    assert.match(list, /data-action="batch:close"/);
+  }
+});
+
+test('batch feedback distinguishes progress, acknowledgements, failures, and skipped blinds', () => {
+  const running = renderBatchFeedback({
+    action:'open', status:'running', target_count:3, acknowledged_count:1,
+    pending_count:2, failed_count:0, skipped_count:1,
+    skipped:[{label:'Back room', availability:'stale'}], targets:[],
+  });
+  assert.match(running, /Opening blinds/);
+  assert.match(running, /1 of 3/);
+  assert.match(running, /Back room/);
+  assert.match(running, /stale/i);
+
+  const partial = renderBatchFeedback({
+    action:'close', status:'partial', target_count:3, acknowledged_count:2,
+    pending_count:0, failed_count:1, skipped_count:0, skipped:[],
+    targets:[{label:'Kitchen',status:'connection_failed'}],
+  });
+  assert.match(partial, /Close commands acknowledged for 2 of 3/);
+  assert.match(partial, /does not confirm movement/i);
+  assert.match(partial, /Kitchen/);
+
+  const unknown = renderBatchFeedback({action:'open',status:'outcome_unknown',error:'Network unavailable'});
+  assert.match(unknown, /Retry original request/);
+  assert.match(unknown, /Network unavailable/);
 });
 
 test('topbar composes the plus-only add action beside display and refresh controls', () => {
