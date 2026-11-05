@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use btleplug::{
@@ -9,7 +15,7 @@ use btleplug::{
     platform::{Adapter, Manager, Peripheral},
 };
 use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
 use crate::controller::{
@@ -39,6 +45,8 @@ pub enum BleFailureStage {
     GattDiscovery,
     IdentityVerification,
     GattWrite,
+    CommandDeadline,
+    CommandPreempted,
     BatteryDiscovery,
     BatteryRead,
 }
@@ -52,6 +60,8 @@ impl BleFailureStage {
             Self::GattDiscovery => "gatt_discovery",
             Self::IdentityVerification => "identity_verification",
             Self::GattWrite => "gatt_write",
+            Self::CommandDeadline => "command_deadline",
+            Self::CommandPreempted => "command_preempted",
             Self::BatteryDiscovery => "battery_discovery",
             Self::BatteryRead => "battery_read",
         }
@@ -84,6 +94,132 @@ impl BleFailure {
             outcome_unknown,
         }
     }
+
+    pub(crate) fn command_deadline(write_may_have_been_sent: bool) -> Self {
+        Self {
+            stage: if write_may_have_been_sent {
+                BleFailureStage::GattWrite
+            } else {
+                BleFailureStage::CommandDeadline
+            },
+            retryable_before_write: !write_may_have_been_sent,
+            write_may_have_been_sent,
+            outcome_unknown: write_may_have_been_sent,
+        }
+    }
+
+    pub(crate) fn command_preempted() -> Self {
+        Self {
+            stage: BleFailureStage::CommandPreempted,
+            retryable_before_write: false,
+            write_may_have_been_sent: false,
+            outcome_unknown: false,
+        }
+    }
+}
+
+const CONTROL_PRE_WRITE: u8 = 0;
+const CONTROL_STOP_CANCELLED: u8 = 1;
+const CONTROL_WRITE_STARTED: u8 = 2;
+const CONTROL_DEADLINE_BEFORE_WRITE: u8 = 3;
+const CONTROL_DEADLINE_AFTER_WRITE: u8 = 4;
+
+/// Coordinates safe Stop preemption with the transition into a possibly-sent GATT write.
+/// Exactly one of `request_prewrite_cancel` and `begin_write` can win.
+#[derive(Clone, Default)]
+pub struct BleCommandControl {
+    state: Arc<AtomicU8>,
+    cancelled: Arc<Notify>,
+}
+
+impl BleCommandControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn request_prewrite_cancel(&self) -> bool {
+        let cancelled = self
+            .state
+            .compare_exchange(
+                CONTROL_PRE_WRITE,
+                CONTROL_STOP_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if cancelled {
+            self.cancelled.notify_waiters();
+        }
+        cancelled
+    }
+
+    pub fn begin_write(&self) -> bool {
+        self.state
+            .compare_exchange(
+                CONTROL_PRE_WRITE,
+                CONTROL_WRITE_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn write_started(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            CONTROL_WRITE_STARTED | CONTROL_DEADLINE_AFTER_WRITE
+        )
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            CONTROL_STOP_CANCELLED | CONTROL_DEADLINE_BEFORE_WRITE | CONTROL_DEADLINE_AFTER_WRITE
+        )
+    }
+
+    pub fn request_deadline_cancel(&self) {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let next = match current {
+                CONTROL_PRE_WRITE => CONTROL_DEADLINE_BEFORE_WRITE,
+                CONTROL_WRITE_STARTED => CONTROL_DEADLINE_AFTER_WRITE,
+                _ => return,
+            };
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.cancelled.notify_waiters();
+                    return;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub fn cancellation_failure(&self) -> BleFailure {
+        match self.state.load(Ordering::Acquire) {
+            CONTROL_DEADLINE_BEFORE_WRITE => BleFailure::command_deadline(false),
+            CONTROL_DEADLINE_AFTER_WRITE => BleFailure::command_deadline(true),
+            _ => BleFailure::command_preempted(),
+        }
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.cancelled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[async_trait]
@@ -94,11 +230,14 @@ pub trait BleAdapter: Send + Sync {
         window: Duration,
     ) -> Result<(), BleFailure>;
 
+    /// Executes one physical action and must observe cancellation until `begin_write` wins.
+    /// After cancellation it must finish best-effort disconnect cleanup before returning.
     async fn write_action(
         &self,
         peripheral_id: &str,
         expected_name: &str,
         action: ServiceAction,
+        control: &BleCommandControl,
     ) -> Result<(), BleFailure>;
 
     async fn read_battery(
@@ -111,6 +250,48 @@ pub trait BleAdapter: Send + Sync {
 #[derive(Clone)]
 pub struct BtleplugAdapter {
     adapter: Adapter,
+}
+
+struct DisconnectGuard(Option<Peripheral>);
+
+impl DisconnectGuard {
+    fn new(peripheral: &Peripheral) -> Self {
+        Self(Some(peripheral.clone()))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+
+    async fn disconnect(&mut self) {
+        if let Some(peripheral) = self.0.take() {
+            BtleplugAdapter::disconnect(&peripheral).await;
+        }
+    }
+
+    async fn abort_connection(&mut self) {
+        if let Some(peripheral) = self.0.take() {
+            BtleplugAdapter::disconnect_after_interruption(&peripheral).await;
+        }
+    }
+}
+
+impl Drop for DisconnectGuard {
+    fn drop(&mut self) {
+        let Some(peripheral) = self.0.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                BtleplugAdapter::disconnect(&peripheral).await;
+            });
+        } else {
+            tracing::warn!(
+                operation = "disconnect",
+                "BLE disconnect cleanup could not be scheduled without a Tokio runtime"
+            );
+        }
+    }
 }
 
 impl BtleplugAdapter {
@@ -296,6 +477,96 @@ impl BtleplugAdapter {
         Ok(peripheral)
     }
 
+    async fn connect_and_discover_cancellable(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        control: &BleCommandControl,
+    ) -> Result<Peripheral, BleFailure> {
+        let peripheral = tokio::select! {
+            biased;
+            _ = control.cancelled() => return Err(control.cancellation_failure()),
+            result = self.peripheral_at(peripheral_id) => result?,
+        };
+        let mut disconnect_guard = DisconnectGuard::new(&peripheral);
+        let connection = tokio::select! {
+            biased;
+            _ = control.cancelled() => {
+                disconnect_guard.abort_connection().await;
+                return Err(control.cancellation_failure());
+            }
+            result = tokio::time::timeout(Duration::from_secs(30), peripheral.connect()) => result,
+        };
+        match connection {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(operation = "connect", %error, "BLE operation failed before write");
+                disconnect_guard.abort_connection().await;
+                return Err(BleFailure::before_write(
+                    BleFailureStage::DeviceConnection,
+                    true,
+                ));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    operation = "connect",
+                    timeout_seconds = 30,
+                    "BLE operation timed out before write"
+                );
+                disconnect_guard.abort_connection().await;
+                return Err(BleFailure::before_write(
+                    BleFailureStage::DeviceConnection,
+                    true,
+                ));
+            }
+        }
+        let discovery = tokio::select! {
+            biased;
+            _ = control.cancelled() => {
+                disconnect_guard.disconnect().await;
+                return Err(control.cancellation_failure());
+            }
+            result = tokio::time::timeout(Duration::from_secs(15), peripheral.discover_services()) => result,
+        };
+        match discovery {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(operation = "discover_services", %error, "BLE service discovery failed before write");
+                disconnect_guard.disconnect().await;
+                return Err(BleFailure::before_write(
+                    BleFailureStage::ServiceResolution,
+                    true,
+                ));
+            }
+            Err(_) => {
+                tracing::warn!(
+                    operation = "discover_services",
+                    timeout_seconds = 15,
+                    "BLE service discovery timed out before write"
+                );
+                disconnect_guard.disconnect().await;
+                return Err(BleFailure::before_write(
+                    BleFailureStage::ServiceResolution,
+                    true,
+                ));
+            }
+        }
+        let identity = tokio::select! {
+            biased;
+            _ = control.cancelled() => {
+                disconnect_guard.disconnect().await;
+                return Err(control.cancellation_failure());
+            }
+            result = Self::verify_identity(&peripheral, expected_name) => result,
+        };
+        if let Err(error) = identity {
+            disconnect_guard.disconnect().await;
+            return Err(error);
+        }
+        disconnect_guard.disarm();
+        Ok(peripheral)
+    }
+
     async fn disconnect(peripheral: &Peripheral) {
         match tokio::time::timeout(Duration::from_secs(3), peripheral.is_connected()).await {
             Ok(Ok(false)) => return,
@@ -323,6 +594,22 @@ impl BtleplugAdapter {
                 timeout_seconds = 5,
                 "BLE disconnect timed out"
             ),
+        }
+    }
+
+    async fn disconnect_after_interruption(peripheral: &Peripheral) {
+        match tokio::time::timeout(Duration::from_secs(5), peripheral.disconnect()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(operation = "disconnect", %error, "BLE connection cleanup after interruption failed");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    operation = "disconnect",
+                    timeout_seconds = 5,
+                    "BLE connection cleanup after interruption timed out"
+                );
+            }
         }
     }
 
@@ -446,10 +733,12 @@ impl BleAdapter for BtleplugAdapter {
         peripheral_id: &str,
         expected_name: &str,
         action: ServiceAction,
+        control: &BleCommandControl,
     ) -> Result<(), BleFailure> {
         let peripheral = self
-            .connect_and_discover(peripheral_id, expected_name)
+            .connect_and_discover_cancellable(peripheral_id, expected_name, control)
             .await?;
+        let mut disconnect_guard = DisconnectGuard::new(&peripheral);
         let (service_uuid, characteristic_uuid) = match action {
             ServiceAction::Open | ServiceAction::Close => {
                 (OPEN_CLOSE_SERVICE_UUID, OPEN_CLOSE_CHARACTERISTIC_UUID)
@@ -474,22 +763,33 @@ impl BleAdapter for BtleplugAdapter {
                 ?characteristics,
                 "No writable SOMA command characteristic was found after service discovery"
             );
-            Self::disconnect(&peripheral).await;
+            disconnect_guard.disconnect().await;
             return Err(BleFailure::before_write(
                 BleFailureStage::GattDiscovery,
                 false,
             ));
         };
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            peripheral.write(
-                characteristic,
-                &encode_service_action(action),
-                WriteType::WithResponse,
-            ),
-        )
-        .await;
-        Self::disconnect(&peripheral).await;
+        if !control.begin_write() {
+            disconnect_guard.disconnect().await;
+            return Err(control.cancellation_failure());
+        }
+        let payload = encode_service_action(action);
+        let result = tokio::select! {
+            biased;
+            _ = control.cancelled() => {
+                disconnect_guard.disconnect().await;
+                return Err(control.cancellation_failure());
+            }
+            result = tokio::time::timeout(
+                Duration::from_secs(10),
+                peripheral.write(
+                    characteristic,
+                    &payload,
+                    WriteType::WithResponse,
+                ),
+            ) => result,
+        };
+        disconnect_guard.disconnect().await;
         match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {

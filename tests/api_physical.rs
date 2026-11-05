@@ -17,7 +17,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use somaris::{
     api::{AppState, QueueConfig, router},
-    ble::{BleAdapter, BleFailure, BleFailureStage, BleObservation},
+    ble::{BleAdapter, BleCommandControl, BleFailure, BleFailureStage, BleObservation},
     controller::ServiceAction,
 };
 use tokio::sync::{Notify, mpsc};
@@ -33,6 +33,44 @@ struct FakeBleAdapter {
     completed_scans: AtomicUsize,
     scans_at_write: Mutex<Vec<usize>>,
     scan_finished: Notify,
+    writes: Mutex<Vec<ServiceAction>>,
+    gate: Mutex<Option<Arc<ActionGate>>>,
+}
+
+struct ActionGate {
+    action: ServiceAction,
+    after_write: bool,
+    ignore_cancellation: bool,
+    paused: AtomicBool,
+    entered: Notify,
+    cancel_seen: Notify,
+    release: Notify,
+}
+
+impl ActionGate {
+    fn new(action: ServiceAction, after_write: bool) -> Arc<Self> {
+        Arc::new(Self {
+            action,
+            after_write,
+            ignore_cancellation: false,
+            paused: AtomicBool::new(true),
+            entered: Notify::new(),
+            cancel_seen: Notify::new(),
+            release: Notify::new(),
+        })
+    }
+
+    fn unresponsive_after_write(action: ServiceAction) -> Arc<Self> {
+        Arc::new(Self {
+            action,
+            after_write: true,
+            ignore_cancellation: true,
+            paused: AtomicBool::new(true),
+            entered: Notify::new(),
+            cancel_seen: Notify::new(),
+            release: Notify::new(),
+        })
+    }
 }
 
 impl FakeBleAdapter {
@@ -56,7 +94,15 @@ impl FakeBleAdapter {
             completed_scans: AtomicUsize::default(),
             scans_at_write: Mutex::default(),
             scan_finished: Notify::default(),
+            writes: Mutex::default(),
+            gate: Mutex::default(),
         }
+    }
+
+    fn with_gate(observations: Vec<BleObservation>, gate: Arc<ActionGate>) -> Self {
+        let adapter = Self::with_observations(observations);
+        *adapter.gate.lock().unwrap() = Some(gate);
+        adapter
     }
 
     fn actions(&self) -> Vec<(String, String, ServiceAction)> {
@@ -69,6 +115,10 @@ impl FakeBleAdapter {
 
     fn scans_at_write(&self) -> Vec<usize> {
         self.scans_at_write.lock().unwrap().clone()
+    }
+
+    fn writes(&self) -> Vec<ServiceAction> {
+        self.writes.lock().unwrap().clone()
     }
 }
 
@@ -98,6 +148,7 @@ impl BleAdapter for FakeBleAdapter {
         peripheral_id: &str,
         expected_name: &str,
         action: ServiceAction,
+        control: &BleCommandControl,
     ) -> Result<(), BleFailure> {
         if self.scan_active.load(Ordering::SeqCst) {
             self.gatt_overlapped_scan.store(true, Ordering::SeqCst);
@@ -111,11 +162,61 @@ impl BleAdapter for FakeBleAdapter {
             expected_name.to_owned(),
             action,
         ));
-        self.action_results
+        let result = self
+            .action_results
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or(Ok(()))
+            .unwrap_or(Ok(()));
+        let gate = self.gate.lock().unwrap().clone();
+        let should_pause = gate
+            .as_ref()
+            .is_some_and(|gate| gate.action == action && gate.paused.swap(false, Ordering::SeqCst));
+        if should_pause && !gate.as_ref().unwrap().after_write {
+            let gate = gate.as_ref().unwrap();
+            gate.entered.notify_one();
+            tokio::select! {
+                biased;
+                _ = control.cancelled() => return Err(control.cancellation_failure()),
+                _ = gate.release.notified() => {}
+            }
+        }
+        if result
+            .as_ref()
+            .is_err_and(|failure| !failure.write_may_have_been_sent)
+        {
+            return result;
+        }
+        if !control.begin_write() {
+            return Err(BleFailure {
+                stage: BleFailureStage::CommandPreempted,
+                retryable_before_write: false,
+                write_may_have_been_sent: false,
+                outcome_unknown: false,
+            });
+        }
+        self.writes.lock().unwrap().push(action);
+        if should_pause && gate.as_ref().unwrap().after_write {
+            let gate = gate.as_ref().unwrap();
+            gate.entered.notify_one();
+            if gate.ignore_cancellation {
+                tokio::select! {
+                    biased;
+                    _ = control.cancelled() => {
+                        gate.cancel_seen.notify_one();
+                        gate.release.notified().await;
+                    }
+                    _ = gate.release.notified() => {}
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = control.cancelled() => return Err(control.cancellation_failure()),
+                    _ = gate.release.notified() => {}
+                }
+            }
+        }
+        result
     }
 
     async fn read_battery(
@@ -189,6 +290,10 @@ async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
         .as_str()
         .unwrap()
         .to_owned();
+    let (_, managed) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let managed = managed.unwrap()["data"][0].clone();
+    assert_eq!(managed["availability"], "ready");
+    assert_eq!(managed["gatt_readiness"]["status"], "untested");
 
     for (key, action, expected) in [
         ("physical-open", "open", ServiceAction::Open),
@@ -210,6 +315,8 @@ async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
         assert_eq!(command["write_state"], "acknowledged");
         assert_eq!(command["retryable"], false);
         assert_eq!(command["attempt"], 1);
+        assert_eq!(command["attempts"].as_array().unwrap().len(), 1);
+        assert_eq!(command["attempts"][0]["phase"], "gatt_write_acknowledged");
         assert_eq!(adapter.actions().last().unwrap().2, expected);
     }
 
@@ -226,6 +333,11 @@ async fn scanned_blind_can_be_enrolled_and_only_fixed_actions_are_written() {
         100
     );
     assert_eq!(adapter.actions().len(), 3);
+    let (_, managed) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let gatt = &managed.unwrap()["data"][0]["gatt_readiness"];
+    assert_eq!(gatt["status"], "write_acknowledged");
+    assert_eq!(gatt["attempt_count"], 1);
+    assert!(gatt["last_write_acknowledged_at"].is_string());
 }
 
 #[tokio::test]
@@ -249,6 +361,262 @@ async fn transient_service_discovery_failure_retries_only_before_a_write() {
     assert_eq!(command["attempt"], 2);
     assert_eq!(command["retryable"], false);
     assert_eq!(adapter.actions().len(), 2);
+    assert_eq!(command["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(command["attempts"][0]["phase"], "service_resolution");
+    assert_eq!(
+        command["attempts"][0]["error_code"],
+        "service_resolution_failed"
+    );
+    assert_eq!(command["attempts"][0]["write_state"], "not_sent");
+    assert_eq!(command["attempts"][1]["phase"], "gatt_write_acknowledged");
+    assert!(command["attempts"][0]["duration_ms"].is_number());
+    assert!(command["attempts"][1]["duration_ms"].is_number());
+}
+
+#[tokio::test]
+async fn gatt_readiness_keeps_last_ack_after_a_later_connection_failure() {
+    let unavailable = BleFailure {
+        stage: BleFailureStage::DeviceConnection,
+        retryable_before_write: false,
+        write_may_have_been_sent: false,
+        outcome_unknown: false,
+    };
+    let adapter = Arc::new(FakeBleAdapter::with_results(
+        vec![closed_blind()],
+        [Ok(()), Err(unavailable)],
+    ));
+    let app = app_with_adapter(adapter).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    assert_eq!(
+        submit(&app, &managed_id, "first-ack", "close").await["status"],
+        "write_acknowledged"
+    );
+    let failed = submit(&app, &managed_id, "later-connect-failure", "open").await;
+    assert_eq!(failed["status"], "connection_failed");
+
+    let (_, response) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let gatt = &response.unwrap()["data"][0]["gatt_readiness"];
+    assert_eq!(gatt["status"], "connection_failed");
+    assert_eq!(gatt["failure_stage"], "device_connection");
+    assert_eq!(gatt["error_code"], "device_connection_failed");
+    assert_eq!(gatt["attempt_count"], 1);
+    assert!(gatt["last_write_acknowledged_at"].is_string());
+    let (ready_status, readiness) = request(&app, Method::GET, "/api/v1/ready", &[], None).await;
+    assert_eq!(ready_status, StatusCode::OK);
+    assert_eq!(readiness.unwrap()["data"]["status"], "healthy");
+}
+
+#[tokio::test]
+async fn stop_preempts_an_in_flight_movement_before_the_gatt_write() {
+    let gate = ActionGate::new(ServiceAction::Close, false);
+    let adapter = Arc::new(FakeBleAdapter::with_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "preemptible-close")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let close_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .expect("movement should reach the pre-write gate");
+
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "priority-stop")],
+        Some(json!({"action": "stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let stop_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    let close = wait_for_command(&app, &close_id).await;
+    let stop = wait_for_command(&app, &stop_id).await;
+
+    assert_eq!(close["status"], "cancelled");
+    assert_eq!(close["error_code"], "preempted_by_stop");
+    assert_eq!(close["write_state"], "not_sent");
+    assert_eq!(stop["status"], "write_acknowledged");
+    assert_eq!(adapter.writes(), [ServiceAction::Stop]);
+}
+
+#[tokio::test]
+async fn stop_waits_for_a_movement_once_its_gatt_write_has_started() {
+    let gate = ActionGate::new(ServiceAction::Close, true);
+    let adapter = Arc::new(FakeBleAdapter::with_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "started-close")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let close_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .expect("movement should reach the post-write gate");
+    let (_, in_flight) = request(
+        &app,
+        Method::GET,
+        &format!("/api/control/v1/commands/{close_id}"),
+        &[],
+        None,
+    )
+    .await;
+    let in_flight = in_flight.unwrap()["data"].clone();
+    assert_eq!(in_flight["write_state"], "possibly_sent");
+    assert_eq!(in_flight["attempts"][0]["write_state"], "possibly_sent");
+
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "serialized-stop")],
+        Some(json!({"action": "stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let stop_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(adapter.writes(), [ServiceAction::Close]);
+    gate.release.notify_one();
+
+    assert_eq!(
+        wait_for_command(&app, &close_id).await["status"],
+        "write_acknowledged"
+    );
+    assert_eq!(
+        wait_for_command(&app, &stop_id).await["status"],
+        "write_acknowledged"
+    );
+    assert_eq!(
+        adapter.writes(),
+        [ServiceAction::Close, ServiceAction::Stop]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn command_deadline_is_bounded_and_retryable_before_a_write() {
+    let gate = ActionGate::new(ServiceAction::Open, false);
+    let adapter = Arc::new(FakeBleAdapter::with_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "deadline-before-write")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .expect("command should reach the pre-write gate");
+    tokio::time::advance(Duration::from_secs(46)).await;
+
+    let command = wait_for_command(&app, &command_id).await;
+    assert_eq!(command["status"], "connection_failed");
+    assert_eq!(command["error_code"], "command_timeout");
+    assert_eq!(command["write_state"], "not_sent");
+    assert_eq!(command["retryable"], true);
+    assert_eq!(command["attempt"], 1);
+    assert_eq!(command["attempts"][0]["phase"], "command_deadline");
+    assert!(adapter.writes().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn command_deadline_after_write_start_is_reported_as_uncertain() {
+    let gate = ActionGate::new(ServiceAction::Open, true);
+    let adapter = Arc::new(FakeBleAdapter::with_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "deadline-after-write")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .expect("command should reach the post-write gate");
+    tokio::time::advance(Duration::from_secs(46)).await;
+
+    let command = wait_for_command(&app, &command_id).await;
+    assert_eq!(command["status"], "outcome_unknown");
+    assert_eq!(command["error_code"], "outcome_unknown");
+    assert_eq!(command["write_state"], "possibly_sent");
+    assert_eq!(command["retryable"], false);
+    assert_eq!(command["attempts"][0]["write_state"], "possibly_sent");
+    assert_eq!(adapter.writes(), [ServiceAction::Open]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn command_deadline_bounds_wait_for_an_unresponsive_adapter_cleanup() {
+    let gate = ActionGate::unresponsive_after_write(ServiceAction::Open);
+    let adapter = Arc::new(FakeBleAdapter::with_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "unresponsive-cleanup")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .expect("command should reach the post-write gate");
+
+    tokio::time::advance(Duration::from_secs(46)).await;
+    tokio::time::timeout(Duration::from_secs(2), gate.cancel_seen.notified())
+        .await
+        .expect("adapter should observe deadline cancellation but remain stuck");
+    tokio::time::advance(Duration::from_secs(11)).await;
+
+    let command = wait_for_command(&app, &command_id).await;
+    assert_eq!(command["status"], "outcome_unknown");
+    assert_eq!(command["write_state"], "possibly_sent");
+    assert_eq!(command["retryable"], false);
+    assert_eq!(adapter.writes(), [ServiceAction::Open]);
 }
 
 #[tokio::test]

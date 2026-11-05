@@ -7,7 +7,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration as StdDuration, Instant},
 };
 
 #[cfg(unix)]
@@ -15,8 +15,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{
     ble::{
-        BleAdapter, BleFailure, BleFailureStage, BleObservation, BtleplugAdapter,
-        SOMA_MANUFACTURER_ID, decode_ba71_voltage, parse_soma_payload,
+        BleAdapter, BleCommandControl, BleFailure, BleFailureStage, BleObservation,
+        BtleplugAdapter, SOMA_MANUFACTURER_ID, decode_ba71_voltage, parse_soma_payload,
     },
     controller::ServiceAction,
 };
@@ -127,6 +127,8 @@ const MAX_BATCHES: usize = 1000;
 const MAX_DISCOVERED_DEVICES: usize = 1024;
 const MAX_AUDIT_ENTRIES: usize = 30;
 const SCAN_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+const COMMAND_EXECUTION_TIMEOUT: StdDuration = StdDuration::from_secs(45);
+const COMMAND_CLEANUP_GRACE: StdDuration = StdDuration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueConfig {
@@ -258,6 +260,7 @@ fn invalid_configuration(message: String) -> io::Error {
 pub struct AppState {
     inner: Arc<Mutex<Inner>>,
     device_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    command_controls: Arc<Mutex<HashMap<String, BleCommandControl>>>,
     adapter_slots: Arc<Semaphore>,
     ble_adapter: Arc<RwLock<Option<Arc<dyn BleAdapter>>>>,
     ble_enabled: bool,
@@ -472,6 +475,7 @@ impl AppState {
         Self {
             inner: Arc::new(Mutex::new(inner)),
             device_locks: Arc::new(Mutex::new(HashMap::new())),
+            command_controls: Arc::new(Mutex::new(HashMap::new())),
             adapter_slots: Arc::new(Semaphore::new(queue_config.adapter_concurrency)),
             ble_adapter: Arc::new(RwLock::new(None)),
             ble_enabled: false,
@@ -513,6 +517,23 @@ impl AppState {
                 command.error_code = Some("outcome_unknown".into());
                 command.failure_stage = Some("service_recovery".into());
                 command.completed_at = Some(now);
+                if let Some(attempt) = command
+                    .attempts
+                    .iter_mut()
+                    .rev()
+                    .find(|attempt| attempt.completed_at.is_none())
+                {
+                    attempt.phase = "service_recovery".into();
+                    attempt.completed_at = Some(now);
+                    attempt.duration_ms = Some(
+                        now.signed_duration_since(attempt.started_at)
+                            .num_milliseconds()
+                            .max(0) as u64,
+                    );
+                    attempt.write_state = WriteState::PossiblySent;
+                    attempt.failure_stage = Some("service_recovery".into());
+                    attempt.error_code = Some("outcome_unknown".into());
+                }
             }
         }
         let completed_commands: Vec<_> = persisted
@@ -671,6 +692,10 @@ impl AppState {
                 .collect()
         };
         for id in queued {
+            self.command_controls
+                .lock()
+                .await
+                .insert(id.clone(), BleCommandControl::new());
             tokio::spawn(process_command(self.clone(), id));
         }
     }
@@ -2218,9 +2243,28 @@ struct ManagedDevice {
     enrollment: Enrollment,
     availability: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    gatt_readiness: Option<GattReadiness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     last_seen_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     position: Option<ControlPosition>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GattReadiness {
+    /// The most recent command outcome; historical evidence, not a live connection probe.
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_command_accepted_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_attempt_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_write_acknowledged_at: Option<DateTime<Utc>>,
+    attempt_count: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2300,6 +2344,8 @@ struct Command {
     completed_at: Option<DateTime<Utc>>,
     expires_at: DateTime<Utc>,
     attempt: u8,
+    #[serde(default)]
+    attempts: Vec<CommandAttempt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2308,6 +2354,22 @@ struct Command {
     retryable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CommandAttempt {
+    number: u8,
+    phase: String,
+    started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    write_state: WriteState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2367,6 +2429,7 @@ struct QueueDiagnostics {
     max_queued_per_device: u64,
     adapter_concurrency: u64,
     adapter_scan_window_ms: u64,
+    command_execution_timeout_seconds: u64,
 }
 
 fn envelope<T>(data: T, count: Option<u64>) -> Envelope<T> {
@@ -3071,6 +3134,8 @@ fn ble_failure_code(failure: &BleFailure) -> &'static str {
                 "gatt_write_error"
             }
         }
+        BleFailureStage::CommandDeadline => "command_timeout",
+        BleFailureStage::CommandPreempted => "preempted_by_stop",
         BleFailureStage::BatteryDiscovery => "ba71_unsupported",
         BleFailureStage::BatteryRead => "battery_read_failed",
     }
@@ -3295,6 +3360,9 @@ async fn queue_command(
             if is_new {
                 tokio::spawn(process_command(state.clone(), command.id.clone()));
             }
+            let command = command_snapshot(&state, &command.id)
+                .await
+                .unwrap_or(command);
             (StatusCode::ACCEPTED, Json(envelope(command, None))).into_response()
         }
         Err(error) => error.into_response(),
@@ -3314,13 +3382,21 @@ async fn toggle_device(
         );
     };
     let idempotency_id = format!("command:{id}:{key}");
-    {
+    let existing = {
         let inner = state.inner.lock().await;
         if let Some(command_id) = inner.command_idempotency.get(&idempotency_id)
             && let Some(command) = inner.commands.get(command_id)
         {
-            return (StatusCode::ACCEPTED, Json(envelope(command.clone(), None))).into_response();
+            Some(command.clone())
+        } else {
+            None
         }
+    };
+    if let Some(command) = existing {
+        let command = command_snapshot(&state, &command.id)
+            .await
+            .unwrap_or(command);
+        return (StatusCode::ACCEPTED, Json(envelope(command, None))).into_response();
     }
     let selected = {
         let inner = state.inner.lock().await;
@@ -3343,6 +3419,9 @@ async fn toggle_device(
             if is_new {
                 tokio::spawn(process_command(state.clone(), command.id.clone()));
             }
+            let command = command_snapshot(&state, &command.id)
+                .await
+                .unwrap_or(command);
             (StatusCode::ACCEPTED, Json(envelope(command, None))).into_response()
         }
         Err(error) => error.into_response(),
@@ -3501,17 +3580,35 @@ async fn get_command(
     RoutePath(id): RoutePath<String>,
     headers: HeaderMap,
 ) -> Response {
-    let inner = state.inner.lock().await;
-    match inner.commands.get(&id) {
-        Some(command) => {
-            conditional_json(&headers, command.clone(), envelope(command.clone(), None))
-        }
+    match command_snapshot(&state, &id).await {
+        Some(command) => conditional_json(&headers, command.clone(), envelope(command, None)),
         None => error_response(
             StatusCode::NOT_FOUND,
             "command_not_found",
             "Command was not found.",
         ),
     }
+}
+
+async fn command_snapshot(state: &AppState, command_id: &str) -> Option<Command> {
+    let inner = state.inner.lock().await;
+    let mut command = inner.commands.get(command_id).cloned()?;
+    if command.status == CommandStatus::Connecting {
+        // Keep the command state stable while checking whether its live control crossed the write boundary.
+        let controls = state.command_controls.lock().await;
+        if controls
+            .get(command_id)
+            .is_some_and(BleCommandControl::write_started)
+        {
+            command.write_state = WriteState::PossiblySent;
+            command.retryable = false;
+            if let Some(attempt) = command.attempts.last_mut() {
+                attempt.phase = "gatt_write".into();
+                attempt.write_state = WriteState::PossiblySent;
+            }
+        }
+    }
+    Some(command)
 }
 
 async fn get_queue(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -3539,6 +3636,7 @@ async fn get_queue(State(state): State<AppState>, headers: HeaderMap) -> Respons
         max_queued_per_device: state.queue_config.max_queued_per_device as u64,
         adapter_concurrency: state.queue_config.adapter_concurrency as u64,
         adapter_scan_window_ms: state.queue_config.adapter_scan_window_ms,
+        command_execution_timeout_seconds: COMMAND_EXECUTION_TIMEOUT.as_secs(),
     };
     conditional_json(&headers, data.clone(), envelope(data, None))
 }
@@ -3590,6 +3688,7 @@ fn make_command(
         completed_at: None,
         expires_at: now + ChronoDuration::seconds(queue_wait_timeout_seconds),
         attempt: 0,
+        attempts: Vec::new(),
         error_code: None,
         failure_stage: None,
         write_state: WriteState::NotSent,
@@ -3762,6 +3861,8 @@ async fn submit_command(
             "This device already has the maximum number of outstanding commands.",
         ));
     }
+    let mut preempt_in_flight = Vec::new();
+    let mut cancelled_queued = Vec::new();
     if action == Action::Stop {
         let mut cancelled = Vec::new();
         for command in inner.commands.values_mut().filter(|command| {
@@ -3773,6 +3874,7 @@ async fn submit_command(
             command.completed_at = Some(Utc::now());
             command.error_code = Some("preempted_by_stop".into());
             command.retryable = false;
+            cancelled_queued.push(command.id.clone());
             cancelled.push((
                 command.id.clone(),
                 command.completed_at.unwrap_or_else(Utc::now),
@@ -3781,6 +3883,18 @@ async fn submit_command(
         for (id, completed_at) in cancelled {
             update_activity_status(&mut inner, &id, "cancelled", completed_at);
         }
+        preempt_in_flight.extend(
+            inner
+                .commands
+                .values()
+                .filter(|command| {
+                    command.managed_device_id == managed_device_id
+                        && command.status == CommandStatus::Connecting
+                        && command.write_state == WriteState::NotSent
+                        && matches!(command.action, Action::Open | Action::Close)
+                })
+                .map(|command| command.id.clone()),
+        );
     }
     let mut command = make_command(
         managed_device_id,
@@ -3809,6 +3923,23 @@ async fn submit_command(
             "persistence_outcome_unknown",
             "The command may have been accepted; query its resource before retrying.",
         ));
+    }
+    state
+        .command_controls
+        .lock()
+        .await
+        .insert(command.id.clone(), BleCommandControl::new());
+    drop(inner);
+    if !preempt_in_flight.is_empty() || !cancelled_queued.is_empty() {
+        let mut controls = state.command_controls.lock().await;
+        for id in cancelled_queued {
+            controls.remove(&id);
+        }
+        for id in preempt_in_flight {
+            if let Some(control) = controls.get(&id) {
+                control.request_prewrite_cancel();
+            }
+        }
     }
     Ok((command, true))
 }
@@ -3968,12 +4099,23 @@ fn opposite(action: Action) -> Action {
 }
 
 async fn process_command(state: AppState, command_id: String) {
+    let control = state
+        .command_controls
+        .lock()
+        .await
+        .entry(command_id.clone())
+        .or_default()
+        .clone();
     let managed_device_id = {
         let inner = state.inner.lock().await;
-        let Some(command) = inner.commands.get(&command_id) else {
-            return;
-        };
-        command.managed_device_id.clone()
+        inner
+            .commands
+            .get(&command_id)
+            .map(|command| command.managed_device_id.clone())
+    };
+    let Some(managed_device_id) = managed_device_id else {
+        state.command_controls.lock().await.remove(&command_id);
+        return;
     };
     let lock = {
         let mut locks = state.device_locks.lock().await;
@@ -3983,12 +4125,14 @@ async fn process_command(state: AppState, command_id: String) {
             .clone()
     };
     let Ok(_device_permit) = lock.acquire_owned().await else {
+        state.command_controls.lock().await.remove(&command_id);
         return;
     };
     let Ok(_adapter_permit) = state.adapter_slots.clone().acquire_owned().await else {
+        state.command_controls.lock().await.remove(&command_id);
         return;
     };
-    let (action, simulator_id, scenario, connection_delay_ms, write_delay_ms) = {
+    let (action, simulator_id, scenario, connection_delay_ms, write_delay_ms, execution_deadline) = {
         let mut inner = state.inner.lock().await;
         let simulator_id = inner
             .enrollments
@@ -3998,9 +4142,13 @@ async fn process_command(state: AppState, command_id: String) {
         let config =
             simulator_id.and_then(|id| simulator_by_id(&inner, id).map(|(_, config)| *config));
         let Some(command) = inner.commands.get_mut(&command_id) else {
+            drop(inner);
+            state.command_controls.lock().await.remove(&command_id);
             return;
         };
         if command.status != CommandStatus::Queued {
+            drop(inner);
+            state.command_controls.lock().await.remove(&command_id);
             return;
         }
         if Utc::now() >= command.expires_at {
@@ -4010,11 +4158,25 @@ async fn process_command(state: AppState, command_id: String) {
             command.retryable = true;
             update_activity_status(&mut inner, &command_id, "expired", completed_at);
             let _ = state.persist(&inner).await;
+            drop(inner);
+            state.command_controls.lock().await.remove(&command_id);
             return;
         }
         command.status = CommandStatus::Connecting;
-        command.started_at = Some(Utc::now());
+        let started_at = Utc::now();
+        command.started_at = Some(started_at);
         command.attempt = 1;
+        command.attempts.push(CommandAttempt {
+            number: 1,
+            phase: "connecting".into(),
+            started_at,
+            completed_at: None,
+            duration_ms: None,
+            write_state: WriteState::NotSent,
+            failure_stage: None,
+            error_code: None,
+        });
+        let execution_deadline = tokio::time::Instant::now() + COMMAND_EXECUTION_TIMEOUT;
         let action = command.action;
         let scenario = config
             .as_ref()
@@ -4033,16 +4195,55 @@ async fn process_command(state: AppState, command_id: String) {
             scenario,
             connection_delay_ms,
             write_delay_ms,
+            execution_deadline,
         )
     };
     let Some(simulator_id) = simulator_id else {
-        process_physical_command(&state, &command_id, action).await;
+        process_physical_command(&state, &command_id, action, control, execution_deadline).await;
         return;
     };
-    tokio::time::sleep(std::time::Duration::from_millis(
+    let simulation_started = Instant::now();
+    let delay = tokio::time::sleep(StdDuration::from_millis(
         connection_delay_ms.saturating_add(write_delay_ms),
-    ))
-    .await;
+    ));
+    tokio::pin!(delay);
+    let delay_result = tokio::select! {
+        biased;
+        _ = control.cancelled() => Err(BleFailure::command_preempted()),
+        result = tokio::time::timeout_at(execution_deadline, &mut delay) => match result {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                control.request_deadline_cancel();
+                Err(control.cancellation_failure())
+            }
+        }
+    };
+    if let Err(failure) = delay_result {
+        let error_code = ble_failure_code(&failure);
+        finish_command_attempt(
+            &state,
+            &command_id,
+            1,
+            simulation_started.elapsed(),
+            Err(&failure),
+        )
+        .await;
+        complete_physical_failure(&state, &command_id, failure, error_code).await;
+        return;
+    }
+    if scenario != SimulatorScenario::PreWriteFailure && !control.begin_write() {
+        let failure = BleFailure::command_preempted();
+        finish_command_attempt(
+            &state,
+            &command_id,
+            1,
+            simulation_started.elapsed(),
+            Err(&failure),
+        )
+        .await;
+        complete_physical_failure(&state, &command_id, failure, "preempted_by_stop").await;
+        return;
+    }
 
     let mut inner = state.inner.lock().await;
     let now = Utc::now();
@@ -4096,6 +4297,14 @@ async fn process_command(state: AppState, command_id: String) {
                 .max(0) as u64,
         );
         command.completed_at = Some(now);
+        if let Some(attempt) = command.attempts.last_mut() {
+            attempt.completed_at = Some(now);
+            attempt.duration_ms = Some(
+                now.signed_duration_since(attempt.started_at)
+                    .num_milliseconds()
+                    .max(0) as u64,
+            );
+        }
         match scenario {
             SimulatorScenario::PreWriteFailure => {
                 command.status = CommandStatus::ConnectionFailed;
@@ -4103,6 +4312,12 @@ async fn process_command(state: AppState, command_id: String) {
                 command.failure_stage = Some("device_connection".into());
                 command.write_state = WriteState::NotSent;
                 command.retryable = true;
+                if let Some(attempt) = command.attempts.last_mut() {
+                    attempt.phase = "device_connection".into();
+                    attempt.failure_stage = Some("device_connection".into());
+                    attempt.error_code = Some("connection_failed".into());
+                    attempt.write_state = WriteState::NotSent;
+                }
             }
             SimulatorScenario::OutcomeUnknown => {
                 command.status = CommandStatus::OutcomeUnknown;
@@ -4110,6 +4325,12 @@ async fn process_command(state: AppState, command_id: String) {
                 command.failure_stage = Some("gatt_write".into());
                 command.write_state = WriteState::PossiblySent;
                 command.retryable = false;
+                if let Some(attempt) = command.attempts.last_mut() {
+                    attempt.phase = "gatt_write".into();
+                    attempt.failure_stage = Some("gatt_write".into());
+                    attempt.error_code = Some("outcome_unknown".into());
+                    attempt.write_state = WriteState::PossiblySent;
+                }
             }
             SimulatorScenario::GattWriteError => {
                 command.status = CommandStatus::WriteFailed;
@@ -4117,11 +4338,21 @@ async fn process_command(state: AppState, command_id: String) {
                 command.failure_stage = Some("gatt_write".into());
                 command.write_state = WriteState::PossiblySent;
                 command.retryable = false;
+                if let Some(attempt) = command.attempts.last_mut() {
+                    attempt.phase = "gatt_write".into();
+                    attempt.failure_stage = Some("gatt_write".into());
+                    attempt.error_code = Some("gatt_write_error".into());
+                    attempt.write_state = WriteState::PossiblySent;
+                }
             }
             SimulatorScenario::Normal | SimulatorScenario::TelemetryPaused => {
                 command.status = CommandStatus::WriteAcknowledged;
                 command.write_state = WriteState::Acknowledged;
                 command.retryable = false;
+                if let Some(attempt) = command.attempts.last_mut() {
+                    attempt.phase = "gatt_write_acknowledged".into();
+                    attempt.write_state = WriteState::Acknowledged;
+                }
             }
         }
     }
@@ -4159,6 +4390,8 @@ async fn process_command(state: AppState, command_id: String) {
     if state.persist(&inner).await.is_err() {
         tracing::warn!(%command_id, "Command result could not be persisted.");
     }
+    drop(inner);
+    state.command_controls.lock().await.remove(&command_id);
 }
 
 fn physical_target(
@@ -4208,7 +4441,13 @@ fn retry_backoff(attempt: u8) -> std::time::Duration {
     std::time::Duration::from_millis(250_u64.saturating_mul(1_u64 << exponent))
 }
 
-async fn process_physical_command(state: &AppState, command_id: &str, action: Action) {
+async fn process_physical_command(
+    state: &AppState,
+    command_id: &str,
+    action: Action,
+    control: BleCommandControl,
+    deadline: tokio::time::Instant,
+) {
     let (managed_device_id, started_at) = {
         let inner = state.inner.lock().await;
         let Some(command) = inner.commands.get(command_id) else {
@@ -4219,58 +4458,107 @@ async fn process_physical_command(state: &AppState, command_id: &str, action: Ac
             command.started_at.unwrap_or(command.accepted_at),
         )
     };
-    let Some(adapter) = state.ble_adapter.read().await.clone() else {
-        complete_physical_failure(
-            state,
-            command_id,
-            BleFailure {
-                stage: BleFailureStage::Adapter,
-                retryable_before_write: true,
-                write_may_have_been_sent: false,
-                outcome_unknown: false,
-            },
-            "adapter_unavailable",
-            started_at,
-        )
-        .await;
-        return;
-    };
-
-    let target = {
-        let inner = state.inner.lock().await;
-        physical_target(&inner, &managed_device_id)
-    };
-    let (mut peripheral_id, expected_name) = match target {
-        Ok(target) => target,
-        Err(code) => {
-            complete_physical_failure(
-                state,
-                command_id,
-                BleFailure {
-                    stage: BleFailureStage::IdentityVerification,
-                    retryable_before_write: true,
-                    write_may_have_been_sent: false,
-                    outcome_unknown: false,
-                },
-                code,
-                started_at,
-            )
-            .await;
-            return;
-        }
-    };
     let service_action = match action {
         Action::Open => ServiceAction::Open,
         Action::Close => ServiceAction::Close,
         Action::Stop => ServiceAction::Stop,
     };
-    let mut result = adapter
-        .write_action(&peripheral_id, &expected_name, service_action)
-        .await;
     let mut attempt = 1;
-    if result.as_ref().is_err_and(retryable_prewrite_failure) {
-        let delay = retry_backoff(attempt);
-        if let Err(failure) = &result {
+    let mut failure_code_override = None;
+    let result = loop {
+        if attempt > 1 {
+            start_command_attempt(state, command_id, attempt).await;
+        }
+        let attempt_started = tokio::time::Instant::now();
+        let attempt_result = if control.is_cancelled() {
+            Err(control.cancellation_failure())
+        } else {
+            let target = {
+                let inner = state.inner.lock().await;
+                physical_target(&inner, &managed_device_id)
+            };
+            match target {
+                Err(code) => {
+                    failure_code_override = Some(code);
+                    Err(BleFailure {
+                        stage: BleFailureStage::IdentityVerification,
+                        retryable_before_write: false,
+                        write_may_have_been_sent: false,
+                        outcome_unknown: false,
+                    })
+                }
+                Ok((peripheral_id, expected_name)) => {
+                    let Some(adapter) = state.ble_adapter.read().await.clone() else {
+                        let failure = BleFailure {
+                            stage: BleFailureStage::Adapter,
+                            retryable_before_write: true,
+                            write_may_have_been_sent: false,
+                            outcome_unknown: false,
+                        };
+                        finish_command_attempt(
+                            state,
+                            command_id,
+                            attempt,
+                            attempt_started.elapsed(),
+                            Err(&failure),
+                        )
+                        .await;
+                        return complete_physical_failure(
+                            state,
+                            command_id,
+                            failure,
+                            "adapter_unavailable",
+                        )
+                        .await;
+                    };
+                    let write = adapter.write_action(
+                        &peripheral_id,
+                        &expected_name,
+                        service_action,
+                        &control,
+                    );
+                    tokio::pin!(write);
+                    let completed = tokio::select! {
+                        biased;
+                        result = &mut write => Some(result),
+                        _ = control.cancelled() => None,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            control.request_deadline_cancel();
+                            None
+                        }
+                    };
+                    match completed {
+                        Some(result) => result,
+                        None => match tokio::time::timeout(COMMAND_CLEANUP_GRACE, &mut write).await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                tracing::warn!(
+                                    command_id,
+                                    cleanup_grace_ms = COMMAND_CLEANUP_GRACE.as_millis() as u64,
+                                    "BLE adapter did not finish cancellation cleanup within the grace period"
+                                );
+                                Err(control.cancellation_failure())
+                            }
+                        },
+                    }
+                }
+            }
+        };
+        finish_command_attempt(
+            state,
+            command_id,
+            attempt,
+            attempt_started.elapsed(),
+            attempt_result.as_ref().map(|_| ()),
+        )
+        .await;
+
+        if let Err(failure) = &attempt_result
+            && attempt == 1
+            && retryable_prewrite_failure(failure)
+        {
+            let delay = retry_backoff(attempt);
             tracing::warn!(
                 command_id,
                 attempt,
@@ -4278,46 +4566,18 @@ async fn process_physical_command(state: &AppState, command_id: &str, action: Ac
                 retry_delay_ms = delay.as_millis() as u64,
                 "Retrying physical command after a confirmed pre-write BLE failure"
             );
-        }
-        tokio::time::sleep(delay).await;
-        let retry_target = {
-            let inner = state.inner.lock().await;
-            physical_target(&inner, &managed_device_id)
-        };
-        match retry_target {
-            Ok((retry_peripheral_id, _)) => {
-                peripheral_id = retry_peripheral_id;
-                attempt = 2;
-                if let Some(command) = state.inner.lock().await.commands.get_mut(command_id) {
-                    command.attempt = attempt;
+            if tokio::time::Instant::now() + delay < deadline {
+                tokio::select! {
+                    biased;
+                    _ = control.cancelled() => break Err(control.cancellation_failure()),
+                    _ = tokio::time::sleep(delay) => {}
                 }
-                let persist_result = {
-                    let inner = state.inner.lock().await;
-                    state.persist(&inner).await
-                };
-                let _ = persist_result;
-                result = adapter
-                    .write_action(&peripheral_id, &expected_name, service_action)
-                    .await;
-            }
-            Err(code) => {
-                complete_physical_failure(
-                    state,
-                    command_id,
-                    BleFailure {
-                        stage: BleFailureStage::IdentityVerification,
-                        retryable_before_write: true,
-                        write_may_have_been_sent: false,
-                        outcome_unknown: false,
-                    },
-                    code,
-                    started_at,
-                )
-                .await;
-                return;
+                attempt = 2;
+                continue;
             }
         }
-    }
+        break attempt_result;
+    };
 
     if let Err(failure) = &result {
         tracing::warn!(
@@ -4351,7 +4611,9 @@ async fn process_physical_command(state: &AppState, command_id: &str, action: Ac
             command.failure_stage = None;
         }
         Err(failure) => {
-            command.status = if failure.write_may_have_been_sent {
+            command.status = if failure.stage == BleFailureStage::CommandPreempted {
+                CommandStatus::Cancelled
+            } else if failure.write_may_have_been_sent {
                 if failure.outcome_unknown {
                     CommandStatus::OutcomeUnknown
                 } else {
@@ -4366,8 +4628,15 @@ async fn process_physical_command(state: &AppState, command_id: &str, action: Ac
                 WriteState::NotSent
             };
             command.retryable = failure.retryable_before_write && !failure.write_may_have_been_sent;
-            command.error_code = Some(ble_failure_code(&failure).into());
+            command.error_code = Some(
+                failure_code_override
+                    .unwrap_or_else(|| ble_failure_code(&failure))
+                    .into(),
+            );
             command.failure_stage = Some(failure.stage.as_str().into());
+            if failure.stage == BleFailureStage::CommandPreempted {
+                command.retryable = false;
+            }
         }
     }
     if let Some((status, completed_at)) = inner
@@ -4385,6 +4654,70 @@ async fn process_physical_command(state: &AppState, command_id: &str, action: Ac
     if state.persist(&inner).await.is_err() {
         tracing::warn!(%command_id, "Physical command result could not be persisted.");
     }
+    drop(inner);
+    state.command_controls.lock().await.remove(command_id);
+}
+
+async fn start_command_attempt(state: &AppState, command_id: &str, number: u8) {
+    let mut inner = state.inner.lock().await;
+    let now = Utc::now();
+    if let Some(command) = inner.commands.get_mut(command_id) {
+        command.attempt = number;
+        command.attempts.push(CommandAttempt {
+            number,
+            phase: "connecting".into(),
+            started_at: now,
+            completed_at: None,
+            duration_ms: None,
+            write_state: WriteState::NotSent,
+            failure_stage: None,
+            error_code: None,
+        });
+    }
+    if state.persist(&inner).await.is_err() {
+        tracing::warn!(%command_id, attempt = number, "Command attempt start could not be persisted.");
+    }
+}
+
+async fn finish_command_attempt(
+    state: &AppState,
+    command_id: &str,
+    number: u8,
+    elapsed: StdDuration,
+    result: Result<(), &BleFailure>,
+) {
+    let mut inner = state.inner.lock().await;
+    let now = Utc::now();
+    let attempt = inner.commands.get_mut(command_id).and_then(|command| {
+        command
+            .attempts
+            .iter_mut()
+            .rev()
+            .find(|attempt| attempt.number == number)
+    });
+    if let Some(attempt) = attempt {
+        attempt.completed_at = Some(now);
+        attempt.duration_ms = Some(elapsed.as_millis().min(u64::MAX as u128) as u64);
+        match result {
+            Ok(()) => {
+                attempt.phase = "gatt_write_acknowledged".into();
+                attempt.write_state = WriteState::Acknowledged;
+            }
+            Err(failure) => {
+                attempt.phase = failure.stage.as_str().into();
+                attempt.failure_stage = Some(failure.stage.as_str().into());
+                attempt.error_code = Some(ble_failure_code(failure).into());
+                attempt.write_state = if failure.write_may_have_been_sent {
+                    WriteState::PossiblySent
+                } else {
+                    WriteState::NotSent
+                };
+            }
+        }
+    }
+    if state.persist(&inner).await.is_err() {
+        tracing::warn!(%command_id, attempt = number, "Command attempt result could not be persisted.");
+    }
 }
 
 async fn complete_physical_failure(
@@ -4392,28 +4725,47 @@ async fn complete_physical_failure(
     command_id: &str,
     failure: BleFailure,
     error_code: &str,
-    started_at: DateTime<Utc>,
 ) {
     let mut inner = state.inner.lock().await;
     let Some(command) = inner.commands.get_mut(command_id) else {
         return;
     };
     let now = Utc::now();
-    command.status = CommandStatus::ConnectionFailed;
+    command.status = if failure.stage == BleFailureStage::CommandPreempted {
+        CommandStatus::Cancelled
+    } else if failure.write_may_have_been_sent {
+        if failure.outcome_unknown {
+            CommandStatus::OutcomeUnknown
+        } else {
+            CommandStatus::WriteFailed
+        }
+    } else {
+        CommandStatus::ConnectionFailed
+    };
     command.completed_at = Some(now);
     command.duration_ms = Some(
-        now.signed_duration_since(started_at)
+        now.signed_duration_since(command.started_at.unwrap_or(command.accepted_at))
             .num_milliseconds()
             .max(0) as u64,
     );
     command.error_code = Some(error_code.to_owned());
     command.failure_stage = Some(failure.stage.as_str().into());
-    command.write_state = WriteState::NotSent;
-    command.retryable = failure.retryable_before_write;
-    update_activity_status(&mut inner, command_id, "connection_failed", now);
+    command.write_state = if failure.write_may_have_been_sent {
+        WriteState::PossiblySent
+    } else {
+        WriteState::NotSent
+    };
+    command.retryable = failure.retryable_before_write && !failure.write_may_have_been_sent;
+    if failure.stage == BleFailureStage::CommandPreempted {
+        command.retryable = false;
+    }
+    let status = command_status_text(command.status);
+    update_activity_status(&mut inner, command_id, status, now);
     if state.persist(&inner).await.is_err() {
         tracing::warn!(%command_id, "Physical command failure could not be persisted.");
     }
+    drop(inner);
+    state.command_controls.lock().await.remove(command_id);
 }
 
 async fn process_batch(state: AppState, batch_id: String) {
@@ -4501,6 +4853,7 @@ async fn process_batch(state: AppState, batch_id: String) {
 }
 
 fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
+    let gatt_readiness = (!enrollment.is_simulated).then(|| gatt_readiness(inner, &enrollment.id));
     let matching: Vec<&Device> = if enrollment.is_simulated {
         inner
             .simulator_enabled
@@ -4524,6 +4877,7 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
         return ManagedDevice {
             enrollment,
             availability: "ambiguous".into(),
+            gatt_readiness,
             last_seen_at: matching.iter().map(|device| device.last_seen_at).max(),
             position: None,
         };
@@ -4536,6 +4890,7 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
             ManagedDevice {
                 enrollment,
                 availability: if fresh { "ready" } else { "stale" }.into(),
+                gatt_readiness,
                 last_seen_at: Some(device.last_seen_at),
                 position: device.position.as_ref().map(|position| ControlPosition {
                     current_closed_percent: position.current_closed_percent,
@@ -4546,8 +4901,46 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
         None => ManagedDevice {
             enrollment,
             availability: "not_seen".into(),
+            gatt_readiness,
             last_seen_at: None,
             position: None,
+        },
+    }
+}
+
+fn gatt_readiness(inner: &Inner, managed_device_id: &str) -> GattReadiness {
+    let latest = inner
+        .commands
+        .values()
+        .filter(|command| command.managed_device_id == managed_device_id)
+        .max_by_key(|command| (command.accepted_at, command.id.as_str()));
+    let last_write_acknowledged_at = inner
+        .commands
+        .values()
+        .filter(|command| {
+            command.managed_device_id == managed_device_id
+                && command.status == CommandStatus::WriteAcknowledged
+        })
+        .filter_map(|command| command.completed_at)
+        .max();
+    match latest {
+        Some(command) => GattReadiness {
+            status: command_status_text(command.status).to_owned(),
+            last_command_accepted_at: Some(command.accepted_at),
+            last_attempt_at: command.started_at,
+            last_write_acknowledged_at,
+            attempt_count: command.attempt,
+            failure_stage: command.failure_stage.clone(),
+            error_code: command.error_code.clone(),
+        },
+        None => GattReadiness {
+            status: "untested".into(),
+            last_command_accepted_at: None,
+            last_attempt_at: None,
+            last_write_acknowledged_at: None,
+            attempt_count: 0,
+            failure_stage: None,
+            error_code: None,
         },
     }
 }
@@ -5135,6 +5528,47 @@ mod security_hardening_tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_connecting_command_closes_its_attempt_as_outcome_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let state = AppState::configured(true, None, Some(path.clone()));
+        let started_at = Utc::now() - ChronoDuration::seconds(5);
+        let mut command = make_command("managed-physical", Action::Open, 120);
+        command.status = CommandStatus::Connecting;
+        command.started_at = Some(started_at);
+        command.attempt = 1;
+        command.attempts.push(CommandAttempt {
+            number: 1,
+            phase: "gatt_write".into(),
+            started_at,
+            completed_at: None,
+            duration_ms: None,
+            write_state: WriteState::NotSent,
+            failure_stage: None,
+            error_code: None,
+        });
+        let command_id = command.id.clone();
+        {
+            let mut inner = state.inner.lock().await;
+            inner.commands.insert(command_id.clone(), command);
+            state.persist(&inner).await.unwrap();
+        }
+
+        let recovered = AppState::from_data_path(&path).await.unwrap();
+        let inner = recovered.inner.lock().await;
+        let command = inner.commands.get(&command_id).unwrap();
+        assert_eq!(command.status, CommandStatus::OutcomeUnknown);
+        assert_eq!(command.write_state, WriteState::PossiblySent);
+        assert_eq!(command.attempts[0].phase, "service_recovery");
+        assert_eq!(command.attempts[0].write_state, WriteState::PossiblySent);
+        assert_eq!(
+            command.attempts[0].error_code.as_deref(),
+            Some("outcome_unknown")
+        );
+        assert!(command.attempts[0].duration_ms.is_some());
     }
 
     #[cfg(unix)]
