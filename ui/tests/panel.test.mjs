@@ -17,3 +17,9 @@ test('panel topbar and cards use the enlarged vertical budget', () => {
   assert.match(panelCss, /\.card--panel\s*\{[^}]*padding:\s*14px/s);
   assert.doesNotMatch(panelCss, /\.device-list-heading/);
 });
+
+test('panel all-blinds controls stay compact and touch friendly', () => {
+  assert.match(panelCss, /\.all-blinds-controls\s*\{[^}]*padding:\s*10px 12px/s);
+  assert.match(panelCss, /\.all-blinds-actions \.button\s*\{[^}]*min-height:\s*44px/s);
+  assert.match(panelCss, /@media\s*\(max-width:\s*359px\)[\s\S]*\.all-blinds-actions/);
+});

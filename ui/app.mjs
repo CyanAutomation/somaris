@@ -9,6 +9,7 @@ import {
   renderDeviceList,
   renderTopbarActions,
   renderHomeSupportingSections,
+  renderBatchControls,
   renderInfoGrid,
   renderMotorSpeedControl,
   renderCalibrationControls,
@@ -96,16 +97,81 @@ export function batteryDisplay(battery) {
 }
 const terminal = new Set(['write_acknowledged','connection_failed','write_failed','outcome_unknown','expired','cancelled','deferred']);
 const app = typeof document === 'undefined' ? null : document.querySelector('#app');
-const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, serviceError:null, enrollmentError:null, removalError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, actionError:null, busy:new Set(), reconciliationRequired:new Set(), tokens:{}, simulators:null};
+const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, batch:null, serviceError:null, enrollmentError:null, removalError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, actionError:null, busy:new Set(), reconciliationRequired:new Set(), tokens:{}, simulators:null};
 let displayPreference = storedDisplayPreference();
 const esc = escapeHtml;
 const relative = date => { if (!date) return 'Never seen'; const seconds = Math.max(0, Math.floor((Date.now()-new Date(date).getTime())/1000)); if (!Number.isFinite(seconds)) return 'Time unavailable'; if(seconds < 60) return 'Seen just now'; if(seconds < 3600) return `Seen ${Math.floor(seconds/60)} min ago`; if(seconds < 86400) return `Seen ${Math.floor(seconds/3600)} hr ago`; return `Seen ${Math.floor(seconds/86400)} days ago`; };
-async function api(path, options) { const response = await fetch(path, {cache:'no-store', ...options}); const body = await response.json().catch(()=>({})); if(!response.ok) throw new Error(body.error?.message || body.message || `Request failed (${response.status})`); return body.data; }
+async function api(path, options) { const response = await fetch(path, {cache:'no-store', ...options}); const body = await response.json().catch(()=>({})); if(!response.ok) { const error=new Error(body.error?.message || body.message || `Request failed (${response.status})`); error.status=response.status; error.code=body.error?.code; throw error; } return body.data; }
 function button(label, action, extra='', disabled=false, icon=null) {
  return renderButton({label, action, variant:extra, disabled, icon});
 }
 function notice(message, dismissAction) { return message ? `<div class="notice" role="alert">${esc(message)}${dismissAction?` <button class="text-button" data-action="${dismissAction}">Dismiss</button>`:''}</div>` : ''; }
 export function availability(value) { return ({ready:['Observed recently',''],stale:['Stale','warn'],not_seen:['Not seen','warn'],ambiguous:['Ambiguous','bad']})[value] || ['Unavailable','warn']; }
+const terminalBatchStatuses = new Set(['completed', 'partial', 'failed', 'rejected']);
+export function blindBatchIsLocked(batch) {
+ return !!batch && !terminalBatchStatuses.has(batch.status);
+}
+export function batchEligibleCount(managed, now = Date.now()) {
+ return (managed || []).filter(device => {
+  if(device.availability!=='ready' || device.calibration_mode_active===true) return false;
+  const cooldownUntil=Date.parse(device.gatt_readiness?.cooldown_until || '');
+  return !Number.isFinite(cooldownUntil) || cooldownUntil<=now;
+ }).length;
+}
+function newIdempotencyKey() {
+ return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+function batchRequestOptions(batch) {
+ return {
+  method:'POST',
+  headers:{'Content-Type':'application/json','Idempotency-Key':batch.idempotencyKey},
+  body:JSON.stringify({action:batch.action}),
+ };
+}
+function applyBatchResult(target, batch, result, onChange) {
+ if(target.batch!==batch) return false;
+ batch.id=result.id || batch.id;
+ batch.data=result;
+ batch.status=result.status;
+ batch.error=null;
+ onChange();
+ return true;
+}
+export async function submitBlindBatch(target, request, action, onChange = () => {}, createKey = newIdempotencyKey) {
+ if(!['open','close'].includes(action) || blindBatchIsLocked(target.batch)) return false;
+ const batch={action,status:'submitting',idempotencyKey:createKey(),id:null,data:null,error:null};
+ target.batch=batch;
+ onChange();
+ try {
+  const result=await request('/api/control/v1/batches',batchRequestOptions(batch));
+  return applyBatchResult(target,batch,result,onChange);
+ } catch(error) {
+  if(target.batch!==batch) return false;
+  batch.error=String(error?.message || error);
+  batch.status=Number.isInteger(error?.status) && error.status>=400 && error.status<500 ? 'rejected' : 'outcome_unknown';
+  onChange();
+  return false;
+ }
+}
+export async function checkBlindBatch(target, request, onChange = () => {}) {
+ const batch=target.batch;
+ if(!batch || terminalBatchStatuses.has(batch.status)) return false;
+ batch.status='checking';
+ batch.error=null;
+ onChange();
+ try {
+  const result=batch.id
+   ? await request(`/api/control/v1/batches/${encodeURIComponent(batch.id)}`)
+   : await request('/api/control/v1/batches',batchRequestOptions(batch));
+  return applyBatchResult(target,batch,result,onChange);
+ } catch(error) {
+  if(target.batch!==batch) return false;
+  batch.status='outcome_unknown';
+  batch.error=String(error?.message || error);
+  onChange();
+  return false;
+ }
+}
 export function gattReadinessLabel(readiness) {
  switch (readiness?.status) {
   case 'untested': return 'No command sent yet';
@@ -161,7 +227,7 @@ function card(device) {
   deviceId:e.id, blindLabel:e.label,
   panelMode,
   disabled, busy:state.busy.has(e.id),
-  movementDisabled:movementCooldown||device.calibration_mode_active===true,
+  movementDisabled:movementCooldown||device.calibration_mode_active===true||blindBatchIsLocked(state.batch),
   supportsPosition:device.capabilities?.set_position === true,
   positionClosedPercent:targetPercent,
  });
@@ -190,9 +256,17 @@ function home() {
  const empty = panelMode
   ? `<div class="panel empty"><h3>No blinds yet</h3><p>Add a nearby blind to see its status and controls here.</p></div>`
   : `<div class="panel empty"><div class="empty-icon">☼</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p></div>`;
+ const batchControls=renderBatchControls({
+  blindCount:state.managed.length,
+  eligibleCount:batchEligibleCount(state.managed),
+  disabled:!!state.serviceError||state.busy.size>0,
+  busy:blindBatchIsLocked(state.batch),
+  panelMode,
+  batch:state.batch,
+ });
  const listMarkup=renderDeviceList({
   count:state.managed.length, panelMode,
-  cardsMarkup:state.managed.map(card).join(''), emptyMarkup:empty,
+  cardsMarkup:state.managed.map(card).join(''), emptyMarkup:empty, toolbarMarkup:batchControls,
  });
  const serviceMarkup=`<div class="section-heading" style="margin-top:35px"><h2>Somaris service</h2><button type="button" class="text-button" data-action="service">View service status &nbsp; ↗</button></div><p class="subtle">${esc(scannerSummary())}</p>`;
  const supportingSections=renderHomeSupportingSections({
@@ -437,8 +511,32 @@ export async function removeEnrolledBlind(target, request, refreshData, managedD
 }
 
 async function refresh(quiet=false){ await refreshService(state,api); if(!quiet || !app?.querySelector('input:focus, select:focus')) render(); }
-async function sendCommand(id,action,positionClosedPercent,motorSpeedPercent){ if((state.busy.has(id)||state.reconciliationRequired.has(id)) && action!=='stop') return; const token=Symbol(); state.busy.add(id); state.actionError=null; state.tokens[id]=token; state.commands[id]={status:'queued'}; render(); try { const key=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`; const body=action==='set_position'?{action,position_closed_percent:positionClosedPercent}:action==='set_motor_speed'?{action,motor_speed_percent:motorSpeedPercent}:{action}; const command=await api(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify(body)}); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); pollCommand(id,command.id,token); } catch(e) { if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.actionError=`Command request failed: ${e.message}. Its outcome may be unknown; check telemetry before trying again.`; if(!state.reconciliationRequired.has(id))state.busy.delete(id); render(); } }
+async function sendCommand(id,action,positionClosedPercent,motorSpeedPercent){ if((state.busy.has(id)||state.reconciliationRequired.has(id)||blindBatchIsLocked(state.batch)) && action!=='stop') return; const token=Symbol(); state.busy.add(id); state.actionError=null; state.tokens[id]=token; state.commands[id]={status:'queued'}; render(); try { const key=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`; const body=action==='set_position'?{action,position_closed_percent:positionClosedPercent}:action==='set_motor_speed'?{action,motor_speed_percent:motorSpeedPercent}:{action}; const command=await api(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify(body)}); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); pollCommand(id,command.id,token); } catch(e) { if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.actionError=`Command request failed: ${e.message}. Its outcome may be unknown; check telemetry before trying again.`; if(!state.reconciliationRequired.has(id))state.busy.delete(id); render(); } }
 async function pollCommand(id,commandId,token){ try { const command=await api(`/api/control/v1/commands/${encodeURIComponent(commandId)}`); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); if(!terminal.has(command.status)){ setTimeout(()=>pollCommand(id,commandId,token),1500); return; } if(!state.reconciliationRequired.has(id))state.busy.delete(id); await refresh(true); } catch(e){ await handleCommandPollFailure(state,id,token,e,()=>refreshCommandTelemetry(state,api,id),render); } }
+function pollBlindBatch(batch) {
+ setTimeout(async()=>{
+  if(state.batch!==batch || !batch.id || !blindBatchIsLocked(batch))return;
+  const updated=await checkBlindBatch(state,api,render);
+  if(!updated || state.batch!==batch)return;
+  if(!blindBatchIsLocked(batch)){await refresh();return;}
+  pollBlindBatch(batch);
+ },1500);
+}
+async function startBlindBatch(action) {
+ const accepted=await submitBlindBatch(state,api,action,render);
+ if(!accepted){if(state.batch?.status==='rejected')await refresh();return;}
+ const batch=state.batch;
+ if(batch?.id && blindBatchIsLocked(batch))pollBlindBatch(batch);
+ else await refresh();
+}
+async function retryBlindBatchCheck() {
+ const batch=state.batch;
+ if(!batch)return;
+ const updated=await checkBlindBatch(state,api,render);
+ if(!updated || state.batch!==batch)return;
+ if(blindBatchIsLocked(batch) && batch.id)pollBlindBatch(batch);
+ else if(!blindBatchIsLocked(batch))await refresh();
+}
 async function simulatorReset(id){state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_closed_percent:100})}); await refresh();}catch(error){state.actionError=`Simulator reset failed: ${error.message}`; render();}}
 async function confirmEnrollmentRemoval(id){
  if(state.removingEnrollmentId===id)return;
@@ -471,7 +569,8 @@ if(app){
   const [action,arg,id]=target.dataset.action.split(':');
   const managedDeviceId=arg ? decodeURIComponent(arg) : '';
   if(action==='command')sendCommand(id,arg);
-  else if(action==='position'){
+  else if(action==='batch'){if(arg==='check')retryBlindBatchCheck();else startBlindBatch(arg);}
+  else if(action==='position' && document.documentElement.dataset.displayMode!=='panel'){
    const input=app.querySelector(`[data-position-input="${CSS.escape(arg)}"]`);
    const position=Number(input?.value);
    if(Number.isInteger(position)&&position>=0&&position<=100)sendCommand(arg,'set_position',position);

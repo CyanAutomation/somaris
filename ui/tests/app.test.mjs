@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, observationFor, refreshCommandTelemetry, refreshService, resolveDisplayMode} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, observationFor, refreshCommandTelemetry, refreshService, resolveDisplayMode} from '../app.mjs';
 
 test('automatic display mode distinguishes square panels from phones and desktop windows',()=>{
  assert.equal(resolveDisplayMode('auto', 800, 800), 'panel');
@@ -8,6 +8,56 @@ test('automatic display mode distinguishes square panels from phones and desktop
  assert.equal(resolveDisplayMode('auto', 390, 844), 'mobile');
  assert.equal(resolveDisplayMode('auto', 1440, 900), 'desktop');
  assert.equal(resolveDisplayMode('auto', 800, 560), 'desktop');
+});
+
+test('all-blinds batch submission is idempotent and a failed request stays locked for safe recovery', async () => {
+ const {submitBlindBatch, checkBlindBatch} = await import('../app.mjs');
+ const state = {batch:null};
+ const requests = [];
+ const request = async (path, options) => {
+  requests.push([path, options]);
+  const action = options?.body ? JSON.parse(options.body).action : 'open';
+  return {id:'batch-1', action, status:'queued', target_count:2, acknowledged_count:0, failed_count:0, pending_count:2, skipped_count:0, skipped:[], targets:[]};
+ };
+ let changes = 0;
+ assert.equal(await submitBlindBatch(state, request, 'open', () => { changes += 1; }, () => 'key-1'), true);
+ assert.equal(requests.length, 1);
+ assert.equal(requests[0][0], '/api/control/v1/batches');
+ assert.equal(requests[0][1].headers['Idempotency-Key'], 'key-1');
+ assert.deepEqual(JSON.parse(requests[0][1].body), {action:'open'});
+ assert.equal(state.batch.id, 'batch-1');
+ assert.equal(state.batch.status, 'queued');
+ assert.equal(changes, 2);
+ assert.equal(await submitBlindBatch(state, request, 'close', () => {}, () => 'key-2'), false);
+ assert.equal(requests.length, 1);
+
+ const unknownState = {batch:null};
+ const failedRequest = async (path, options) => {
+  requests.push([path, options]);
+  throw new Error('Network unavailable');
+ };
+ assert.equal(await submitBlindBatch(unknownState, failedRequest, 'close', () => {}, () => 'key-2'), false);
+ assert.equal(unknownState.batch.status, 'outcome_unknown');
+ const requestCountBeforeRetry = requests.length;
+ assert.equal(await submitBlindBatch(unknownState, request, 'open', () => {}, () => 'key-3'), false);
+ assert.equal(requests.length, requestCountBeforeRetry);
+ assert.equal(await checkBlindBatch(unknownState, request, () => {}), true);
+ assert.equal(requests.at(-1)[1].headers['Idempotency-Key'], 'key-2');
+ assert.equal(JSON.parse(requests.at(-1)[1].body).action, 'close');
+ assert.equal(unknownState.batch.id, 'batch-1');
+});
+
+test('batch polling preserves an unknown outcome for a known batch ID and updates terminal results', async () => {
+ const {checkBlindBatch} = await import('../app.mjs');
+ const state = {batch:{id:'batch-9', action:'close', status:'running', data:{status:'running'}}};
+ let refreshPath = '';
+ assert.equal(await checkBlindBatch(state, async path => { refreshPath = path; throw new Error('Temporary failure'); }, () => {}), false);
+ assert.equal(refreshPath, '/api/control/v1/batches/batch-9');
+ assert.equal(state.batch.status, 'outcome_unknown');
+ assert.match(state.batch.error, /Temporary failure/);
+ assert.equal(await checkBlindBatch(state, async path => ({id:'batch-9', action:'close', status:'partial', target_count:2, acknowledged_count:1, failed_count:1, pending_count:0, skipped_count:0, skipped:[], targets:[]}), () => {}), true);
+ assert.equal(state.batch.status, 'partial');
+ assert.equal(state.batch.data.acknowledged_count, 1);
 });
 
 test('display preference query pins a mode and otherwise uses the saved choice',()=>{
@@ -22,6 +72,18 @@ test('explicit display mode overrides automatic viewport selection',()=>{
  assert.equal(resolveDisplayMode('mobile', 1440, 900), 'mobile');
  assert.equal(resolveDisplayMode('desktop', 390, 844), 'desktop');
  assert.equal(resolveDisplayMode('unknown', 390, 844), 'mobile');
+});
+
+test('all-blinds eligibility follows fresh availability, cooldown, and calibration state',()=>{
+ const now=Date.parse('2026-11-05T23:00:00Z');
+ const managed=[
+  {availability:'ready'},
+  {availability:'ready',gatt_readiness:{cooldown_until:'2026-11-05T23:01:00Z'}},
+  {availability:'ready',gatt_readiness:{cooldown_until:'2026-11-05T22:59:00Z'}},
+  {availability:'ready',calibration_mode_active:true},
+  {availability:'stale'},
+ ];
+ assert.equal(batchEligibleCount(managed,now),2);
 });
 
 test('command messages distinguish acknowledgement and uncertain outcomes',()=>{
