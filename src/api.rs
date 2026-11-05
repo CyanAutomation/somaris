@@ -19,6 +19,7 @@ use crate::{
         BtleplugAdapter, SOMA_MANUFACTURER_ID, decode_ba71_voltage, parse_soma_payload,
     },
     controller::ServiceAction,
+    integration::{DeviceCapabilities, StateChange, StateChangePublisher},
 };
 use axum::{
     Json, Router,
@@ -36,7 +37,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, Semaphore, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -274,6 +275,7 @@ pub struct AppState {
     history_persisted_cursor: Arc<AtomicU64>,
     history_persisted_count: Arc<AtomicUsize>,
     data_path: Option<PathBuf>,
+    state_changes: StateChangePublisher,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +358,26 @@ impl ScannerCounters {
 }
 
 impl AppState {
+    /// Subscribe to best-effort state-change notifications. A lagged receiver
+    /// must resynchronize by reading the managed-device and command APIs.
+    pub fn subscribe_state_changes(&self) -> broadcast::Receiver<StateChange> {
+        self.state_changes.subscribe()
+    }
+
+    /// Read an authoritative, immutable snapshot of enrolled devices.
+    pub async fn managed_devices_snapshot(&self) -> Vec<ManagedDevice> {
+        let mut inner = self.inner.lock().await;
+        prune_registry(&mut inner, Utc::now());
+        let mut devices: Vec<_> = inner
+            .enrollments
+            .values()
+            .cloned()
+            .map(|enrollment| managed_device(&inner, enrollment))
+            .collect();
+        devices.sort_by(|left, right| left.enrollment.label.cmp(&right.enrollment.label));
+        devices
+    }
+
     fn pending_history(&self, history: &VecDeque<HistoryObservation>) -> Vec<HistoryObservation> {
         let cursor = self.history_persisted_cursor.load(Ordering::Acquire);
         let first = history.partition_point(|record| record.cursor <= cursor);
@@ -489,6 +511,7 @@ impl AppState {
             history_persisted_cursor: Arc::new(AtomicU64::new(history_persisted_cursor)),
             history_persisted_count: Arc::new(AtomicUsize::new(history_persisted_count)),
             data_path,
+            state_changes: StateChangePublisher::default(),
         }
     }
 
@@ -602,6 +625,7 @@ impl AppState {
 
     async fn persist(&self, inner: &Inner) -> Result<(), ()> {
         let Some(path) = &self.data_path else {
+            self.state_changes.publish();
             return Ok(());
         };
         let bytes = serde_json::to_vec_pretty(inner).map_err(|_| ())?;
@@ -609,7 +633,9 @@ impl AppState {
         tokio::task::spawn_blocking(move || atomic_write(&path, &bytes))
             .await
             .map_err(|_| ())?
-            .map_err(|_| ())
+            .map_err(|_| ())?;
+        self.state_changes.publish();
+        Ok(())
     }
 
     async fn persist_history(
@@ -708,22 +734,56 @@ impl AppState {
                 interval.tick().await;
                 let history = {
                     let mut inner = state.inner.lock().await;
+                    let now = Utc::now();
+                    if prune_registry(&mut inner, now) {
+                        state.state_changes.publish();
+                    }
                     if !inner.simulator_enabled {
                         continue;
                     }
-                    let now = Utc::now();
                     let primary_config = inner.simulator_config;
+                    let primary_before = inner.simulator.position.as_ref().map(|position| {
+                        (
+                            position.current_closed_percent,
+                            position.target_closed_percent,
+                        )
+                    });
                     if !primary_config.telemetry_paused {
                         advance_simulator(&mut inner.simulator, &primary_config, now);
                         inner.simulator.last_seen_at = now;
                     }
                     let second_config = inner.simulator_two_config;
+                    let second_before = inner.simulator_two.as_ref().and_then(|device| {
+                        device.position.as_ref().map(|position| {
+                            (
+                                position.current_closed_percent,
+                                position.target_closed_percent,
+                            )
+                        })
+                    });
                     if let (Some(device), Some(config)) =
                         (inner.simulator_two.as_mut(), second_config.as_ref())
                         && !config.telemetry_paused
                     {
                         advance_simulator(device, config, now);
                         device.last_seen_at = now;
+                    }
+                    let primary_after = inner.simulator.position.as_ref().map(|position| {
+                        (
+                            position.current_closed_percent,
+                            position.target_closed_percent,
+                        )
+                    });
+                    let second_after = inner.simulator_two.as_ref().and_then(|device| {
+                        device.position.as_ref().map(|position| {
+                            (
+                                position.current_closed_percent,
+                                position.target_closed_percent,
+                            )
+                        })
+                    });
+                    if primary_before != primary_after || second_before != second_after {
+                        state.state_changes.publish();
                     }
                     let recorded = record_history(&mut inner).unwrap_or(false);
                     if recorded {
@@ -926,6 +986,15 @@ impl AppState {
                 .get(&observation.peripheral_id)
                 .cloned()
                 .or(rebound_device);
+            let observation_changed = previous.as_ref().is_none_or(|previous| {
+                previous.freshness != Freshness::Fresh
+                    || previous.position.as_ref().map(|position| {
+                        (
+                            position.current_closed_percent,
+                            position.target_closed_percent,
+                        )
+                    }) != Some((parsed.current_closed_percent, parsed.target_closed_percent))
+            });
             let id = previous
                 .as_ref()
                 .map(|device| device.id.clone())
@@ -972,6 +1041,9 @@ impl AppState {
             };
             let mut history_changed = record_history_for_device(&mut inner, &device);
             inner.devices.insert(observation.peripheral_id, device);
+            if observation_changed {
+                self.state_changes.publish();
+            }
             if inner.simulator_enabled {
                 let simulators = simulator_snapshots(&inner);
                 for simulator in &simulators {
@@ -1898,21 +1970,21 @@ async fn reset_simulator_for(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Freshness {
+pub enum Freshness {
     Fresh,
     Stale,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Source {
+pub enum Source {
     BleAdvertisement,
     Simulator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PositionStatus {
+pub enum PositionStatus {
     Observed,
     Unsupported,
     InvalidPayload,
@@ -1921,7 +1993,7 @@ enum PositionStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum MovementStatus {
+pub enum MovementStatus {
     Closing,
     Opening,
     AtTarget,
@@ -1930,7 +2002,7 @@ enum MovementStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PositionConfidence {
+pub enum PositionConfidence {
     ProjectConfirmed,
     Simulated,
 }
@@ -2229,48 +2301,68 @@ struct SimulatorStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Enrollment {
-    id: String,
-    label: String,
-    advertised_name: String,
+pub struct Enrollment {
+    pub id: String,
+    pub label: String,
+    pub advertised_name: String,
     logical_id: String,
-    is_simulated: bool,
-    created_at: DateTime<Utc>,
+    pub is_simulated: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ManagedDevice {
-    enrollment: Enrollment,
-    availability: String,
+pub struct ManagedDevice {
+    pub enrollment: Enrollment,
+    pub availability: String,
+    pub capabilities: DeviceCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
-    gatt_readiness: Option<GattReadiness>,
+    pub gatt_readiness: Option<GattReadiness>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_seen_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    position: Option<ControlPosition>,
+    pub position: Option<ControlPosition>,
+    /// Motor-reported target, separate from Somaris command intent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub movement_status: Option<MovementStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_status: Option<PositionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_freshness: Option<Freshness>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_source: Option<Source>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_confidence: Option<PositionConfidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_observed_at: Option<DateTime<Utc>>,
+    /// Endpoint requested by the latest retained open/close command, whether
+    /// or not the motor has yet reported it as its target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_position_closed_percent: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_command_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct GattReadiness {
+pub struct GattReadiness {
     /// The most recent command outcome; historical evidence, not a live connection probe.
-    status: String,
+    pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_command_accepted_at: Option<DateTime<Utc>>,
+    pub last_command_accepted_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_attempt_at: Option<DateTime<Utc>>,
+    pub last_attempt_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_write_acknowledged_at: Option<DateTime<Utc>>,
-    attempt_count: u8,
+    pub last_write_acknowledged_at: Option<DateTime<Utc>>,
+    pub attempt_count: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
-    failure_stage: Option<String>,
+    pub failure_stage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    error_code: Option<String>,
+    pub error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ControlPosition {
-    current_closed_percent: u8,
-    target_closed_percent: u8,
+pub struct ControlPosition {
+    pub current_closed_percent: u8,
+    pub target_closed_percent: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3026,20 +3118,25 @@ fn simulator_battery_telemetry(state: BatteryState, now: DateTime<Utc>) -> Batte
     }
 }
 
-fn prune_registry(inner: &mut Inner, now: DateTime<Utc>) {
+fn prune_registry(inner: &mut Inner, now: DateTime<Utc>) -> bool {
+    let mut changed = false;
     inner.devices.retain(|_, device| {
         let age = now.signed_duration_since(device.last_seen_at);
         if age > ChronoDuration::minutes(10) {
+            changed = true;
             false
         } else {
-            device.freshness = if age > ChronoDuration::seconds(60) {
+            let freshness = if age > ChronoDuration::seconds(60) {
                 Freshness::Stale
             } else {
                 Freshness::Fresh
             };
+            changed |= freshness != device.freshness;
+            device.freshness = freshness;
             true
         }
     });
+    changed
 }
 
 fn oldest_evictable_devices(inner: &Inner, incoming_logical_id: &str) -> Option<Vec<String>> {
@@ -3162,15 +3259,7 @@ fn device_snapshot(simulator: &Device) -> Device {
 }
 
 async fn list_managed_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let mut inner = state.inner.lock().await;
-    prune_registry(&mut inner, Utc::now());
-    let mut devices: Vec<_> = inner
-        .enrollments
-        .values()
-        .cloned()
-        .map(|enrollment| managed_device(&inner, enrollment))
-        .collect();
-    devices.sort_by(|left, right| left.enrollment.label.cmp(&right.enrollment.label));
+    let devices = state.managed_devices_snapshot().await;
     conditional_json(
         &headers,
         devices.clone(),
@@ -4854,6 +4943,13 @@ async fn process_batch(state: AppState, batch_id: String) {
 
 fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
     let gatt_readiness = (!enrollment.is_simulated).then(|| gatt_readiness(inner, &enrollment.id));
+    let capabilities = if enrollment.is_simulated {
+        DeviceCapabilities::SIMULATOR
+    } else {
+        DeviceCapabilities::WAZOMBI
+    };
+    let (requested_position_closed_percent, requested_command_status) =
+        requested_target(inner, &enrollment.id);
     let matching: Vec<&Device> = if enrollment.is_simulated {
         inner
             .simulator_enabled
@@ -4877,9 +4973,18 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
         return ManagedDevice {
             enrollment,
             availability: "ambiguous".into(),
+            capabilities,
             gatt_readiness,
             last_seen_at: matching.iter().map(|device| device.last_seen_at).max(),
             position: None,
+            movement_status: None,
+            position_status: None,
+            position_freshness: None,
+            position_source: None,
+            position_confidence: None,
+            position_observed_at: None,
+            requested_position_closed_percent,
+            requested_command_status,
         };
     }
     match matching.first().copied() {
@@ -4890,22 +4995,66 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
             ManagedDevice {
                 enrollment,
                 availability: if fresh { "ready" } else { "stale" }.into(),
+                capabilities,
                 gatt_readiness,
                 last_seen_at: Some(device.last_seen_at),
                 position: device.position.as_ref().map(|position| ControlPosition {
                     current_closed_percent: position.current_closed_percent,
                     target_closed_percent: position.target_closed_percent,
                 }),
+                movement_status: Some(device.movement_status),
+                position_status: Some(device.position_status),
+                position_freshness: Some(device.freshness),
+                position_source: device.position.as_ref().map(|position| position.source),
+                position_confidence: device.position.as_ref().map(|position| position.confidence),
+                position_observed_at: device
+                    .position
+                    .as_ref()
+                    .map(|position| position.observed_at),
+                requested_position_closed_percent,
+                requested_command_status,
             }
         }
         None => ManagedDevice {
             enrollment,
             availability: "not_seen".into(),
+            capabilities,
             gatt_readiness,
             last_seen_at: None,
             position: None,
+            movement_status: None,
+            position_status: Some(PositionStatus::NotObserved),
+            position_freshness: None,
+            position_source: None,
+            position_confidence: None,
+            position_observed_at: None,
+            requested_position_closed_percent,
+            requested_command_status,
         },
     }
+}
+
+fn requested_target(inner: &Inner, managed_device_id: &str) -> (Option<u8>, Option<String>) {
+    let latest = inner
+        .commands
+        .values()
+        .filter(|command| {
+            command.managed_device_id == managed_device_id
+                && matches!(command.action, Action::Open | Action::Close)
+        })
+        .max_by_key(|command| (command.accepted_at, command.id.as_str()));
+    let Some(command) = latest else {
+        return (None, None);
+    };
+    let requested = match command.action {
+        Action::Open => Some(0),
+        Action::Close => Some(100),
+        Action::Stop => None,
+    };
+    (
+        requested,
+        Some(command_status_text(command.status).to_owned()),
+    )
 }
 
 fn gatt_readiness(inner: &Inner, managed_device_id: &str) -> GattReadiness {

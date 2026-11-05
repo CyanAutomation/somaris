@@ -8,6 +8,26 @@ use serde_json::{Value, json};
 use somaris::api::{AppState, router};
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn enrollment_emits_internal_state_change_notification() {
+    let state = AppState::new();
+    let mut changes = state.subscribe_state_changes();
+    let app = router(state);
+    let (status, _, _) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({
+            "observed_device_id": "simulator-1",
+            "label": "Bedroom"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(changes.recv().await.unwrap().revision >= 1);
+}
+
 async fn request(
     app: &Router,
     method: Method,
@@ -214,6 +234,14 @@ async fn simulators_have_distinct_names_independent_settings_and_positions() {
     assert_eq!(status, StatusCode::OK);
     let managed = managed.unwrap()["data"].clone();
     assert_eq!(managed.as_array().unwrap().len(), 2);
+    assert_eq!(managed[0]["capabilities"]["open"], true);
+    assert_eq!(managed[0]["capabilities"]["close"], true);
+    assert_eq!(managed[0]["capabilities"]["stop"], true);
+    assert_eq!(managed[0]["capabilities"]["set_position"], false);
+    assert_eq!(managed[0]["capabilities"]["position_feedback"], true);
+    assert_eq!(managed[0]["position_freshness"], "fresh");
+    assert_eq!(managed[0]["position_source"], "simulator");
+    assert!(managed[0]["position_observed_at"].is_string());
     let first_id = managed[0]["enrollment"]["id"].as_str().unwrap();
     let (status, _, command) = request(
         &app,
@@ -229,6 +257,42 @@ async fn simulators_have_distinct_names_independent_settings_and_positions() {
         wait_for_command(&app, &command_id).await["status"],
         "write_acknowledged"
     );
+    let (_, _, reconciled) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let reconciled = reconciled.unwrap()["data"].clone();
+    let first = reconciled
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["enrollment"]["id"] == first_id)
+        .unwrap();
+    assert_eq!(first["requested_position_closed_percent"], 0);
+    assert_eq!(first["requested_command_status"], "write_acknowledged");
+    assert_eq!(first["position"]["target_closed_percent"], 0);
+
+    let (status, _, stop) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{first_id}/commands"),
+        &[("idempotency-key", "stop-after-open-simulator-1")],
+        Some(json!({"action": "stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let stop_id = stop.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&app, &stop_id).await["status"],
+        "write_acknowledged"
+    );
+    let (_, _, stopped) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let stopped = stopped.unwrap()["data"].clone();
+    let first = stopped
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["enrollment"]["id"] == first_id)
+        .unwrap();
+    assert_eq!(first["requested_position_closed_percent"], 0);
+    assert_eq!(first["requested_command_status"], "write_acknowledged");
 
     let (status, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
@@ -245,7 +309,7 @@ async fn simulators_have_distinct_names_independent_settings_and_positions() {
         .iter()
         .find(|device| device["id"] == "simulator-2")
         .unwrap();
-    assert_eq!(first["position"]["target_closed_percent"], 0);
+    assert_eq!(first["position"]["target_closed_percent"], 25);
     assert_eq!(second["position"]["current_closed_percent"], 65);
     assert_eq!(second["position"]["target_closed_percent"], 65);
 }
@@ -705,6 +769,25 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
     assert_eq!(status, StatusCode::OK);
     let contract = contract.unwrap();
     assert_eq!(contract["info"]["title"], "Somaris API");
+    let managed = &contract["components"]["schemas"]["ManagedDevice"]["properties"];
+    for field in [
+        "capabilities",
+        "position_freshness",
+        "position_source",
+        "position_confidence",
+        "position_observed_at",
+        "requested_position_closed_percent",
+        "requested_command_status",
+    ] {
+        assert!(
+            managed.get(field).is_some(),
+            "missing ManagedDevice.{field}"
+        );
+    }
+    assert_eq!(
+        contract["components"]["schemas"]["DeviceCapabilities"]["properties"]["set_position"]["type"],
+        "boolean"
+    );
 
     for (path, methods) in expected {
         let path_item = &contract["paths"][*path];
