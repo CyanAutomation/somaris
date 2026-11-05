@@ -154,6 +154,113 @@ async fn device_list_uses_closed_percent_and_supports_conditional_reads() {
 }
 
 #[tokio::test]
+async fn position_commands_validate_targets_and_preserve_idempotency() {
+    let app = router(AppState::new());
+    let (status, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let simulator_id = devices.unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _, enrollment) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": simulator_id, "label": "Position test"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let enrollment_id = enrollment.unwrap()["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (status, _, accepted) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{enrollment_id}/commands"),
+        &[("idempotency-key", "position-half")],
+        Some(json!({"action": "set_position", "position_closed_percent": 50})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command = accepted.unwrap()["data"].clone();
+    assert_eq!(command["action"], "set_position");
+    assert_eq!(command["target_closed_percent"], 50);
+    let command_id = command["id"].as_str().unwrap();
+    assert_eq!(
+        wait_for_command(&app, command_id).await["status"],
+        "write_acknowledged"
+    );
+
+    let (status, _, replay) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{enrollment_id}/commands"),
+        &[("idempotency-key", "position-half")],
+        Some(json!({"action": "set_position", "position_closed_percent": 50})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(replay.unwrap()["data"]["id"], command_id);
+
+    let (status, _, conflict) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{enrollment_id}/commands"),
+        &[("idempotency-key", "position-half")],
+        Some(json!({"action": "set_position", "position_closed_percent": 51})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(conflict.unwrap()["error"]["code"], "idempotency_conflict");
+
+    for (key, body, expected_code) in [
+        (
+            "position-too-high",
+            json!({"action": "set_position", "position_closed_percent": 101}),
+            "invalid_position",
+        ),
+        (
+            "position-missing",
+            json!({"action": "set_position"}),
+            "position_required",
+        ),
+        (
+            "position-unexpected",
+            json!({"action": "open", "position_closed_percent": 50}),
+            "unexpected_position",
+        ),
+    ] {
+        let (status, _, error) = request(
+            &app,
+            Method::POST,
+            &format!("/api/control/v1/devices/{enrollment_id}/commands"),
+            &[("idempotency-key", key)],
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.unwrap()["error"]["code"], expected_code);
+    }
+
+    let (_, _, managed) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let managed = managed.unwrap()["data"].clone();
+    let device = managed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["enrollment"]["id"] == enrollment_id)
+        .unwrap();
+    assert_eq!(device["capabilities"]["set_position"], true);
+    assert_eq!(device["capabilities"]["set_motor_speed"], true);
+    assert_eq!(device["capabilities"]["calibrate_endpoints"], true);
+    assert_eq!(device["position"]["target_closed_percent"], 50);
+    assert_eq!(device["requested_position_closed_percent"], 50);
+}
+
+#[tokio::test]
 async fn simulators_have_distinct_names_independent_settings_and_positions() {
     let app = router(AppState::new());
 
@@ -237,7 +344,7 @@ async fn simulators_have_distinct_names_independent_settings_and_positions() {
     assert_eq!(managed[0]["capabilities"]["open"], true);
     assert_eq!(managed[0]["capabilities"]["close"], true);
     assert_eq!(managed[0]["capabilities"]["stop"], true);
-    assert_eq!(managed[0]["capabilities"]["set_position"], false);
+    assert_eq!(managed[0]["capabilities"]["set_position"], true);
     assert_eq!(managed[0]["capabilities"]["position_feedback"], true);
     assert_eq!(managed[0]["position_freshness"], "fresh");
     assert_eq!(managed[0]["position_source"], "simulator");
@@ -312,6 +419,274 @@ async fn simulators_have_distinct_names_independent_settings_and_positions() {
     assert_eq!(first["position"]["target_closed_percent"], 25);
     assert_eq!(second["position"]["current_closed_percent"], 65);
     assert_eq!(second["position"]["target_closed_percent"], 65);
+}
+
+#[tokio::test]
+async fn motor_speed_and_endpoint_calibration_are_typed_and_sequenced() {
+    let app = router(AppState::new());
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let simulator = devices.unwrap()["data"][0].clone();
+    let (_, _, enrolled) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({
+            "observed_device_id": simulator["id"],
+            "label": simulator["advertised_name"]
+        })),
+    )
+    .await;
+    let enrollment_id = enrolled.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    let command_url = format!("/api/control/v1/devices/{enrollment_id}/commands");
+
+    for (key, speed, expected) in [("speed-high", 101, "invalid_motor_speed")] {
+        let (status, _, error) = request(
+            &app,
+            Method::POST,
+            &command_url,
+            &[("idempotency-key", key)],
+            Some(json!({"action": "set_motor_speed", "motor_speed_percent": speed})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.unwrap()["error"]["code"], expected);
+    }
+
+    let (status, _, response) = request(
+        &app,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "speed-37")],
+        Some(json!({"action": "set_motor_speed", "motor_speed_percent": 37})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command = response.unwrap()["data"].clone();
+    assert_eq!(command["motor_speed_percent"], 37);
+    assert_eq!(
+        wait_for_command(&app, command["id"].as_str().unwrap()).await["status"],
+        "write_acknowledged"
+    );
+
+    let (status, _, response) = request(
+        &app,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "speed-zero")],
+        Some(json!({"action": "set_motor_speed", "motor_speed_percent": 0})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command = response.unwrap()["data"].clone();
+    assert_eq!(command["motor_speed_percent"], 0);
+    assert_eq!(
+        wait_for_command(&app, command["id"].as_str().unwrap()).await["status"],
+        "write_acknowledged"
+    );
+
+    let (status, _, before_start) = request(
+        &app,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "calibration-step-before-start")],
+        Some(json!({"action": "calibration_nudge_open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        before_start.unwrap()["error"]["code"],
+        "calibration_not_active"
+    );
+
+    let (status, _, response) = request(
+        &app,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "calibration-start")],
+        Some(json!({"action": "calibration_start"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&app, &command_id).await["status"],
+        "write_acknowledged"
+    );
+
+    let (_, _, managed) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let managed = managed.unwrap()["data"].clone();
+    let device = managed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["enrollment"]["id"] == enrollment_id)
+        .unwrap();
+    assert_eq!(device["calibration_mode_active"], true);
+
+    let (status, _, remove_error) = request(
+        &app,
+        Method::DELETE,
+        &format!("/api/control/v1/devices/{enrollment_id}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(remove_error.unwrap()["error"]["code"], "calibration_active");
+
+    let (status, _, batch_error) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "calibration-batch-close")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(batch_error.unwrap()["error"]["code"], "no_available_blinds");
+
+    let (status, _, blocked_move) = request(
+        &app,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "position-during-calibration")],
+        Some(json!({"action": "set_position", "position_closed_percent": 45})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(blocked_move.unwrap()["error"]["code"], "calibration_active");
+
+    for (key, action) in [
+        ("calibration-nudge-open", "calibration_nudge_open"),
+        ("calibration-mark-open", "calibration_set_open_limit"),
+        ("calibration-nudge-closed", "calibration_nudge_closed"),
+        ("calibration-mark-closed", "calibration_set_closed_limit"),
+    ] {
+        let (status, _, response) = request(
+            &app,
+            Method::POST,
+            &command_url,
+            &[("idempotency-key", key)],
+            Some(json!({"action": action})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            wait_for_command(&app, &command_id).await["status"],
+            "write_acknowledged"
+        );
+    }
+
+    let (status, _, response) = request(
+        &app,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "calibration-stop")],
+        Some(json!({"action": "calibration_stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&app, &command_id).await["status"],
+        "write_acknowledged"
+    );
+    let (_, _, managed) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let managed = managed.unwrap()["data"].clone();
+    let device = managed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["enrollment"]["id"] == enrollment_id)
+        .unwrap();
+    assert_eq!(device["calibration_mode_active"], false);
+}
+
+#[tokio::test]
+async fn calibration_lock_survives_service_restart_until_explicit_stop() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.json");
+    let app = router(AppState::from_data_path(&state_path).await.unwrap());
+    let (_, _, devices) = request(&app, Method::GET, "/api/v1/devices", &[], None).await;
+    let simulator_id = devices.unwrap()["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _, enrolled) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": simulator_id, "label": "Calibration persistence"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let managed_id = enrolled.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    let command_url = format!("/api/control/v1/devices/{managed_id}/commands");
+    let (status, _, response) = request(
+        &app,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "persist-calibration-start")],
+        Some(json!({"action": "calibration_start"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&app, &command_id).await["status"],
+        "write_acknowledged"
+    );
+    drop(app);
+
+    let restored = router(AppState::from_data_path(&state_path).await.unwrap());
+    let (_, _, managed) =
+        request(&restored, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let device = managed.unwrap()["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["enrollment"]["id"] == managed_id)
+        .unwrap()
+        .clone();
+    assert_eq!(device["calibration_mode_active"], true);
+    let (status, _, blocked) = request(
+        &restored,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "persist-calibration-blocked-move")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(blocked.unwrap()["error"]["code"], "calibration_active");
+
+    let (status, _, response) = request(
+        &restored,
+        Method::POST,
+        &command_url,
+        &[("idempotency-key", "persist-calibration-stop")],
+        Some(json!({"action": "calibration_stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&restored, &command_id).await["status"],
+        "write_acknowledged"
+    );
+    let (_, _, managed) =
+        request(&restored, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let device = managed.unwrap()["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["enrollment"]["id"] == managed_id)
+        .unwrap()
+        .clone();
+    assert_eq!(device["calibration_mode_active"], false);
 }
 
 #[tokio::test]
@@ -772,6 +1147,7 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
     let managed = &contract["components"]["schemas"]["ManagedDevice"]["properties"];
     for field in [
         "capabilities",
+        "calibration_mode_active",
         "advertisement_age_ms",
         "motion_feedback",
         "position_freshness",
@@ -789,6 +1165,54 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
     assert_eq!(
         contract["components"]["schemas"]["DeviceCapabilities"]["properties"]["set_position"]["type"],
         "boolean"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["DeviceCapabilities"]["properties"]["set_motor_speed"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["DeviceCapabilities"]["properties"]["calibrate_endpoints"]
+            ["type"],
+        "boolean"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["ManagedDevice"]["properties"]["calibration_mode_active"]
+            ["type"],
+        "boolean"
+    );
+    let command_request = &contract["components"]["schemas"]["CommandRequest"];
+    assert_eq!(
+        command_request["properties"]["action"]["enum"],
+        json!([
+            "open",
+            "close",
+            "stop",
+            "set_position",
+            "set_motor_speed",
+            "calibration_start",
+            "calibration_stop",
+            "calibration_nudge_open",
+            "calibration_nudge_closed",
+            "calibration_set_open_limit",
+            "calibration_set_closed_limit"
+        ])
+    );
+    assert_eq!(
+        command_request["properties"]["position_closed_percent"]["maximum"],
+        100
+    );
+    assert_eq!(
+        command_request["properties"]["motor_speed_percent"]["minimum"],
+        0
+    );
+    assert_eq!(
+        command_request["properties"]["motor_speed_percent"]["maximum"],
+        100
+    );
+    assert!(
+        contract["components"]["schemas"]["Command"]["properties"]
+            .get("target_closed_percent")
+            .is_some()
     );
     assert!(
         contract["components"]["schemas"]["GattReadiness"]["properties"]

@@ -1,10 +1,12 @@
 use async_trait::async_trait;
 use serde_json::json;
 use somaris::controller::{
-    ControllerCommand, Notification, OPEN_CLOSE_CHARACTERISTIC_UUID, OPEN_CLOSE_SERVICE_UUID,
-    PositionError, STOP_CHARACTERISTIC_UUID, STOP_SERVICE_UUID, ServiceAction, Version,
+    CALIBRATION_CHARACTERISTIC_UUID, ControllerCommand, MOTOR_CONTROL_CHARACTERISTIC_UUID,
+    MOTOR_SERVICE_UUID, Notification, OPEN_CLOSE_CHARACTERISTIC_UUID, OPEN_CLOSE_SERVICE_UUID,
+    POSITION_TARGET_CHARACTERISTIC_UUID, PositionError, SHADE_CONFIG_CHARACTERISTIC_UUID,
+    STOP_CHARACTERISTIC_UUID, STOP_SERVICE_UUID, ServiceAction, Version,
     closed_percent_from_open_percent, encode_controller_command, encode_service_action,
-    open_percent_from_wire_byte, parse_notification, set_position_byte,
+    open_percent_from_wire_byte, parse_notification, service_action_target, set_position_byte,
 };
 use somaris::device_info::{CharacteristicReader, DeviceInfo};
 use somaris::telemetry::{
@@ -102,6 +104,67 @@ fn service_actions_encode_the_documented_gatt_payloads() {
         [0x1a, 0x01, 0x64]
     );
     assert_eq!(encode_service_action(ServiceAction::Stop), [0x00]);
+    assert_eq!(
+        encode_service_action(ServiceAction::SetTargetClosedPercent(0)),
+        [0x00]
+    );
+    assert_eq!(
+        encode_service_action(ServiceAction::SetTargetClosedPercent(50)),
+        [0x32]
+    );
+    assert_eq!(
+        encode_service_action(ServiceAction::SetTargetClosedPercent(100)),
+        [0x64]
+    );
+    assert_eq!(
+        encode_service_action(ServiceAction::SetMotorSpeedPercent(37)),
+        [0x01, 0x01, 0x25]
+    );
+    assert_eq!(
+        encode_service_action(ServiceAction::CalibrationStart),
+        [0x76]
+    );
+    assert_eq!(
+        encode_service_action(ServiceAction::CalibrationStop),
+        [0x36]
+    );
+    assert_eq!(
+        encode_service_action(ServiceAction::CalibrationNudgeOpen),
+        [0x68]
+    );
+    assert_eq!(
+        encode_service_action(ServiceAction::CalibrationNudgeClosed),
+        [0x86]
+    );
+    assert_eq!(
+        encode_service_action(ServiceAction::CalibrationSetOpenLimit),
+        [0x69]
+    );
+    assert_eq!(
+        encode_service_action(ServiceAction::CalibrationSetClosedLimit),
+        [0x96]
+    );
+    assert_eq!(
+        service_action_target(ServiceAction::SetMotorSpeedPercent(37)),
+        (
+            "00001890-b87f-490c-92cb-11ba5ea5167c",
+            "00001896-b87f-490c-92cb-11ba5ea5167c"
+        )
+    );
+    assert_eq!(
+        service_action_target(ServiceAction::CalibrationStart),
+        (
+            "00001861-b87f-490c-92cb-11ba5ea5167c",
+            "00001529-b87f-490c-92cb-11ba5ea5167c"
+        )
+    );
+    assert_eq!(
+        service_action_target(ServiceAction::CalibrationNudgeOpen),
+        (
+            "00001861-b87f-490c-92cb-11ba5ea5167c",
+            "00001530-b87f-490c-92cb-11ba5ea5167c"
+        )
+    );
 }
 
 #[test]
@@ -118,6 +181,20 @@ fn controller_uses_the_expected_gatt_service_and_characteristic_uuids() {
     assert_eq!(
         STOP_CHARACTERISTIC_UUID,
         "00001530-b87f-490c-92cb-11ba5ea5167c"
+    );
+    assert_eq!(MOTOR_SERVICE_UUID, STOP_SERVICE_UUID);
+    assert_eq!(MOTOR_CONTROL_CHARACTERISTIC_UUID, STOP_CHARACTERISTIC_UUID);
+    assert_eq!(
+        POSITION_TARGET_CHARACTERISTIC_UUID,
+        "00001526-b87f-490c-92cb-11ba5ea5167c"
+    );
+    assert_eq!(
+        CALIBRATION_CHARACTERISTIC_UUID,
+        "00001529-b87f-490c-92cb-11ba5ea5167c"
+    );
+    assert_eq!(
+        SHADE_CONFIG_CHARACTERISTIC_UUID,
+        OPEN_CLOSE_CHARACTERISTIC_UUID
     );
 }
 
