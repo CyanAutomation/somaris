@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, observationFor, refreshCommandTelemetry, resolveDisplayMode} from '../app.mjs';
+import {activityMessage, availability, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, observationFor, refreshCommandTelemetry, refreshService, resolveDisplayMode} from '../app.mjs';
 
 test('automatic display mode distinguishes square panels from phones and desktop windows',()=>{
  assert.equal(resolveDisplayMode('auto', 800, 800), 'panel');
@@ -36,19 +36,20 @@ test('command poll failure refreshes position before movement controls unlock', 
  const id='blind-1';
  const token=Symbol('command');
  const state={
-  commands:{[id]:{status:'connecting'}},
+  commands:{[id]:{status:'connecting',accepted_at:'2026-11-05T22:40:00.000Z'}},
   busy:new Set([id]),
   tokens:{[id]:token},
   managed:[{enrollment:{id},position:{current_closed_percent:100}}],
   observations:[{id:'old-observation'}],
   actionError:null,
-  serviceError:null,
+  serviceError:'Could not refresh diagnostics.',
+  reconciliationRequired:new Set(),
  };
  const calls=[];
  const changes=[];
  const request=async path=>{
   calls.push(path);
-  if(path==='/api/control/v1/devices')return [{enrollment:{id},position:{current_closed_percent:95},position_freshness:'fresh'}];
+  if(path==='/api/control/v1/devices')return [{enrollment:{id},availability:'ready',position:{current_closed_percent:95},position_freshness:'fresh',position_observed_at:'2026-11-05T22:40:01.000Z'}];
   if(path==='/api/v1/devices')return [{id:'fresh-observation'}];
   throw new Error(`Unexpected request: ${path}`);
  };
@@ -58,7 +59,7 @@ test('command poll failure refreshes position before movement controls unlock', 
   id,
   token,
   new Error('Command was not found.'),
-  ()=>refreshCommandTelemetry(state,request),
+  ()=>refreshCommandTelemetry(state,request,id),
   ()=>changes.push({busy:state.busy.has(id),status:state.commands[id]?.status,position:state.managed[0]?.position?.current_closed_percent}),
  );
 
@@ -72,9 +73,78 @@ test('command poll failure refreshes position before movement controls unlock', 
  assert.equal(state.managed[0].position.current_closed_percent,95);
  assert.equal(state.observations[0].id,'fresh-observation');
  assert.equal(state.busy.has(id),false);
+ assert.equal(state.reconciliationRequired.has(id),false);
  assert.match(state.actionError,/Could not check command status/);
  assert.match(state.actionError,/latest reported position/);
- assert.equal(state.serviceError,null);
+ assert.equal(state.serviceError,'Could not refresh diagnostics.');
+});
+
+test('failed managed-position refresh keeps movement locked until a later fresh refresh', async()=>{
+ const id='blind-1';
+ const token=Symbol('command');
+ const state={
+  commands:{[id]:{status:'connecting',accepted_at:'2026-11-05T22:40:00.000Z'}},
+  busy:new Set([id]),
+  tokens:{[id]:token},
+  managed:[{enrollment:{id},availability:'stale',position:{current_closed_percent:100},position_freshness:'stale',position_observed_at:'2026-11-05T22:39:00.000Z'}],
+  observations:[{id:'old-observation'}],
+  actionError:null,
+  serviceError:'Unrelated service error.',
+  reconciliationRequired:new Set(),
+ };
+ const request=async path=>{
+  if(path==='/api/control/v1/devices')throw new Error('Managed-device request failed.');
+  if(path==='/api/v1/devices')return [{id:'new-observation'}];
+  throw new Error(`Unexpected request: ${path}`);
+ };
+
+ await handleCommandPollFailure(state,id,token,new Error('Command was not found.'),()=>refreshCommandTelemetry(state,request,id));
+
+ assert.equal(state.busy.has(id),true);
+ assert.equal(state.reconciliationRequired.has(id),true);
+ assert.equal(state.managed[0].position.current_closed_percent,100);
+ assert.equal(state.observations[0].id,'new-observation');
+ assert.equal(state.serviceError,'Unrelated service error.');
+ assert.match(state.actionError,/movement controls remain locked/);
+
+ const fullRefresh=async path=>{
+  if(path==='/api/control/v1/devices')return [{enrollment:{id},availability:'ready',position:{current_closed_percent:95},position_freshness:'fresh',position_observed_at:'2026-11-05T22:40:01.000Z'}];
+  if(path==='/api/v1/devices')return [{id:'fresh-observation'}];
+  if(path==='/api/v1/diagnostics')return {scanner:{adapter_available:true}};
+  if(path==='/api/dev/simulators')return [];
+  if(path==='/api/control/v1/audit-log')return [];
+  throw new Error(`Unexpected request: ${path}`);
+ };
+ await refreshService(state,fullRefresh);
+
+ assert.equal(state.reconciliationRequired.has(id),false);
+ assert.equal(state.busy.has(id),false);
+ assert.equal(state.managed[0].position.current_closed_percent,95);
+ assert.match(state.actionError,/A fresh position is now available/);
+});
+
+test('fresh pre-command observation does not unlock an uncertain movement', async()=>{
+ const id='blind-1';
+ const token=Symbol('command');
+ const state={
+  commands:{[id]:{status:'connecting',accepted_at:'2026-11-05T22:40:00.000Z'}},
+  busy:new Set([id]),
+  tokens:{[id]:token},
+  managed:[],
+  observations:[],
+  actionError:null,
+  serviceError:null,
+  reconciliationRequired:new Set(),
+ };
+ const request=async path=>path==='/api/control/v1/devices'
+  ? [{enrollment:{id},availability:'ready',position_freshness:'fresh',position_observed_at:'2026-11-05T22:39:59.999Z'}]
+  : [];
+
+ await handleCommandPollFailure(state,id,token,new Error('Command was not found.'),()=>refreshCommandTelemetry(state,request,id));
+
+ assert.equal(state.busy.has(id),true);
+ assert.equal(state.reconciliationRequired.has(id),true);
+ assert.match(state.actionError,/fresh managed-device position is unavailable/);
 });
 
 test('stale command poll failure cannot clear a newer command state', async()=>{
