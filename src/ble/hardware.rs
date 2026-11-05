@@ -285,6 +285,11 @@ impl Drop for DisconnectGuard {
             runtime.spawn(async move {
                 BtleplugAdapter::disconnect(&peripheral).await;
             });
+        } else {
+            tracing::warn!(
+                operation = "disconnect",
+                "BLE disconnect cleanup could not be scheduled without a Tokio runtime"
+            );
         }
     }
 }

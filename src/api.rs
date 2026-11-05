@@ -128,6 +128,7 @@ const MAX_DISCOVERED_DEVICES: usize = 1024;
 const MAX_AUDIT_ENTRIES: usize = 30;
 const SCAN_RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 const COMMAND_EXECUTION_TIMEOUT: StdDuration = StdDuration::from_secs(45);
+const COMMAND_CLEANUP_GRACE: StdDuration = StdDuration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueConfig {
@@ -3590,20 +3591,21 @@ async fn get_command(
 }
 
 async fn command_snapshot(state: &AppState, command_id: &str) -> Option<Command> {
-    let mut command = state.inner.lock().await.commands.get(command_id).cloned()?;
-    if command.status == CommandStatus::Connecting
-        && state
-            .command_controls
-            .lock()
-            .await
+    let inner = state.inner.lock().await;
+    let mut command = inner.commands.get(command_id).cloned()?;
+    if command.status == CommandStatus::Connecting {
+        // Keep the command state stable while checking whether its live control crossed the write boundary.
+        let controls = state.command_controls.lock().await;
+        if controls
             .get(command_id)
             .is_some_and(BleCommandControl::write_started)
-    {
-        command.write_state = WriteState::PossiblySent;
-        command.retryable = false;
-        if let Some(attempt) = command.attempts.last_mut() {
-            attempt.phase = "gatt_write".into();
-            attempt.write_state = WriteState::PossiblySent;
+        {
+            command.write_state = WriteState::PossiblySent;
+            command.retryable = false;
+            if let Some(attempt) = command.attempts.last_mut() {
+                attempt.phase = "gatt_write".into();
+                attempt.write_state = WriteState::PossiblySent;
+            }
         }
     }
     Some(command)
@@ -4226,7 +4228,7 @@ async fn process_command(state: AppState, command_id: String) {
             Err(&failure),
         )
         .await;
-        complete_physical_failure(&state, &command_id, failure, error_code, Utc::now()).await;
+        complete_physical_failure(&state, &command_id, failure, error_code).await;
         return;
     }
     if scenario != SimulatorScenario::PreWriteFailure && !control.begin_write() {
@@ -4239,14 +4241,7 @@ async fn process_command(state: AppState, command_id: String) {
             Err(&failure),
         )
         .await;
-        complete_physical_failure(
-            &state,
-            &command_id,
-            failure,
-            "preempted_by_stop",
-            Utc::now(),
-        )
-        .await;
+        complete_physical_failure(&state, &command_id, failure, "preempted_by_stop").await;
         return;
     }
 
@@ -4513,7 +4508,6 @@ async fn process_physical_command(
                             command_id,
                             failure,
                             "adapter_unavailable",
-                            started_at,
                         )
                         .await;
                     };
@@ -4535,7 +4529,18 @@ async fn process_physical_command(
                     };
                     match completed {
                         Some(result) => result,
-                        None => write.await,
+                        None => match tokio::time::timeout(COMMAND_CLEANUP_GRACE, &mut write).await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                tracing::warn!(
+                                    command_id,
+                                    cleanup_grace_ms = COMMAND_CLEANUP_GRACE.as_millis() as u64,
+                                    "BLE adapter did not finish cancellation cleanup within the grace period"
+                                );
+                                Err(control.cancellation_failure())
+                            }
+                        },
                     }
                 }
             }
@@ -4720,7 +4725,6 @@ async fn complete_physical_failure(
     command_id: &str,
     failure: BleFailure,
     error_code: &str,
-    _started_at: DateTime<Utc>,
 ) {
     let mut inner = state.inner.lock().await;
     let Some(command) = inner.commands.get_mut(command_id) else {
