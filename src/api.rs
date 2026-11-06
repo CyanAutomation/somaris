@@ -124,6 +124,7 @@ const SIMULATOR_ID: &str = "simulator-1";
 const SECOND_SIMULATOR_ID: &str = "simulator-2";
 const SIMULATOR_NAME: &str = "Somaris Simulator 1";
 const SECOND_SIMULATOR_NAME: &str = "Somaris Simulator 2";
+const MAX_SIMULATOR_ENROLLMENTS: usize = 2;
 const MAX_COMMANDS: usize = 1000;
 const MAX_BATCHES: usize = 1000;
 const MAX_DISCOVERED_DEVICES: usize = 1024;
@@ -3516,6 +3517,20 @@ async fn enroll_device(
             "This device is already enrolled.",
         );
     }
+    if observed.is_simulated
+        && inner
+            .enrollments
+            .values()
+            .filter(|entry| entry.is_simulated)
+            .count()
+            >= MAX_SIMULATOR_ENROLLMENTS
+    {
+        return error_response(
+            StatusCode::CONFLICT,
+            "simulator_limit_reached",
+            "A maximum of two simulators can be enrolled. Remove a simulator before adding another.",
+        );
+    }
     if !observed.is_simulated
         && inner
             .devices
@@ -6268,6 +6283,113 @@ mod security_hardening_tests {
             gatt_readiness(&inner, "managed-1").transport_evidence,
             "no_recent_write"
         );
+    }
+
+    #[tokio::test]
+    async fn simulator_enrollment_is_limited_to_two_without_blocking_physical_blinds() {
+        let state = AppState::new();
+        let third_name = "Somaris Simulator 3";
+        {
+            let mut inner = state.inner.lock().await;
+            let mut third = make_simulated_device("simulator-3", third_name, Utc::now());
+            third.adapter_device_id = "simulator://simulator-3".into();
+            inner.devices.insert(third.adapter_device_id.clone(), third);
+
+            let mut physical = make_simulated_device("physical-1", "Physical Blind", Utc::now());
+            physical.logical_id = Some(logical_id_for_name("Physical Blind", "soma"));
+            physical.adapter_device_id = "physical-peripheral-1".into();
+            physical.source = Source::BleAdvertisement;
+            physical.is_simulated = false;
+            inner
+                .devices
+                .insert(physical.adapter_device_id.clone(), physical);
+        }
+
+        for (id, label) in [
+            (SIMULATOR_ID, "Simulator 1"),
+            (SECOND_SIMULATOR_ID, "Simulator 2"),
+        ] {
+            let response = enroll_device(
+                State(state.clone()),
+                Ok(Json(EnrollmentRequest {
+                    observed_device_id: id.into(),
+                    label: label.into(),
+                })),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let rejected = enroll_device(
+            State(state.clone()),
+            Ok(Json(EnrollmentRequest {
+                observed_device_id: "simulator-3".into(),
+                label: third_name.into(),
+            })),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(error["error"]["code"], "simulator_limit_reached");
+
+        let physical = enroll_device(
+            State(state.clone()),
+            Ok(Json(EnrollmentRequest {
+                observed_device_id: "physical-1".into(),
+                label: "Physical Blind".into(),
+            })),
+        )
+        .await;
+        assert_eq!(physical.status(), StatusCode::CREATED);
+
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner
+                .enrollments
+                .values()
+                .filter(|enrollment| enrollment.is_simulated)
+                .count(),
+            2
+        );
+        assert_eq!(inner.enrollments.len(), 3);
+        let removable_simulator_id = inner
+            .enrollments
+            .values()
+            .find(|enrollment| {
+                enrollment.is_simulated
+                    && enrollment.logical_id == logical_id_for_name(SIMULATOR_NAME, "simulator")
+            })
+            .unwrap()
+            .id
+            .clone();
+        drop(inner);
+
+        let removed =
+            remove_enrollment(State(state.clone()), RoutePath(removable_simulator_id)).await;
+        assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+
+        let replacement = enroll_device(
+            State(state.clone()),
+            Ok(Json(EnrollmentRequest {
+                observed_device_id: "simulator-3".into(),
+                label: third_name.into(),
+            })),
+        )
+        .await;
+        assert_eq!(replacement.status(), StatusCode::CREATED);
+        let inner = state.inner.lock().await;
+        assert_eq!(
+            inner
+                .enrollments
+                .values()
+                .filter(|enrollment| enrollment.is_simulated)
+                .count(),
+            2
+        );
+        assert_eq!(inner.enrollments.len(), 3);
     }
 
     #[test]

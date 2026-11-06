@@ -326,6 +326,21 @@ test('battery display shows estimated percentage and retains cached and unavaila
  assert.match(batteryDisplay(null), /Battery unavailable/);
 });
 
+test('simulator enrollment limit explains how to add another later', async () => {
+ const {enrollBlind} = await import('../app.mjs');
+ const state = {enrollmentError:null};
+ const request = async () => {
+  const error = new Error('A maximum of two simulators can be enrolled at a time.');
+  error.status = 409;
+  error.code = 'simulator_limit_reached';
+  throw error;
+ };
+
+ assert.equal(await enrollBlind(state, request, async () => {}, 'simulator-3', 'Simulator 3'), false);
+ assert.match(state.enrollmentError, /You can add up to two simulators/);
+ assert.match(state.enrollmentError, /Remove one from your managed blinds before adding another/);
+});
+
 test('removing an enrollment sends DELETE, clears local device state, and refreshes', async () => {
  const {removeEnrolledBlind} = await import('../app.mjs');
  const id = 'managed/a b';
