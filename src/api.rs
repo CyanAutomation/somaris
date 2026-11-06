@@ -1309,6 +1309,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/panel.css", get(ui_panel_style))
         .route("/ui/app.mjs", get(ui_app))
         .route("/ui/components.mjs", get(ui_components))
+        .route("/ui/snackbar.mjs", get(ui_snackbar))
         .route("/ui/favicon.svg", get(ui_favicon_svg))
         .route("/ui/favicon-32x32.png", get(ui_favicon_png))
         .route("/ui/apple-touch-icon.png", get(ui_apple_touch_icon))
@@ -1425,6 +1426,13 @@ async fn ui_components() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../ui/components.mjs"),
+    )
+}
+
+async fn ui_snackbar() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/snackbar.mjs"),
     )
 }
 

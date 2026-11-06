@@ -18,6 +18,8 @@ import {
   renderDeviceList,
   renderBatchControls,
   renderBatchFeedback,
+  renderSnackbar,
+  renderSnackbarRegion,
   renderTopbarActions,
   renderHomeSupportingSections,
   renderInfoGrid,
@@ -278,18 +280,36 @@ test('batch feedback distinguishes progress, acknowledgements, failures, and ski
   assert.match(running, /Back room/);
   assert.match(running, /stale/i);
 
-  const partial = renderBatchFeedback({
-    action:'close', status:'partial', target_count:3, acknowledged_count:2,
-    pending_count:0, failed_count:1, skipped_count:0, skipped:[],
-    targets:[{label:'Kitchen',status:'connection_failed'}],
-  });
-  assert.match(partial, /Close commands acknowledged for 2 of 3/);
-  assert.match(partial, /does not confirm movement/i);
-  assert.match(partial, /Kitchen/);
-
   const unknown = renderBatchFeedback({action:'open',status:'outcome_unknown',error:'Network unavailable'});
   assert.match(unknown, /Retry original request/);
   assert.match(unknown, /Network unavailable/);
+  assert.equal(renderBatchFeedback({action:'open',status:'completed',target_count:3,acknowledged_count:3}), '');
+  assert.equal(renderBatchFeedback({action:'open',status:'partial',target_count:3,acknowledged_count:2,failed_count:1}), '');
+  assert.equal(renderBatchFeedback({action:'open',status:'failed',target_count:3,failed_count:3}), '');
+});
+
+test('snackbar primitives escape content, announce by tone, and render an optional action', () => {
+  const markup = renderSnackbar({
+    id:'snack-1', message:'Could not add <Hallway>', tone:'error',
+    action:{label:'Try again', action:'refresh'},
+    details:['Skipped <Kitchen>'],
+  });
+  assert.match(markup, /role="alert"/);
+  assert.match(markup, /aria-live="assertive"/);
+  assert.match(markup, /Could not add &lt;Hallway&gt;/);
+  assert.match(markup, /data-action="refresh"/);
+  assert.match(markup, /aria-label="Dismiss notification"/);
+  assert.match(markup, /Skipped &lt;Kitchen&gt;/);
+  assert.doesNotMatch(markup, /<Hallway>/);
+
+  const region = renderSnackbarRegion([
+    {id:'snack-1',message:'Saved',tone:'success'},
+    {id:'snack-2',message:'Working',tone:'info'},
+  ]);
+  assert.match(region, /id="snackbar-region"/);
+  assert.match(region, /role="status"/);
+  assert.match(region, /Saved/);
+  assert.match(region, /Working/);
 });
 
 test('topbar composes the plus-only add action beside display and refresh controls', () => {

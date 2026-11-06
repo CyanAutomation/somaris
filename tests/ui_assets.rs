@@ -12,6 +12,7 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
         ("/ui/app.mjs", "text/javascript", "resolveDisplayMode"),
         ("/ui/style.css", "text/css", ".app-shell"),
         ("/ui/components.mjs", "text/javascript", "blindState"),
+        ("/ui/snackbar.mjs", "text/javascript", "class SnackbarQueue"),
         ("/ui/components.css", "text/css", ".ui-icon"),
         ("/ui/panel.css", "text/css", "card--panel"),
         ("/ui/favicon.svg", "image/svg+xml", "#ff9638"),
