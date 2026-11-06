@@ -469,7 +469,9 @@ export async function enrollBlind(target, request, refreshData, observedDeviceId
     return true;
   } catch (error) {
     await refreshData();
-    target.enrollmentError = `Could not add blind: ${error.message.replace(/[.!?]+$/, "")}. Refresh and check the list before retrying.`;
+    target.enrollmentError = error.code === 'simulator_limit_reached'
+      ? 'Could not add simulator: You can add up to two simulators. Remove one from your managed blinds before adding another.'
+      : `Could not add blind: ${error.message.replace(/[.!?]+$/, "")}. Refresh and check the list before retrying.`;
     return false;
   }
 }
