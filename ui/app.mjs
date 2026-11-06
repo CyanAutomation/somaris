@@ -14,7 +14,10 @@ import {
   renderMotorSpeedControl,
   renderCalibrationControls,
   movementStatusFromPositions,
+  renderSnackbar,
+  renderSnackbarRegion,
 } from './components.mjs';
+import {SnackbarQueue} from './snackbar.mjs';
 
 export {escapeHtml};
 const displayModes = new Set(['auto', 'panel', 'mobile', 'desktop']);
@@ -97,7 +100,10 @@ export function batteryDisplay(battery) {
 }
 const terminal = new Set(['write_acknowledged','connection_failed','write_failed','outcome_unknown','expired','cancelled','deferred']);
 const app = typeof document === 'undefined' ? null : document.querySelector('#app');
-const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, batch:null, serviceError:null, enrollmentError:null, removalError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, actionError:null, busy:new Set(), reconciliationRequired:new Set(), tokens:{}, simulators:null};
+const snackbarRoot = typeof document === 'undefined' ? null : document.querySelector('#snackbar-root');
+let renderSnackbars = () => {};
+const snackbarQueue = new SnackbarQueue({onChange:items => renderSnackbars(items)});
+const state = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, batch:null, serviceError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, busy:new Set(), reconciliationRequired:new Set(), tokens:{}, simulators:null, notify:item=>snackbarQueue.push(item), dismissNotification:key=>snackbarQueue.dismissByKey(key)};
 let displayPreference = storedDisplayPreference();
 const esc = escapeHtml;
 const relative = date => { if (!date) return 'Never seen'; const seconds = Math.max(0, Math.floor((Date.now()-new Date(date).getTime())/1000)); if (!Number.isFinite(seconds)) return 'Time unavailable'; if(seconds < 60) return 'Seen just now'; if(seconds < 3600) return `Seen ${Math.floor(seconds/60)} min ago`; if(seconds < 86400) return `Seen ${Math.floor(seconds/3600)} hr ago`; return `Seen ${Math.floor(seconds/86400)} days ago`; };
@@ -105,7 +111,51 @@ async function api(path, options) { const response = await fetch(path, {cache:'n
 function button(label, action, extra='', disabled=false, icon=null) {
  return renderButton({label, action, variant:extra, disabled, icon});
 }
-function notice(message, dismissAction) { return message ? `<div class="notice" role="alert">${esc(message)}${dismissAction?` <button class="text-button" data-action="${dismissAction}">Dismiss</button>`:''}</div>` : ''; }
+function notifyTarget(target, notification) {
+ if(typeof target?.notify === 'function') target.notify(notification);
+ else { target.notifications ??= []; target.notifications.push(notification); }
+}
+function dismissTargetNotification(target, key) { target?.dismissNotification?.(key); }
+function serviceFailure(target, error) {
+ const message=`Could not refresh Somaris: ${error?.message||String(error)}`;
+ if(target.serviceError!==message){
+  if(target.serviceError)dismissTargetNotification(target,'service-refresh');
+  notifyTarget(target,{key:'service-refresh',message,tone:'error'});
+ }
+ target.serviceError=message;
+}
+function serviceRecovered(target) {
+ const recovered=!!target.serviceError;
+ target.serviceError=null;
+ if(recovered){
+  dismissTargetNotification(target,'service-refresh');
+  notifyTarget(target,{key:'service-restored',message:'The connection to Somaris is back.',tone:'success'});
+ }
+}
+renderSnackbars = items => {
+ if(!snackbarRoot) return;
+ const focused=snackbarRoot.contains(document.activeElement) ? document.activeElement : null;
+ const focusedId=focused?.closest('[data-snackbar-id]')?.dataset.snackbarId;
+ const focusedControl=focused?.dataset.snackbarControl;
+ if(!snackbarRoot.querySelector('#snackbar-region'))snackbarRoot.innerHTML=renderSnackbarRegion([]);
+ const region=snackbarRoot.querySelector('#snackbar-region');
+ const visibleIds=new Set(items.map(item=>item.id));
+ for(const item of [...region.querySelectorAll('[data-snackbar-id]')]){
+  if(!visibleIds.has(item.dataset.snackbarId))item.remove();
+ }
+ for(const item of items){
+  if(region.querySelector(`[data-snackbar-id="${CSS.escape(item.id)}"]`))continue;
+  const template=document.createElement('template');
+  template.innerHTML=renderSnackbar(item);
+  const snackbar=template.content.firstElementChild;
+  if(snackbar)region.append(snackbar);
+ }
+ if(focusedId && focusedControl){
+  const itemSelector=`[data-snackbar-id="${CSS.escape(focusedId)}"] [data-snackbar-control="${CSS.escape(focusedControl)}"]`;
+  snackbarRoot.querySelector(itemSelector)?.focus({preventScroll:true});
+ }
+};
+if(snackbarRoot) renderSnackbars(snackbarQueue.visibleItems);
 export function availability(value) { return ({ready:['Observed recently',''],stale:['Stale','warn'],not_seen:['Not seen','warn'],ambiguous:['Ambiguous','bad']})[value] || ['Unavailable','warn']; }
 const terminalBatchStatuses = new Set(['completed', 'partial', 'failed', 'rejected']);
 export function blindBatchIsLocked(batch) {
@@ -128,12 +178,53 @@ function batchRequestOptions(batch) {
   body:JSON.stringify({action:batch.action}),
  };
 }
+function batchResultNotification(batch) {
+ const data=batch.data||batch;
+ const action=batch.action||data.action;
+ const label=action==='close'?'Close':'Open';
+ const status=batch.status||data.status;
+ const acknowledged=data.acknowledged_count||0;
+ const total=data.target_count||0;
+ const failed=data.failed_count||0;
+ const skippedItems=data.skipped||[];
+ const skipped=skippedItems.length;
+ const failureStatuses=new Set(['connection_failed','deferred','write_failed','outcome_unknown','expired','cancelled']);
+ const failedItems=(data.targets||[]).filter(target=>failureStatuses.has(target.status));
+ const details=[
+  ...skippedItems.map(item=>`Skipped ${item.label||'blind'} · ${(item.availability||'unavailable').replaceAll('_',' ')}`),
+  ...failedItems.map(item=>`${item.label||'Blind'} · ${item.status.replaceAll('_',' ')}`),
+ ];
+ let message='';
+ let tone='success';
+ if(status==='completed'){
+  message=`${label} commands acknowledged for ${acknowledged} of ${total} ready blinds${skipped?`; ${skipped} unavailable`:''}. Acknowledgement does not confirm movement.`;
+  if(skipped)tone='warning';
+ }
+ else if(status==='partial'){
+  message=`${label} commands acknowledged for ${acknowledged} of ${total} ready blinds; ${failed} failed${skipped?`; ${skipped} unavailable`:''}.`;
+  tone='warning';
+ } else if(status==='failed'){
+  message=`No ${label.toLowerCase()} commands were acknowledged; ${failed} failed${skipped?`; ${skipped} unavailable`:''}.`;
+  tone='error';
+ } else if(status==='rejected'){
+  message=`Could not start the ${label.toLowerCase()} batch: ${batch.error||data.error||'The request was rejected.'}`;
+  tone='error';
+ }
+ const visibleDetails=details.slice(0,4);
+ if(details.length>visibleDetails.length)visibleDetails.push(`${details.length-visibleDetails.length} more details`);
+ return message ? {key:`batch:${batch.id||batch.idempotencyKey||'current'}:result`,message,tone,details:visibleDetails} : null;
+}
 function applyBatchResult(target, batch, result, onChange) {
  if(target.batch!==batch) return false;
  batch.id=result.id || batch.id;
  batch.data=result;
  batch.status=result.status;
- batch.error=null;
+ batch.error=result.error||null;
+ const notification=batchResultNotification(batch);
+ if(notification){
+  dismissTargetNotification(target,`batch:${batch.id||batch.idempotencyKey||'current'}:unknown`);
+  notifyTarget(target,notification);
+ }
  onChange();
  return true;
 }
@@ -149,6 +240,12 @@ export async function submitBlindBatch(target, request, action, onChange = () =>
   if(target.batch!==batch) return false;
   batch.error=String(error?.message || error);
   batch.status=Number.isInteger(error?.status) && error.status>=400 && error.status<500 ? 'rejected' : 'outcome_unknown';
+  if(batch.status==='rejected'){
+   const notification=batchResultNotification(batch);
+   if(notification)notifyTarget(target,notification);
+  } else {
+   notifyTarget(target,{key:`batch:${batch.id||batch.idempotencyKey}:unknown`,message:`The ${action} batch result is unknown. Check its status before starting another batch.`,tone:'warning',action:{label:'Check status',action:'batch:check'}});
+  }
   onChange();
   return false;
  }
@@ -156,6 +253,7 @@ export async function submitBlindBatch(target, request, action, onChange = () =>
 export async function checkBlindBatch(target, request, onChange = () => {}) {
  const batch=target.batch;
  if(!batch || terminalBatchStatuses.has(batch.status)) return false;
+ const previousStatus=batch.status;
  batch.status='checking';
  batch.error=null;
  onChange();
@@ -168,6 +266,7 @@ export async function checkBlindBatch(target, request, onChange = () => {}) {
   if(target.batch!==batch) return false;
   batch.status='outcome_unknown';
   batch.error=String(error?.message || error);
+  if(previousStatus!=='outcome_unknown')notifyTarget(target,{key:`batch:${batch.id||batch.idempotencyKey}:unknown`,message:`The ${batch.action} batch result is unknown. Check its status before starting another batch.`,tone:'warning',action:{label:'Check status',action:'batch:check'}});
   onChange();
   return false;
  }
@@ -219,7 +318,9 @@ function card(device) {
  const panelMode=document.documentElement.dataset.displayMode==='panel';
  const cooldownUntil=device.gatt_readiness?.cooldown_until;
  const movementCooldown=!!cooldownUntil && new Date(cooldownUntil).getTime()>Date.now();
- const command=state.commands[e.id]; const [message,msgTone]=command ? commandMessage(command) : ['', ''];
+ const command=state.commands[e.id];
+ const contextualCommand=command&&(!terminal.has(command.status)||['outcome_unknown','write_failed','deferred'].includes(command.status));
+ const [message,msgTone]=contextualCommand ? commandMessage(command) : ['', ''];
  const targetPercent=device.position?.target_closed_percent ?? p ?? 100;
  const lines=Number.isInteger(p) ? Math.max(1, Math.round(p/100*11)) : 0;
  const disabled=!!state.serviceError||device.availability!=='ready';
@@ -274,14 +375,14 @@ function home() {
   activityMarkup:panelMode?'':activityPanel(),
   serviceMarkup:panelMode?'':serviceMarkup,
  });
- return `${hero}${notice(state.serviceError)}${notice(state.actionError,'dismiss-action')}${listMarkup}${supportingSections}`;
+ return `${hero}${listMarkup}${supportingSections}`;
 }
 function scannerSummary(){ const s=state.diagnostics?.scanner; if(!s) return 'Service status unavailable'; return s.adapter_available ? (s.scan_active?'Bluetooth adapter available · scanning':'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
 function back(){ return '<button class="text-button back" data-action="home">← &nbsp; Back to your blinds</button>'; }
-function addPage(){ const available=state.observations.filter(o=>!state.managed.some(m=>m.enrollment.logical_id===o.logical_id && !!m.enrollment.is_simulated===!!o.is_simulated)); return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p>${notice(state.serviceError)}${notice(state.enrollmentError,'dismiss-enrollment')}<div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length?`<div class="stack">${available.map(o=>`<form class="panel device-row" data-enroll="${esc(o.id)}"><div><h3>${esc(o.advertised_name||o.device_name||'Unnamed blind')}</h3><p class="subtle">${o.is_simulated?'Simulator · ':''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field">Display name<input name="label" maxlength="64" required value="${esc(o.advertised_name||o.device_name||'Blind')}"></label></div><button class="button" ${o.freshness!=='fresh'?'disabled':''}>Add blind</button></form>`).join('')}</div>`:`<div class="panel empty"><div class="empty-icon">⌁</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available?'Keep your blind nearby and refresh in a moment.': 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${button('Refresh devices','refresh','secondary')}</div>`}`; }
+function addPage(){ const available=state.observations.filter(o=>!state.managed.some(m=>m.enrollment.logical_id===o.logical_id && !!m.enrollment.is_simulated===!!o.is_simulated)); return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p><div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length?`<div class="stack">${available.map(o=>`<form class="panel device-row" data-enroll="${esc(o.id)}"><div><h3>${esc(o.advertised_name||o.device_name||'Unnamed blind')}</h3><p class="subtle">${o.is_simulated?'Simulator · ':''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field">Display name<input name="label" maxlength="64" required value="${esc(o.advertised_name||o.device_name||'Blind')}"></label></div><button class="button" ${o.freshness!=='fresh'?'disabled':''}>Add blind</button></form>`).join('')}</div>`:`<div class="panel empty"><div class="empty-icon">⌁</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available?'Keep your blind nearby and refresh in a moment.': 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${button('Refresh devices','refresh','secondary')}</div>`}`; }
 function detailPage(id){
  const d=state.managed.find(x=>x.enrollment.id===id);
- if(!d)return `${back()}${notice(state.serviceError)}${notice(state.removalError,'dismiss-removal')}<div class="notice">This blind is no longer enrolled.</div>`;
+ if(!d)return `${back()}<div class="notice">This blind is no longer enrolled.</div>`;
  const o=observationFor(d,state.observations);
  const encodedId=encodeURIComponent(id);
  const fields=[
@@ -317,7 +418,7 @@ function detailPage(id){
  const busy=state.busy.has(id);
  const motorSettings=d.capabilities?.set_motor_speed?renderMotorSpeedControl({deviceId:id,busy,calibrationActive:d.calibration_mode_active===true}):'';
  const calibrationSettings=d.capabilities?.calibrate_endpoints?`<section class="panel device-settings"><h2>Endpoint calibration</h2><p>Calibration changes the blind’s stored open and closed limits. Stay with the blind while adjusting it. Use the small nudges to reach each endpoint, mark both limits, then end calibration.</p>${d.calibration_mode_active?'<p class="message warn" role="status">Calibration mode is active. Watch the blind while nudging it, then mark each endpoint.</p>':''}${renderCalibrationControls({deviceId:id,active:d.calibration_mode_active===true,busy})}</section>`:'';
- return `${back()}${notice(state.serviceError)}${notice(state.removalError,'dismiss-removal')}${notice(state.actionError,'dismiss-action')}<h1 class="page-title">${esc(d.enrollment.label)}</h1><p class="page-intro">The latest observations reported by your blind.</p>${renderInfoGrid(fields)}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>${motorSettings}${calibrationSettings}<section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${confirmationMarkup}</section>`;
+ return `${back()}<h1 class="page-title">${esc(d.enrollment.label)}</h1><p class="page-intro">The latest observations reported by your blind.</p>${renderInfoGrid(fields)}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>${motorSettings}${calibrationSettings}<section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${confirmationMarkup}</section>`;
 }
 function simulatorControls(){
  if(!state.simulators?.length)return '';
@@ -332,7 +433,7 @@ function simulatorControls(){
  }).join('');
  return `<section class="panel" style="margin-top:28px"><p class="eyebrow">Development</p><h2>Simulator controls</h2><p class="subtle">Settings and resets apply only to the selected simulator.</p>${instances}</section>`;
 }
-function servicePage(){ const s=state.diagnostics?.scanner; const fields=[['Service',state.serviceError?'Connection problem':'Connected'],['Bluetooth adapter',s?.adapter_available?'Available':'Unavailable'],['Scanner',s?.status||'Unavailable'],['Advertisements seen',s?.soma_advertisements_seen??'—'],['Last scanner error',s?.last_error_code||'None reported'],['Telemetry history',state.diagnostics?.history_enabled?'Enabled':'Not enabled'],['Simulators',state.simulators?.length??'Unavailable or disabled']].map(([label,value])=>({label,value})); return `${back()}<h1 class="page-title">Service status</h1><p class="page-intro">A closer look at the Somaris service and Bluetooth scanner.</p>${notice(state.serviceError)}${notice(state.actionError,'dismiss-action')}${renderInfoGrid(fields)}${simulatorControls()}`; }
+function servicePage(){ const s=state.diagnostics?.scanner; const fields=[['Service',state.serviceError?'Connection problem':'Connected'],['Bluetooth adapter',s?.adapter_available?'Available':'Unavailable'],['Scanner',s?.status||'Unavailable'],['Advertisements seen',s?.soma_advertisements_seen??'—'],['Last scanner error',s?.last_error_code||'None reported'],['Telemetry history',state.diagnostics?.history_enabled?'Enabled':'Not enabled'],['Simulators',state.simulators?.length??'Unavailable or disabled']].map(([label,value])=>({label,value})); return `${back()}<h1 class="page-title">Service status</h1><p class="page-intro">A closer look at the Somaris service and Bluetooth scanner.</p>${renderInfoGrid(fields)}${simulatorControls()}`; }
 function page(){return location.hash.slice(1)||'home'}
 function render(){
  if(!app)return;
@@ -379,13 +480,12 @@ export async function refreshService(target, request) {
       request('/api/v1/diagnostics'), request('/api/dev/simulators').catch(() => null),
       request('/api/control/v1/audit-log'),
     ]);
-    Object.assign(target, {managed, observations, diagnostics, simulators, activity, serviceError:null});
+    Object.assign(target, {managed, observations, diagnostics, simulators, activity});
+    serviceRecovered(target);
     const released = releaseReconciledCommandLocks(target);
-    if (released && target.actionError?.includes('movement controls remain locked')) {
-      target.actionError = 'A fresh position is now available. Verify it before trying again.';
-    }
+    if (released) notifyTarget(target,{message:'A fresh position is available. Verify it before trying again.',tone:'warning'});
   } catch (error) {
-    target.serviceError = `Could not refresh Somaris: ${error.message}`;
+    serviceFailure(target,error);
   }
 }
 
@@ -440,7 +540,6 @@ export async function handleCommandPollFailure(target, id, token, error, refresh
   target.commands[id] = {...target.commands[id],status:'outcome_unknown'};
   target.reconciliationRequired ??= new Set();
   target.reconciliationRequired.add(id);
-  target.actionError = `Could not check command status: ${reason}. Refreshing the latest position; check it before trying again.`;
   onChange();
   const refreshResult = await refreshData();
   if (target.tokens?.[id] !== token) return false;
@@ -448,37 +547,35 @@ export async function handleCommandPollFailure(target, id, token, error, refresh
   if (refreshResult?.positionFresh === true) {
     target.reconciliationRequired.delete(id);
     target.busy?.delete(id);
-    target.actionError = `Could not check command status: ${reason}. Check the latest reported position before trying again.${errors}`;
+    notifyTarget(target,{key:`command-status:${id}`,message:`Could not check command status: ${reason}. Check the latest reported position before trying again.${errors}`,tone:'warning',action:{label:'Refresh position',action:'refresh'}});
   } else {
-    target.actionError = `Could not check command status: ${reason}. A fresh managed-device position is unavailable; movement controls remain locked. Refresh and verify the position before trying again.${errors}`;
+    notifyTarget(target,{key:`command-status:${id}`,message:`Could not check command status: ${reason}. A fresh managed-device position is unavailable; movement controls remain locked. Refresh and verify the position before trying again.${errors}`,tone:'warning',action:{label:'Refresh position',action:'refresh'}});
   }
   onChange();
   return true;
 }
 
-export function dismissEnrollmentError(target) { target.enrollmentError = null; }
-
 export async function enrollBlind(target, request, refreshData, observedDeviceId, label) {
-  dismissEnrollmentError(target);
   try {
     await request('/api/control/v1/devices', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({observed_device_id:observedDeviceId, label}),
     });
-    await refreshData();
-    return true;
   } catch (error) {
-    await refreshData();
-    target.enrollmentError = error.code === 'simulator_limit_reached'
+    try { await refreshData(); } catch(refreshError) { serviceFailure(target,refreshError); }
+    const message = error.code === 'simulator_limit_reached'
       ? 'Could not add simulator: You can add up to two simulators. Remove one from your managed blinds before adding another.'
       : `Could not add blind: ${error.message.replace(/[.!?]+$/, "")}. Refresh and check the list before retrying.`;
+    notifyTarget(target,{message,tone:'error'});
     return false;
   }
+  try { await refreshData(); } catch(refreshError) { serviceFailure(target,refreshError); }
+  notifyTarget(target,{message:`${label} added.`,tone:'success'});
+  return true;
 }
 
 export async function removeEnrolledBlind(target, request, refreshData, managedDeviceId) {
   if (target.removingEnrollmentId === managedDeviceId) return false;
-  target.removalError = null;
   target.removingEnrollmentId = managedDeviceId;
 
   try {
@@ -487,17 +584,19 @@ export async function removeEnrolledBlind(target, request, refreshData, managedD
     try {
       await refreshData();
     } catch (refreshError) {
-      target.serviceError = `Could not refresh Somaris: ${refreshError.message}`;
+      serviceFailure(target,refreshError);
     }
     const reason = String(error?.message || error).replace(/[.!?]+$/, '');
-    target.removalError = `Could not remove blind: ${reason}. Refresh the list and check the enrollment before retrying.`;
+    notifyTarget(target,{message:`Could not remove blind: ${reason}. Refresh the list and check the enrollment before retrying.`,tone:'error'});
     target.removingEnrollmentId = null;
     return false;
   }
 
+  const removed=target.managed?.find(device=>device.enrollment.id===managedDeviceId);
   if (Array.isArray(target.managed)) {
     target.managed = target.managed.filter(device => device.enrollment.id !== managedDeviceId);
   }
+  notifyTarget(target,{message:`${removed?.enrollment.label||'Blind'} removed.`,tone:'success'});
   if (target.commands) delete target.commands[managedDeviceId];
   target.busy?.delete(managedDeviceId);
   if (target.tokens) delete target.tokens[managedDeviceId];
@@ -507,14 +606,56 @@ export async function removeEnrolledBlind(target, request, refreshData, managedD
   try {
     await refreshData();
   } catch (error) {
-    target.serviceError = `Could not refresh Somaris: ${error.message}`;
+    serviceFailure(target,error);
   }
   return true;
 }
 
 async function refresh(quiet=false){ await refreshService(state,api); if(!quiet || !app?.querySelector('input:focus, select:focus')) render(); }
-async function sendCommand(id,action,positionClosedPercent,motorSpeedPercent){ if((state.busy.has(id)||state.reconciliationRequired.has(id)||blindBatchIsLocked(state.batch)) && action!=='stop') return; const token=Symbol(); state.busy.add(id); state.actionError=null; state.tokens[id]=token; state.commands[id]={status:'queued'}; render(); try { const key=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`; const body=action==='set_position'?{action,position_closed_percent:positionClosedPercent}:action==='set_motor_speed'?{action,motor_speed_percent:motorSpeedPercent}:{action}; const command=await api(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify(body)}); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); pollCommand(id,command.id,token); } catch(e) { if(state.tokens[id]!==token)return; state.commands[id]={status:'outcome_unknown'}; state.actionError=`Command request failed: ${e.message}. Its outcome may be unknown; check telemetry before trying again.`; if(!state.reconciliationRequired.has(id))state.busy.delete(id); render(); } }
-async function pollCommand(id,commandId,token){ try { const command=await api(`/api/control/v1/commands/${encodeURIComponent(commandId)}`); if(state.tokens[id]!==token)return; state.commands[id]=command; render(); if(!terminal.has(command.status)){ setTimeout(()=>pollCommand(id,commandId,token),1500); return; } if(!state.reconciliationRequired.has(id))state.busy.delete(id); await refresh(true); } catch(e){ await handleCommandPollFailure(state,id,token,e,()=>refreshCommandTelemetry(state,api,id),render); } }
+function notifyCommandResult(id,command){
+ const [message]=commandMessage(command);
+ const label=state.managed.find(device=>device.enrollment.id===id)?.enrollment.label;
+ const tone=command.status==='write_acknowledged'?'success':['connection_failed','expired'].includes(command.status)?'error':'warning';
+ const notification={key:`command:${command.id||id}:${command.status}`,message:label?`${label}: ${message}`:message,tone};
+ if(['outcome_unknown','write_failed'].includes(command.status))notification.action={label:'Refresh position',action:'refresh'};
+ snackbarQueue.push(notification);
+}
+async function sendCommand(id,action,positionClosedPercent,motorSpeedPercent){
+ if((state.busy.has(id)||state.reconciliationRequired.has(id)||blindBatchIsLocked(state.batch)) && action!=='stop')return;
+ const token=Symbol();
+ state.busy.add(id);
+ state.tokens[id]=token;
+ state.commands[id]={status:'queued'};
+ render();
+ try{
+  const key=globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const body=action==='set_position'?{action,position_closed_percent:positionClosedPercent}:action==='set_motor_speed'?{action,motor_speed_percent:motorSpeedPercent}:{action};
+  const command=await api(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify(body)});
+  if(state.tokens[id]!==token)return;
+  state.commands[id]=command;
+  render();
+  pollCommand(id,command.id,token);
+ }catch(error){
+  if(state.tokens[id]!==token)return;
+  state.commands[id]={status:'outcome_unknown'};
+  snackbarQueue.push({key:`command-request:${id}`,message:`Command request failed: ${error.message}. Its outcome may be unknown; check telemetry before trying again.`,tone:'warning',action:{label:'Refresh position',action:'refresh'}});
+  if(!state.reconciliationRequired.has(id))state.busy.delete(id);
+  render();
+ }
+}
+async function pollCommand(id,commandId,token){
+ try{
+  const command=await api(`/api/control/v1/commands/${encodeURIComponent(commandId)}`);
+  if(state.tokens[id]!==token)return;
+  state.commands[id]=command;
+  render();
+  if(!terminal.has(command.status)){setTimeout(()=>pollCommand(id,commandId,token),1500);return;}
+  if(['outcome_unknown','write_failed'].includes(command.status))state.reconciliationRequired.add(id);
+  if(!state.reconciliationRequired.has(id))state.busy.delete(id);
+  notifyCommandResult(id,command);
+  await refresh(true);
+ }catch(error){await handleCommandPollFailure(state,id,token,error,()=>refreshCommandTelemetry(state,api,id),render);}
+}
 function pollBlindBatch(batch) {
  setTimeout(async()=>{
   if(state.batch!==batch || !batch.id || !blindBatchIsLocked(batch))return;
@@ -539,7 +680,7 @@ async function retryBlindBatchCheck() {
  if(blindBatchIsLocked(batch) && batch.id)pollBlindBatch(batch);
  else if(!blindBatchIsLocked(batch))await refresh();
 }
-async function simulatorReset(id){state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_closed_percent:100})}); await refresh();}catch(error){state.actionError=`Simulator reset failed: ${error.message}`; render();}}
+async function simulatorReset(id){try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_closed_percent:100})});await refresh();snackbarQueue.push({message:'Simulator reset.',tone:'success'});}catch(error){snackbarQueue.push({message:`Simulator reset failed: ${error.message}`,tone:'error'});render();}}
 async function confirmEnrollmentRemoval(id){
  if(state.removingEnrollmentId===id)return;
  const removal=removeEnrolledBlind(state,api,()=>refreshService(state,api),id);
@@ -570,6 +711,7 @@ if(app){
   if(!target)return;
   const [action,arg,id]=target.dataset.action.split(':');
   const managedDeviceId=arg ? decodeURIComponent(arg) : '';
+  if(action==='snackbar-dismiss'){snackbarQueue.dismiss(managedDeviceId);return;}
   if(action==='command')sendCommand(id,arg);
   else if(action==='batch'){if(arg==='check')retryBlindBatchCheck();else startBlindBatch(arg);}
   else if(action==='position' && document.documentElement.dataset.displayMode!=='panel'){
@@ -580,11 +722,9 @@ if(app){
   else if(action==='details')location.hash=`details/${encodeURIComponent(arg)}`;
   else if(action==='refresh')refresh();
   else if(action==='sim-reset')simulatorReset(arg);
-  else if(action==='dismiss-enrollment'){dismissEnrollmentError(state);render();}
   else if(action==='remove'){
    state.confirmingRemovalId=managedDeviceId;
    state.pendingRemovalFocusId=managedDeviceId;
-   state.removalError=null;
    render();
   }
   else if(action==='remove-confirm')confirmEnrollmentRemoval(managedDeviceId);
@@ -592,13 +732,26 @@ if(app){
    if(state.removingEnrollmentId!==managedDeviceId){
     state.confirmingRemovalId=null;
     state.pendingRemovalFocusId=null;
-    state.removalError=null;
     render();
    }
   }
-  else if(action==='dismiss-removal'){state.removalError=null;render();}
-  else if(action==='dismiss-action'){state.actionError=null;render();}
   else location.hash=action;
+ });
+ snackbarRoot?.addEventListener('pointerover',event=>{
+  const item=event.target.closest('[data-snackbar-id]');
+  if(item&&!item.contains(event.relatedTarget))snackbarQueue.pause(item.dataset.snackbarId,'pointer');
+ });
+ snackbarRoot?.addEventListener('pointerout',event=>{
+  const item=event.target.closest('[data-snackbar-id]');
+  if(item&&!item.contains(event.relatedTarget))snackbarQueue.resume(item.dataset.snackbarId,'pointer');
+ });
+ snackbarRoot?.addEventListener('focusin',event=>{
+  const item=event.target.closest('[data-snackbar-id]');
+  if(item)snackbarQueue.pause(item.dataset.snackbarId,'focus');
+ });
+ snackbarRoot?.addEventListener('focusout',event=>{
+  const item=event.target.closest('[data-snackbar-id]');
+  if(item&&!item.contains(event.relatedTarget))snackbarQueue.resume(item.dataset.snackbarId,'focus');
  });
  actionRoot.addEventListener('input',e=>{
   const input=e.target.closest('[data-position-input]');
@@ -606,6 +759,6 @@ if(app){
   const output=app.querySelector(`[data-position-output="${CSS.escape(input.dataset.positionInput)}"]`);
   if(output)output.value=`${input.value}%`;
  });
- app.addEventListener('submit',async e=>{ if(e.target.matches('[data-simulator]')){e.preventDefault(); const values=Object.fromEntries(new FormData(e.target)); const id=e.target.dataset.simulator; state.actionError=null; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/scenario`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)}); await refresh();}catch(error){state.actionError=`Simulator settings could not be saved: ${error.message}`; render();} return;} const speedForm=e.target.closest('[data-motor-speed]'); if(speedForm){e.preventDefault();const id=speedForm.dataset.motorSpeed;const speed=Number(new FormData(speedForm).get('motor_speed_percent'));if(Number.isInteger(speed)&&speed>=0&&speed<=100)sendCommand(id,'set_motor_speed',undefined,speed);return;} const form=e.target.closest('[data-enroll]'); if(!form)return; e.preventDefault(); const b=form.querySelector('button'); b.disabled=true; const id=form.dataset.enroll, label=new FormData(form).get('label').trim(); const added=await enrollBlind(state,api,()=>refreshService(state,api),id,label); if(added) location.hash='home'; render();});
+ app.addEventListener('submit',async e=>{ if(e.target.matches('[data-simulator]')){e.preventDefault(); const values=Object.fromEntries(new FormData(e.target)); const id=e.target.dataset.simulator; try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/scenario`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)}); await refresh(); snackbarQueue.push({message:'Simulator settings saved.',tone:'success'});}catch(error){snackbarQueue.push({message:`Simulator settings could not be saved: ${error.message}`,tone:'error'}); render();} return;} const speedForm=e.target.closest('[data-motor-speed]'); if(speedForm){e.preventDefault();const id=speedForm.dataset.motorSpeed;const speed=Number(new FormData(speedForm).get('motor_speed_percent'));if(Number.isInteger(speed)&&speed>=0&&speed<=100)sendCommand(id,'set_motor_speed',undefined,speed);return;} const form=e.target.closest('[data-enroll]'); if(!form)return; e.preventDefault(); const b=form.querySelector('button'); b.disabled=true; const id=form.dataset.enroll, label=new FormData(form).get('label').trim(); const added=await enrollBlind(state,api,()=>refreshService(state,api),id,label); if(added) location.hash='home'; render();});
  refresh(); setInterval(()=>refresh(true),5000);
 }
