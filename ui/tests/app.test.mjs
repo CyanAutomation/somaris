@@ -49,15 +49,29 @@ test('all-blinds batch submission is idempotent and a failed request stays locke
 
 test('batch polling preserves an unknown outcome for a known batch ID and updates terminal results', async () => {
  const {checkBlindBatch} = await import('../app.mjs');
- const state = {batch:{id:'batch-9', action:'close', status:'running', data:{status:'running'}}};
+ const state = {batch:{id:'batch-9', action:'close', status:'running', data:{status:'running'}}, notifications:[], notify(item){this.notifications.push(item);}};
  let refreshPath = '';
  assert.equal(await checkBlindBatch(state, async path => { refreshPath = path; throw new Error('Temporary failure'); }, () => {}), false);
  assert.equal(refreshPath, '/api/control/v1/batches/batch-9');
  assert.equal(state.batch.status, 'outcome_unknown');
  assert.match(state.batch.error, /Temporary failure/);
- assert.equal(await checkBlindBatch(state, async path => ({id:'batch-9', action:'close', status:'partial', target_count:2, acknowledged_count:1, failed_count:1, pending_count:0, skipped_count:0, skipped:[], targets:[]}), () => {}), true);
+ assert.equal(await checkBlindBatch(state, async path => ({id:'batch-9', action:'close', status:'partial', target_count:2, acknowledged_count:1, failed_count:1, pending_count:0, skipped_count:1, skipped:[{label:'Guest room',availability:'stale'}], targets:[{label:'Kitchen',status:'connection_failed'}]}), () => {}), true);
  assert.equal(state.batch.status, 'partial');
  assert.equal(state.batch.data.acknowledged_count, 1);
+ assert.equal(state.notifications.at(-1).tone, 'warning');
+ assert.match(state.notifications.at(-1).message, /1 of 2/);
+ assert.match(state.notifications.at(-1).details.join(' '), /Guest room.*stale.*Kitchen.*connection failed/);
+});
+
+test('batch progress stays contextual while a terminal batch result becomes a snackbar', async () => {
+ const {submitBlindBatch} = await import('../app.mjs');
+ const notifications = [];
+ const state = {batch:null, notify:item=>notifications.push(item)};
+ const result = {id:'batch-done',action:'open',status:'completed',target_count:3,acknowledged_count:3,failed_count:0,pending_count:0,skipped_count:0,skipped:[],targets:[]};
+ assert.equal(await submitBlindBatch(state,async()=>result,'open'),true);
+ assert.equal(notifications.length,1);
+ assert.equal(notifications[0].tone,'success');
+ assert.match(notifications[0].message,/3 of 3/);
 });
 
 test('display preference query pins a mode and otherwise uses the saved choice',()=>{
@@ -103,7 +117,8 @@ test('command poll failure refreshes position before movement controls unlock', 
   tokens:{[id]:token},
   managed:[{enrollment:{id},position:{current_closed_percent:100}}],
   observations:[{id:'old-observation'}],
-  actionError:null,
+  notifications:[],
+  notify(item){this.notifications.push(item);},
   serviceError:'Could not refresh diagnostics.',
   reconciliationRequired:new Set(),
  };
@@ -136,8 +151,9 @@ test('command poll failure refreshes position before movement controls unlock', 
  assert.equal(state.observations[0].id,'fresh-observation');
  assert.equal(state.busy.has(id),false);
  assert.equal(state.reconciliationRequired.has(id),false);
- assert.match(state.actionError,/Could not check command status/);
- assert.match(state.actionError,/latest reported position/);
+ assert.match(state.notifications.at(-1).message,/Could not check command status/);
+ assert.match(state.notifications.at(-1).message,/latest reported position/);
+ assert.equal(state.notifications.at(-1).tone,'warning');
  assert.equal(state.serviceError,'Could not refresh diagnostics.');
 });
 
@@ -150,7 +166,8 @@ test('failed managed-position refresh keeps movement locked until a later fresh 
   tokens:{[id]:token},
   managed:[{enrollment:{id},availability:'stale',position:{current_closed_percent:100},position_freshness:'stale',position_observed_at:'2026-11-05T22:39:00.000Z'}],
   observations:[{id:'old-observation'}],
-  actionError:null,
+  notifications:[],
+  notify(item){this.notifications.push(item);},
   serviceError:'Unrelated service error.',
   reconciliationRequired:new Set(),
  };
@@ -167,7 +184,7 @@ test('failed managed-position refresh keeps movement locked until a later fresh 
  assert.equal(state.managed[0].position.current_closed_percent,100);
  assert.equal(state.observations[0].id,'new-observation');
  assert.equal(state.serviceError,'Unrelated service error.');
- assert.match(state.actionError,/movement controls remain locked/);
+ assert.match(state.notifications.at(-1).message,/movement controls remain locked/);
 
  const fullRefresh=async path=>{
   if(path==='/api/control/v1/devices')return [{enrollment:{id},availability:'ready',position:{current_closed_percent:95},position_freshness:'fresh',position_observed_at:'2026-11-05T22:40:01.000Z'}];
@@ -182,7 +199,7 @@ test('failed managed-position refresh keeps movement locked until a later fresh 
  assert.equal(state.reconciliationRequired.has(id),false);
  assert.equal(state.busy.has(id),false);
  assert.equal(state.managed[0].position.current_closed_percent,95);
- assert.match(state.actionError,/A fresh position is now available/);
+ assert.equal(state.notifications.at(-1).message,'A fresh position is available. Verify it before trying again.');
 });
 
 test('fresh pre-command observation does not unlock an uncertain movement', async()=>{
@@ -194,7 +211,8 @@ test('fresh pre-command observation does not unlock an uncertain movement', asyn
   tokens:{[id]:token},
   managed:[],
   observations:[],
-  actionError:null,
+  notifications:[],
+  notify(item){this.notifications.push(item);},
   serviceError:null,
   reconciliationRequired:new Set(),
  };
@@ -206,7 +224,7 @@ test('fresh pre-command observation does not unlock an uncertain movement', asyn
 
  assert.equal(state.busy.has(id),true);
  assert.equal(state.reconciliationRequired.has(id),true);
- assert.match(state.actionError,/fresh managed-device position is unavailable/);
+ assert.match(state.notifications.at(-1).message,/fresh managed-device position is unavailable/);
 });
 
 test('stale command poll failure cannot clear a newer command state', async()=>{
@@ -217,7 +235,8 @@ test('stale command poll failure cannot clear a newer command state', async()=>{
   commands:{[id]:{status:'queued'}},
   busy:new Set([id]),
   tokens:{[id]:token},
-  actionError:null,
+  notifications:[],
+  notify(item){this.notifications.push(item);},
  };
 
  const handled=await handleCommandPollFailure(state,id,Symbol('old command'),new Error('Not found.'),async()=>{refreshed=true;});
@@ -226,7 +245,7 @@ test('stale command poll failure cannot clear a newer command state', async()=>{
  assert.equal(refreshed,false);
  assert.equal(state.commands[id].status,'queued');
  assert.equal(state.busy.has(id),true);
- assert.equal(state.actionError,null);
+ assert.equal(state.notifications.length,0);
 });
 test('fresh observations are not presented as GATT command readiness',()=>{
  assert.equal(availability('ready')[0], 'Observed recently');
@@ -283,34 +302,43 @@ test('service refresh loads recent activity and activity descriptions stay reada
  assert.equal(activityMessage({kind:'enrollment_removed', subject:'Study blind'}), 'Removed Study blind');
 });
 
-test('enrollment errors survive successful and failed service refreshes until retry or dismissal', async () => {
- const {enrollBlind, refreshService, dismissEnrollmentError} = await import('../app.mjs');
- const state = {enrollmentError:null, serviceError:null};
- let failRefresh = false;
+test('service refresh errors notify once per outage and announce recovery', async () => {
+ const {refreshService} = await import('../app.mjs');
+ const notices = [];
+ const dismissed = [];
+ const state = {notify:item=>notices.push(item),dismissNotification:key=>dismissed.push(key)};
+ const failed = async () => { throw new Error('Network unavailable'); };
+ await refreshService(state, failed);
+ await refreshService(state, failed);
+ assert.equal(notices.length,1);
+ assert.match(notices[0].message,/Network unavailable/);
+ assert.equal(notices[0].key,'service-refresh');
+
+ const recovered = async path => path.endsWith('/diagnostics') ? {scanner:{adapter_available:true}} : [];
+ await refreshService(state, recovered);
+ assert.deepEqual(dismissed,['service-refresh']);
+ assert.equal(notices.length,2);
+ assert.equal(notices[1].tone,'success');
+ assert.match(notices[1].message,/connection to Somaris is back/i);
+});
+
+test('enrollment errors notify in context and successful enrollment reports completion', async () => {
+ const {enrollBlind} = await import('../app.mjs');
+ const notices = [];
+ const state = {notify:item=>notices.push(item)};
  const request = async (path, options) => {
   if (options?.method === 'POST') throw new Error('Device is no longer fresh');
-  if (failRefresh) throw new Error('Network unavailable');
-  return path.endsWith('/diagnostics') ? {scanner:{adapter_available:true}} : [];
+  return {};
  };
- const refresh = () => refreshService(state, request);
+ const refresh = async () => {};
  assert.equal(await enrollBlind(state, request, refresh, 'blind-1', 'Hallway'), false);
- assert.match(state.enrollmentError, /Device is no longer fresh/);
- assert.equal(state.serviceError, null);
- await refresh();
- assert.match(state.enrollmentError, /Device is no longer fresh/);
- failRefresh = true;
- await refresh();
- assert.match(state.serviceError, /Network unavailable/);
- assert.match(state.enrollmentError, /Device is no longer fresh/);
- dismissEnrollmentError(state);
- assert.equal(state.enrollmentError, null);
- assert.match(state.serviceError, /Network unavailable/);
- failRefresh = false;
  const successfulRequest = async (path, options) => options?.method === 'POST' ? {} : request(path, options);
- state.enrollmentError = 'previous failure';
  assert.equal(await enrollBlind(state, successfulRequest, refresh, 'blind-1', 'Hallway'), true);
- assert.equal(state.enrollmentError, null);
- assert.equal(state.serviceError, null);
+ assert.equal(notices.length,2);
+ assert.equal(notices[0].tone,'error');
+ assert.match(notices[0].message,/Device is no longer fresh/);
+ assert.equal(notices[1].tone,'success');
+ assert.match(notices[1].message,/Hallway.*added/i);
 });
 
 test('battery display shows estimated percentage and retains cached and unavailable states', async () => {
@@ -328,7 +356,8 @@ test('battery display shows estimated percentage and retains cached and unavaila
 
 test('simulator enrollment limit explains how to add another later', async () => {
  const {enrollBlind} = await import('../app.mjs');
- const state = {enrollmentError:null};
+ const notices = [];
+ const state = {notify:item=>notices.push(item)};
  const request = async () => {
   const error = new Error('A maximum of two simulators can be enrolled at a time.');
   error.status = 409;
@@ -337,19 +366,21 @@ test('simulator enrollment limit explains how to add another later', async () =>
  };
 
  assert.equal(await enrollBlind(state, request, async () => {}, 'simulator-3', 'Simulator 3'), false);
- assert.match(state.enrollmentError, /You can add up to two simulators/);
- assert.match(state.enrollmentError, /Remove one from your managed blinds before adding another/);
+ assert.match(notices[0].message, /You can add up to two simulators/);
+ assert.match(notices[0].message, /Remove one from your managed blinds before adding another/);
 });
 
 test('removing an enrollment sends DELETE, clears local device state, and refreshes', async () => {
  const {removeEnrolledBlind} = await import('../app.mjs');
  const id = 'managed/a b';
  const token = Symbol('command');
+ const notices=[];
  const state = {
   managed:[{enrollment:{id}},{enrollment:{id:'other'}}],
   commands:{[id]:{status:'write_acknowledged'}},
   busy:new Set([id]), tokens:{[id]:token},
-  confirmingRemovalId:id, removalError:'old error',
+  confirmingRemovalId:id,
+  notify:item=>notices.push(item),
  };
  const calls = [];
  let refreshes = 0;
@@ -364,20 +395,24 @@ test('removing an enrollment sends DELETE, clears local device state, and refres
  assert.equal(state.tokens[id], undefined);
  assert.equal(state.confirmingRemovalId, null);
  assert.equal(state.removingEnrollmentId, null);
- assert.equal(state.removalError, null);
+ assert.equal(notices.length,1);
+ assert.equal(notices[0].tone,'success');
+ assert.match(notices[0].message,/removed/i);
  assert.equal(refreshes, 1);
 });
 
 test('removal failures remain visible and keep the confirmation available for retry', async () => {
  const {removeEnrolledBlind} = await import('../app.mjs');
  const id = 'managed-1';
- const state = {managed:[{enrollment:{id}}], confirmingRemovalId:id, removalError:null};
+ const notices = [];
+ const state = {managed:[{enrollment:{id}}], confirmingRemovalId:id, notify:item=>notices.push(item)};
  let refreshes = 0;
  const request = async () => { throw new Error('The enrollment has queued or running commands.'); };
 
  assert.equal(await removeEnrolledBlind(state, request, async () => { refreshes += 1; }, id), false);
- assert.match(state.removalError, /queued or running commands/);
- assert.match(state.removalError, /refresh/i);
+ assert.match(notices[0].message, /queued or running commands/);
+ assert.match(notices[0].message, /refresh/i);
+ assert.equal(notices[0].tone,'error');
  assert.equal(state.managed.length, 1);
  assert.equal(state.confirmingRemovalId, id);
  assert.equal(state.removingEnrollmentId, null);

@@ -201,6 +201,7 @@ export function renderBatchFeedback(batch) {
   const action = batch.action || data.action;
   const actionLabel = action === 'close' ? 'Close' : 'Open';
   const status = batch.status || data.status;
+  if (['completed', 'partial', 'failed', 'rejected'].includes(status)) return '';
   let message = '';
   let tone = '';
 
@@ -209,9 +210,6 @@ export function renderBatchFeedback(batch) {
   else if (status === 'outcome_unknown') {
     message = `The ${actionLabel.toLowerCase()} batch result is unknown. Check its status before starting another batch.`;
     tone = 'warn';
-  } else if (status === 'rejected') {
-    message = `Could not start the ${actionLabel.toLowerCase()} batch: ${batch.error || 'The request was rejected.'}`;
-    tone = 'bad';
   } else if (status === 'queued') {
     message = `${actionLabel} batch queued for ${data.target_count || 0} ready blinds.`;
   } else if (status === 'running') {
@@ -222,14 +220,6 @@ export function renderBatchFeedback(batch) {
     const movement = action === 'close' ? 'Closing' : 'Opening';
     const failed = failedCount ? `${failedCount} failed, ` : '';
     message = `${movement} blinds: commands acknowledged for ${acknowledged} of ${total} ready blinds; ${failed}${pending} pending.`;
-  } else if (status === 'completed') {
-    message = `${actionLabel} commands acknowledged for ${data.acknowledged_count || 0} of ${data.target_count || 0} ready blinds. Acknowledgement does not confirm movement.`;
-  } else if (status === 'partial') {
-    message = `${actionLabel} commands acknowledged for ${data.acknowledged_count || 0} of ${data.target_count || 0} ready blinds; ${data.failed_count || 0} failed. Acknowledgement does not confirm movement.`;
-    tone = 'warn';
-  } else if (status === 'failed') {
-    message = `No ${actionLabel.toLowerCase()} commands were acknowledged; ${data.failed_count || 0} failed.`;
-    tone = 'bad';
   } else {
     return '';
   }
@@ -247,8 +237,24 @@ export function renderBatchFeedback(batch) {
   const errorDetail = status === 'outcome_unknown' && batch.error
     ? `<span class="subtle">${escapeHtml(batch.error)}</span>`
     : '';
-  const liveMode = tone === 'bad' ? 'assertive' : 'polite';
-  return `<div class="batch-feedback${tone ? ` batch-feedback--${tone}` : ''}" role="${tone === 'bad' ? 'alert' : 'status'}" aria-live="${liveMode}"><p>${escapeHtml(message)}</p>${errorDetail}${skipped}${failed}${retry}</div>`;
+  return `<div class="batch-feedback${tone ? ` batch-feedback--${tone}` : ''}" role="status" aria-live="polite"><p>${escapeHtml(message)}</p>${errorDetail}${skipped}${failed}${retry}</div>`;
+}
+
+export function renderSnackbar({id, message, tone = 'info', action = null, details = []} = {}) {
+  if (typeof message !== 'string' || !message.trim()) return '';
+  const safeTone = ['info', 'success', 'warning', 'error'].includes(tone) ? tone : 'info';
+  const isError = safeTone === 'error';
+  const actionMarkup = action && typeof action.label === 'string' && typeof action.action === 'string'
+    ? `<button type="button" class="snackbar-action" data-snackbar-control="action" data-action="${escapeHtml(action.action)}">${escapeHtml(action.label)}</button>`
+    : '';
+  const detailItems=Array.isArray(details)&&details.length
+    ? `<ul class="snackbar-details">${details.map(detail=>`<li>${escapeHtml(detail)}</li>`).join('')}</ul>`
+    : '';
+  return `<article class="snackbar snackbar--${safeTone}" data-snackbar-id="${escapeHtml(id || '')}" role="${isError ? 'alert' : 'status'}" aria-live="${isError ? 'assertive' : 'polite'}" aria-atomic="true"><span class="snackbar-message">${escapeHtml(message)}</span>${detailItems}${actionMarkup}<button type="button" class="snackbar-dismiss" data-snackbar-control="dismiss" data-action="snackbar-dismiss:${escapeHtml(id || '')}" aria-label="Dismiss notification" title="Dismiss">×</button></article>`;
+}
+
+export function renderSnackbarRegion(items = []) {
+  return `<div id="snackbar-region" class="snackbar-region" role="region" aria-label="Notifications">${(items || []).map(renderSnackbar).join('')}</div>`;
 }
 
 export function renderBatchControls({blindCount = 0, eligibleCount = 0, disabled = false, busy = false, panelMode = false, batch = null} = {}) {
