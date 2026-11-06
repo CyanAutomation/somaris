@@ -678,7 +678,7 @@
       "post": {
         "operationId": "enrollManagedDevice",
         "summary": "Enroll one uniquely named fresh Somaris V2 blind for control",
-        "description": "Enrollment stores the advertised name and its opaque logical hash, never the current BLE address. The device name is re-read over GATT before every command. Duplicate active names are rejected. If the file rename succeeds but syncing its directory fails, the API returns 503 with code persistence_outcome_unknown; refresh the device list before retrying.",
+        "description": "Enrollment stores the advertised name and its opaque logical hash, never the current BLE address. The device name is re-read over GATT before every command. Duplicate active names are rejected. At most two simulators may be enrolled at once; a further simulator enrollment returns 409 with code simulator_limit_reached until one is removed. If the file rename succeeds but syncing its directory fails, the API returns 503 with code persistence_outcome_unknown; refresh the device list before retrying.",
         "requestBody": {
           "required": true,
           "content": {
@@ -704,7 +704,8 @@
             "$ref": "#/components/responses/Error"
           },
           "409": {
-            "$ref": "#/components/responses/Error"
+            "$ref": "#/components/responses/Error",
+            "description": "Conflict. Includes duplicate_device, ambiguous_device, or simulator_limit_reached when two simulators are already enrolled."
           },
           "415": {
             "$ref": "#/components/responses/Error"
