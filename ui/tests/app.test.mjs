@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, batchEligibleCount, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, observationFor, refreshCommandTelemetry, refreshService, resolveDisplayMode} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, resolveDisplayMode} from '../app.mjs';
 
 test('automatic display mode distinguishes square panels from phones and desktop windows',()=>{
  assert.equal(resolveDisplayMode('auto', 800, 800), 'panel');
@@ -79,6 +79,14 @@ test('display preference query pins a mode and otherwise uses the saved choice',
  assert.equal(displayPreferenceFrom('?view=unknown', 'mobile'), 'mobile');
  assert.equal(displayPreferenceFrom('', 'panel'), 'panel');
  assert.equal(displayPreferenceFrom('', 'unknown'), 'auto');
+});
+
+test('display mode control cycles through auto, mobile, panel, and desktop',()=>{
+ assert.equal(nextDisplayPreference('auto'), 'mobile');
+ assert.equal(nextDisplayPreference('mobile'), 'panel');
+ assert.equal(nextDisplayPreference('panel'), 'desktop');
+ assert.equal(nextDisplayPreference('desktop'), 'auto');
+ assert.equal(nextDisplayPreference('unknown'), 'auto');
 });
 
 test('explicit display mode overrides automatic viewport selection',()=>{

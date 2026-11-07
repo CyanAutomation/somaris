@@ -8,6 +8,7 @@ import {
   renderConfirmationPanel,
   renderDeviceList,
   renderTopbarActions,
+  DISPLAY_MODE_OPTIONS,
   renderHomeSupportingSections,
   renderBatchControls,
   renderInfoGrid,
@@ -20,7 +21,12 @@ import {
 import {SnackbarQueue} from './snackbar.mjs';
 
 export {escapeHtml};
-const displayModes = new Set(['auto', 'panel', 'mobile', 'desktop']);
+const displayModes = new Set(DISPLAY_MODE_OPTIONS.map(([value]) => value));
+const displayPreferenceCycle = DISPLAY_MODE_OPTIONS.map(([value]) => value);
+export function nextDisplayPreference(preference) {
+  const index = displayPreferenceCycle.indexOf(preference);
+  return displayPreferenceCycle[(index + 1 + displayPreferenceCycle.length) % displayPreferenceCycle.length];
+}
 export function resolveDisplayMode(preference, width, height) {
   if (displayModes.has(preference) && preference !== 'auto') return preference;
   const viewportWidth = Number.isFinite(width) ? Math.max(0, width) : 0;
@@ -340,6 +346,7 @@ function card(device) {
  return renderBlindCard({
   id:e.id, label:e.label, isSimulated:e.is_simulated, lastSeen:relative(device.last_seen_at),
   availabilityLabel:label, availabilityTone:tone,
+  availabilityStatus:device.availability,
   positionPercent:p, movementStatus:o?.movement_status, blindLines:lines,
   controlsMarkup, messageMarkup:`${messageMarkup}${availabilityMessage}${cooldownMessage}${calibrationMessage}`, footerMarkup, panelMode,
  });
@@ -698,12 +705,6 @@ if(app){
  };
  applyDisplayMode();
  render();
- topActions.addEventListener('change', event => {
-  if(event.target.id !== 'display-mode') return;
-  displayPreference = event.target.value;
-  try { globalThis.localStorage?.setItem('somaris-display-mode', displayPreference); } catch { /* The current selection still applies until the page reloads. */ }
-  if (applyDisplayMode()) render();
- });
  window.addEventListener('resize', () => { if (applyDisplayMode()) render(); });
  window.addEventListener('hashchange',render);
  actionRoot.addEventListener('click', e=>{
@@ -712,6 +713,15 @@ if(app){
   const [action,arg,id]=target.dataset.action.split(':');
   const managedDeviceId=arg ? decodeURIComponent(arg) : '';
   if(action==='snackbar-dismiss'){snackbarQueue.dismiss(managedDeviceId);return;}
+  if(action==='display-mode'){
+   displayPreference=nextDisplayPreference(displayPreference);
+   try { globalThis.localStorage?.setItem('somaris-display-mode', displayPreference); } catch { /* The current selection still applies until the page reloads. */ }
+   applyDisplayMode();
+   render();
+   const label=DISPLAY_MODE_OPTIONS.find(([value])=>value===displayPreference)?.[1]||'Auto';
+   snackbarQueue.push({message:`View changed to ${label}.`,tone:'info'});
+   return;
+  }
   if(action==='command')sendCommand(id,arg);
   else if(action==='batch'){if(arg==='check')retryBlindBatchCheck();else startBlindBatch(arg);}
   else if(action==='position' && document.documentElement.dataset.displayMode!=='panel'){
