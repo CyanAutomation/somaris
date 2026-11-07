@@ -452,7 +452,6 @@ function render(){
   const active=topActions.contains(document.activeElement) ? document.activeElement : null;
   const focusId=active?.id || '';
   const focusLabel=active?.getAttribute('aria-label') || '';
-  const menuWasOpen=!!topActions.querySelector('.display-menu')?.open;
   topActions.innerHTML=renderTopbarActions({
    blindCount:state.managed.length,
    panelMode:document.documentElement.dataset.displayMode==='panel',
@@ -460,7 +459,6 @@ function render(){
    serviceLabel:state.serviceError?'Disconnected':!state.diagnostics?'Connecting':state.diagnostics.scanner?.adapter_available?'Connected':'Service degraded',
    serviceTone:state.serviceError?'bad':state.diagnostics?.scanner?.adapter_available?'good':'',
   });
-  if(menuWasOpen) topActions.querySelector('.display-menu').open=true;
   const replacement=focusId ? document.getElementById(focusId) : focusLabel ? [...topActions.querySelectorAll('[aria-label]')].find(el=>el.getAttribute('aria-label')===focusLabel) : null;
   replacement?.focus({preventScroll:true});
  }
