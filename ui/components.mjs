@@ -5,12 +5,25 @@ export const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, chara
 const icons = {
   add:'<path d="M12 5v14M5 12h14"/>',
   display:'<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/>',
+  observed:'<circle cx="12" cy="12" r="8.5"/><path d="m8.5 12 2.3 2.3 4.8-5"/>',
+  stale:'<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3 2"/>',
+  not_seen:'<circle cx="12" cy="12" r="8.5"/><path d="m9 9 6 6m0-6-6 6"/>',
+  ambiguous:'<path d="M12 3.5 22 20H2L12 3.5Z"/><path d="M12 9v5m0 3h.01"/>',
+  unavailable:'<circle cx="12" cy="12" r="8.5"/><path d="M9.8 9a2.3 2.3 0 1 1 3.9 1.7c-1 .8-1.7 1.2-1.7 2.8m0 3h.01"/>',
   refresh:'<path d="M20 11a8 8 0 0 0-14.9-3M4 4v4h4M4 13a8 8 0 0 0 14.9 3M20 20v-4h-4"/>',
   open:'<path d="M12 19V5M5 12l7-7 7 7"/>',
   stop:'<rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"/>',
   close:'<path d="M12 5v14m7-7-7 7-7-7"/>',
   trash:'<path d="M4 7h16M10 11v6m4-6v6M5 7l1 14h12l1-14M9 7V4h6v3"/>',
 };
+const availabilityIcons = {ready:'observed', stale:'stale', not_seen:'not_seen', ambiguous:'ambiguous'};
+
+export const DISPLAY_MODE_OPTIONS = [
+  ['auto', 'Auto'],
+  ['mobile', 'Mobile'],
+  ['panel', 'Panel'],
+  ['desktop', 'Desktop'],
+];
 
 export function iconMarkup(name) {
   const paths = icons[name];
@@ -50,11 +63,27 @@ export function renderBadge({label, tone = ''}) {
   return `<span class="badge${variant}">${escapeHtml(label)}</span>`;
 }
 
-export function renderDeviceCardHeader({id, label, availabilityLabel, availabilityTone = '', isSimulated = false, lastSeen = ''}) {
+export function renderStatusIndicator({label, tone = '', status = 'unavailable'} = {}) {
+  const icon = availabilityIcons[status] || 'unavailable';
+  const toneClass = tone ? ` ${escapeHtml(tone)}` : '';
+  const name = escapeHtml(label || 'Availability unavailable');
+  return `<span class="status-indicator${toneClass}" role="img" aria-label="${name}" title="${name}">${iconMarkup(icon)}</span>`;
+}
+
+export function renderDisplayModeToggle({displayPreference = 'auto'} = {}) {
+  const selectedIndex = DISPLAY_MODE_OPTIONS.findIndex(([value]) => value === displayPreference);
+  const safeIndex = selectedIndex < 0 ? 0 : selectedIndex;
+  const [, currentLabel] = DISPLAY_MODE_OPTIONS[safeIndex];
+  const [, nextLabel] = DISPLAY_MODE_OPTIONS[(safeIndex + 1) % DISPLAY_MODE_OPTIONS.length];
+  const accessibleName = `Display mode: ${currentLabel}. Switch to ${nextLabel}`;
+  return `<button type="button" id="display-mode-toggle" class="icon-button display-mode-button" data-action="display-mode" aria-label="${escapeHtml(accessibleName)}" title="${escapeHtml(accessibleName)}">${iconMarkup('display')}</button>`;
+}
+
+export function renderDeviceCardHeader({id, label, availabilityLabel, availabilityTone = '', availabilityStatus = 'unavailable', isSimulated = false, lastSeen = ''}) {
   const escapedId = escapeHtml(id);
   const escapedLabel = escapeHtml(label);
   const kind = isSimulated ? 'SIMULATED BLIND' : 'YOUR BLIND';
-  return `<div class="card-top device-card-header"><div class="device-card-heading"><div class="subtle">${kind}</div><h3><button type="button" class="card-title" data-action="details:${escapedId}" aria-label="View details for ${escapedLabel}">${escapedLabel}</button></h3><div class="subtle">${escapeHtml(lastSeen)}</div></div>${renderBadge({label:availabilityLabel, tone:availabilityTone})}</div>`;
+  return `<div class="card-top device-card-header"><div class="device-card-heading"><div class="subtle">${kind}</div><h3><button type="button" class="card-title" data-action="details:${escapedId}" aria-label="View details for ${escapedLabel}">${escapedLabel}</button></h3><div class="subtle">${escapeHtml(lastSeen)}</div></div>${renderStatusIndicator({label:availabilityLabel, tone:availabilityTone, status:availabilityStatus})}</div>`;
 }
 
 export function renderButton({
@@ -154,15 +183,13 @@ export function renderTopbarActions({
   serviceLabel = 'Connecting',
   serviceTone = '',
 } = {}) {
-  const modes = [['auto', 'Auto'], ['panel', 'Panel'], ['mobile', 'Mobile'], ['desktop', 'Desktop']];
-  const safePreference = modes.some(([value]) => value === displayPreference) ? displayPreference : 'auto';
   const count = Number.isInteger(blindCount) && blindCount >= 0 ? blindCount : 0;
   const countLabel = `${count} ${count === 1 ? 'blind' : 'blinds'}`;
   const status = `<span id="service-status" class="service-status"><span class="status-dot${serviceTone ? ` ${escapeHtml(serviceTone)}` : ''}"></span> ${escapeHtml(serviceLabel)}</span>`;
   const panelCount = panelMode ? `<span class="topbar-device-count">${escapeHtml(countLabel)}</span>` : '';
-  const displayMenu = `<details class="display-menu"><summary class="icon-button display-mode-button" aria-label="Display mode" title="Display mode">${iconMarkup('display')}</summary><div class="display-popover"><label for="display-mode">Display mode</label><select id="display-mode">${modes.map(([value, label]) => `<option value="${value}"${value === safePreference ? ' selected' : ''}>${label}</option>`).join('')}</select><span class="subtle">Auto adapts to this screen.</span><a class="display-link" href="#service">Service status</a></div></details>`;
+  const displayToggle = renderDisplayModeToggle({displayPreference});
   const refreshButton = renderIconButton({label:'Refresh', action:'refresh', icon:'refresh', variant:'topbar-icon-button'});
-  return `${status}${panelCount}${renderAddBlindButton()}${displayMenu}${refreshButton}`;
+  return `${status}${panelCount}${renderAddBlindButton()}${displayToggle}${refreshButton}`;
 }
 
 export function renderBlindActions({deviceId, blindLabel, panelMode = false, disabled = false, busy = false, movementDisabled = false, supportsPosition = false, positionClosedPercent = 100}) {
@@ -279,6 +306,7 @@ export function renderBlindCard({
   lastSeen,
   availabilityLabel,
   availabilityTone = '',
+  availabilityStatus = 'unavailable',
   positionPercent,
   movementStatus,
   blindLines = 0,
@@ -290,7 +318,7 @@ export function renderBlindCard({
   const slats = '<i></i>'.repeat(Math.max(0, Math.min(11, blindLines)));
   const cardVariant = panelMode ? ' card--panel' : '';
   const displayVariant = panelMode ? ' blind-display--panel' : '';
-  const header = renderDeviceCardHeader({id, label, availabilityLabel, availabilityTone, isSimulated, lastSeen});
+  const header = renderDeviceCardHeader({id, label, availabilityLabel, availabilityTone, availabilityStatus, isSimulated, lastSeen});
   const status = renderBlindStatus({positionPercent, movementStatus, panelMode});
   return `<article class="card${cardVariant}">${header}<div class="blind-display${displayVariant}">${status}<div class="blind-art" aria-hidden="true">${slats}</div></div>${controlsMarkup}${messageMarkup}<div class="card-foot">${footerMarkup}</div></article>`;
 }
