@@ -9,6 +9,7 @@ import {
   renderBlindStatus,
   renderMotorSpeedControl,
   renderBadge,
+  renderStatusIndicator,
   renderDeviceCardHeader,
   renderButton,
   renderIconButton,
@@ -188,12 +189,22 @@ test('shared badge and device-card header primitives keep card markup consistent
 
   const header = renderDeviceCardHeader({
     id:'blind-<1>', label:'Bedroom <Left>', availabilityLabel:'Ready',
-    availabilityTone:'', isSimulated:false, lastSeen:'Seen just now',
+    availabilityTone:'', availabilityStatus:'ready', isSimulated:false, lastSeen:'Seen just now',
   });
   assert.match(header, /class="card-top device-card-header"/);
   assert.match(header, /data-action="details:blind-&lt;1&gt;"/);
   assert.match(header, /aria-label="View details for Bedroom &lt;Left&gt;"/);
-  assert.match(header, /class="badge">Ready<\/span>/);
+  assert.match(header, /class="status-indicator" role="img" aria-label="Ready" title="Ready"/);
+});
+
+test('availability is a compact reusable icon indicator with an accessible status name', () => {
+  const ready = renderStatusIndicator({label:'Observed recently', status:'ready'});
+  assert.match(ready, /class="status-indicator"/);
+  assert.match(ready, /aria-label="Observed recently"/);
+  assert.match(ready, /title="Observed recently"/);
+  assert.match(ready, /data-icon="observed"/);
+  assert.doesNotMatch(ready, />Observed recently</);
+  assert.match(renderStatusIndicator({label:'Stale', tone:'warn', status:'stale'}), /data-icon="stale"/);
 });
 
 test('add-blind action is a plus-only button with an accessible name and tooltip', () => {
@@ -208,7 +219,7 @@ test('add-blind action is a plus-only button with an accessible name and tooltip
 test('device card composes the state, named actions and reusable content areas', () => {
   const card = renderBlindCard({
     id:'blind-1', label:'Bedroom Left', isSimulated:false, lastSeen:'Seen just now',
-    availabilityLabel:'Ready', availabilityTone:'', positionPercent:100,
+    availabilityLabel:'Ready', availabilityTone:'', availabilityStatus:'ready', positionPercent:100,
     movementStatus:'opening', blindLines:11,
     controlsMarkup:renderBlindActions({deviceId:'blind-1', blindLabel:'Bedroom Left', panelMode:true, disabled:false}),
     messageMarkup:'', footerMarkup:'', panelMode:true,
@@ -223,12 +234,12 @@ test('device card composes the state, named actions and reusable content areas',
 
 test('regular device cards keep the shared components without panel-only variants', () => {
   const card = renderBlindCard({
-    id:'blind-2', label:'Study', availabilityLabel:'Ready', positionPercent:25,
+    id:'blind-2', label:'Study', availabilityLabel:'Ready', availabilityStatus:'ready', positionPercent:25,
     movementStatus:'at_target', controlsMarkup:'<div class="controls"></div>',
   });
   assert.match(card, /<article class="card">/);
   assert.doesNotMatch(card, /card--panel|blind-state--panel/);
-  assert.match(card, /class="badge">Ready<\/span>/);
+  assert.match(card, /class="status-indicator" role="img" aria-label="Ready"/);
 });
 
 test('panel device list omits its heading because panel count and add action live in the topbar', () => {
@@ -312,17 +323,20 @@ test('snackbar primitives escape content, announce by tone, and render an option
   assert.match(region, /Working/);
 });
 
-test('topbar composes the plus-only add action beside display and refresh controls', () => {
+test('topbar composes the plus-only add action beside a named mode toggle and refresh controls', () => {
   const panel = renderTopbarActions({blindCount:3, panelMode:true, displayPreference:'panel'});
   assert.match(panel, /class="topbar-device-count">3 blinds<\/span>/);
   assert.match(panel, /data-action="add"[^>]*aria-label="Add a blind"/);
   assert.match(panel, /data-icon="add"/);
-  assert.match(panel, /aria-label="Display mode"/);
+  assert.match(panel, /id="display-mode-toggle"/);
+  assert.match(panel, /aria-label="Display mode: Panel\. Switch to Desktop"/);
+  assert.match(panel, /data-action="display-mode"/);
   assert.match(panel, /data-icon="display"/);
+  assert.doesNotMatch(panel, /<select|<details class="display-menu"/);
   assert.match(panel, /data-action="refresh"[^>]*aria-label="Refresh"/);
   assert.match(panel, /data-icon="refresh"/);
-  assert.ok(panel.indexOf('data-action="add"') < panel.indexOf('aria-label="Display mode"'));
-  assert.ok(panel.indexOf('aria-label="Display mode"') < panel.indexOf('data-action="refresh"'));
+  assert.ok(panel.indexOf('data-action="add"') < panel.indexOf('data-action="display-mode"'));
+  assert.ok(panel.indexOf('data-action="display-mode"') < panel.indexOf('data-action="refresh"'));
   assert.doesNotMatch(panel, />Add a blind</);
 
   for (const displayPreference of ['mobile', 'desktop']) {
