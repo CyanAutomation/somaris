@@ -1,0 +1,78 @@
+# Builds the existing Somaris image and deploys it as a simulator demo on Cloud Run.
+# No application or Dockerfile configuration is changed: the image already listens on
+# 0.0.0.0:8080 and enables the built-in simulators by default.
+# Cloud Run does not expose Bluetooth hardware, so physical device control is unavailable.
+# The service is public and Somaris has no API authentication; use it as a simulator demo only.
+# Cloud Run's writable filesystem is temporary, so /data state can reset on instance restart.
+# Instance-based CPU and one minimum instance keep Somaris background tasks running, with
+# continuous instance billing while the demo instance is active.
+#
+# Configure a manual Cloud Build trigger for the Somaris GitHub repository and point it
+# at this file. The defaults reuse GoGoMio's europe-west1 Artifact Registry repository;
+# Somaris is stored as a separate image named "somaris" inside that repository.
+# Trigger substitutions can override these defaults when a different name or region is needed.
+
+substitutions:
+  _GAR_REGION: europe-west1
+  _GAR_REPO: gogomio
+  _IMAGE_NAME: somaris
+  _IMAGE_TAG: latest
+  _CLOUD_RUN_REGION: europe-west1
+  _SERVICE_NAME: somaris-demo
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: build-and-push
+    env:
+      - DOCKER_BUILDKIT=1
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        image="${_GAR_REGION}-docker.pkg.dev/$PROJECT_ID/${_GAR_REPO}/${_IMAGE_NAME}"
+        docker buildx create --name somaris-cloudbuild --driver docker-container --use
+        docker buildx build \
+          --file Dockerfile \
+          --progress plain \
+          --platform linux/amd64 \
+          --cache-from "type=registry,ref=${_GAR_REGION}-docker.pkg.dev/$PROJECT_ID/${_GAR_REPO}/${_IMAGE_NAME}:buildcache" \
+          --cache-to "type=registry,ref=${_GAR_REGION}-docker.pkg.dev/$PROJECT_ID/${_GAR_REPO}/${_IMAGE_NAME}:buildcache,mode=max" \
+          --tag "${image}:${_IMAGE_TAG}" \
+          --tag "${image}:$BUILD_ID" \
+          --push .
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    id: deploy-cloud-run
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE_NAME}
+      - --image
+      - ${_GAR_REGION}-docker.pkg.dev/$PROJECT_ID/${_GAR_REPO}/${_IMAGE_NAME}:$BUILD_ID
+      - --region
+      - ${_CLOUD_RUN_REGION}
+      - --platform
+      - managed
+      - --port
+      - "8080"
+      - --allow-unauthenticated
+      - --no-cpu-throttling
+      - --min
+      - "1"
+      - --max
+      - "1"
+      - --memory
+      - 512Mi
+    waitFor:
+      - build-and-push
+
+images:
+  - ${_GAR_REGION}-docker.pkg.dev/$PROJECT_ID/${_GAR_REPO}/${_IMAGE_NAME}:${_IMAGE_TAG}
+  - ${_GAR_REGION}-docker.pkg.dev/$PROJECT_ID/${_GAR_REPO}/${_IMAGE_NAME}:$BUILD_ID
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s
