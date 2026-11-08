@@ -78,45 +78,7 @@ const DOCS_HTML: &str = r##"<!doctype html>
   </header>
   <p id="status" role="status"></p>
   <main id="operations"></main>
-  <script>
-    const methods = ["get", "post", "put", "patch", "delete"];
-    fetch("/openapi.json")
-      .then(response => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.json();
-      })
-      .then(spec => {
-        document.title = `${spec.info.title} reference`;
-        document.querySelector("h1").textContent = `${spec.info.title} reference`;
-        const root = document.querySelector("#operations");
-        for (const [path, pathItem] of Object.entries(spec.paths)) {
-          for (const method of methods) {
-            const operation = pathItem[method];
-            if (!operation) continue;
-            const row = document.createElement("section");
-            row.className = "operation";
-            const heading = document.createElement("div");
-            const verb = document.createElement("span");
-            verb.className = "method";
-            verb.textContent = method.toUpperCase();
-            const route = document.createElement("code");
-            route.textContent = path;
-            heading.append(verb, route);
-            row.append(heading);
-            if (operation.summary || operation.description) {
-              const description = document.createElement("p");
-              description.className = "description";
-              description.textContent = operation.summary || operation.description;
-              row.append(description);
-            }
-            root.append(row);
-          }
-        }
-      })
-      .catch(error => {
-        document.querySelector("#status").textContent = `Could not load the OpenAPI document: ${error.message}`;
-      });
-  </script>
+  <script type="module" src="/ui/api-docs.mjs"></script>
 </body>
 </html>
 "##;
@@ -1308,6 +1270,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/components.css", get(ui_components_style))
         .route("/ui/panel.css", get(ui_panel_style))
         .route("/ui/app.mjs", get(ui_app))
+        .route("/ui/api-docs.mjs", get(ui_api_docs))
         .route("/ui/components.mjs", get(ui_components))
         .route("/ui/snackbar.mjs", get(ui_snackbar))
         .route("/ui/favicon.svg", get(ui_favicon_svg))
@@ -1419,6 +1382,13 @@ async fn ui_app() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../ui/app.mjs"),
+    )
+}
+
+async fn ui_api_docs() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/api-docs.mjs"),
     )
 }
 

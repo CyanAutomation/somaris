@@ -68,8 +68,14 @@ jobs:
         with:
           node-version-file: .nvmrc
 
-      - name: Run UI tests
-        run: node --test ui/tests/*.test.mjs
+      - name: Install UI tooling
+        run: npm ci
+
+      - name: Type-check and test UI
+        run: npm run check:ui
+
+      - name: Check compiled UI modules are current
+        run: git diff --exit-code -- ui/*.mjs
 
   dependency-audit:
     name: Audit Rust dependencies
