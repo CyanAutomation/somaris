@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "ui",
+    "outDir": "ui"
+  },
+  "include": ["ui/*.mts"],
+  "exclude": ["ui/tests"]
+}

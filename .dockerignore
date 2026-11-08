@@ -5,3 +5,5 @@ data
 *.log
 .env
 .env.*
+node_modules/
+*.tsbuildinfo

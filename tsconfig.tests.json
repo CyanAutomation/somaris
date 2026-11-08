@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": false,
+    "noImplicitAny": false,
+    "noUncheckedIndexedAccess": false,
+    "noImplicitOverride": false,
+    "noEmit": true
+  },
+  "include": ["ui/*.mts", "ui/tests/*.mts"]
+}

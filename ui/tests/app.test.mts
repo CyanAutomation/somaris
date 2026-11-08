@@ -1,6 +1,22 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {activityMessage, availability, batchEligibleCount, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, resolveDisplayMode} from '../app.mjs';
+import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
+
+type CommandTarget = RefreshTarget & {
+  commands: Record<string, CommandRecord>;
+  tokens: Record<string, symbol>;
+  busy: Set<string>;
+  reconciliationRequired: Set<string>;
+};
+
+function requestBody(options: RequestInit | undefined): Record<string, unknown> {
+  return JSON.parse(String(options?.body ?? '{}')) as Record<string, unknown>;
+}
+
+function requestHeader(options: RequestInit | undefined, name: string): string | null {
+  return new Headers(options?.headers).get(name);
+}
 
 test('automatic display mode distinguishes square panels from phones and desktop windows',()=>{
  assert.equal(resolveDisplayMode('auto', 800, 800), 'panel');
@@ -12,27 +28,27 @@ test('automatic display mode distinguishes square panels from phones and desktop
 
 test('all-blinds batch submission is idempotent and a failed request stays locked for safe recovery', async () => {
  const {submitBlindBatch, checkBlindBatch} = await import('../app.mjs');
- const state = {batch:null};
- const requests = [];
- const request = async (path, options) => {
+ const state: RefreshTarget & {batch: BatchState | null} = {batch:null};
+ const requests: Array<[string, RequestInit | undefined]> = [];
+ const request: ApiRequest = async (path, options) => {
   requests.push([path, options]);
-  const action = options?.body ? JSON.parse(options.body).action : 'open';
+  const action = options?.body ? JSON.parse(String(options.body)).action : 'open';
   return {id:'batch-1', action, status:'queued', target_count:2, acknowledged_count:0, failed_count:0, pending_count:2, skipped_count:0, skipped:[], targets:[]};
  };
  let changes = 0;
  assert.equal(await submitBlindBatch(state, request, 'open', () => { changes += 1; }, () => 'key-1'), true);
  assert.equal(requests.length, 1);
  assert.equal(requests[0][0], '/api/control/v1/batches');
- assert.equal(requests[0][1].headers['Idempotency-Key'], 'key-1');
- assert.deepEqual(JSON.parse(requests[0][1].body), {action:'open'});
+ assert.equal(requestHeader(requests[0]?.[1], 'Idempotency-Key'), 'key-1');
+ assert.deepEqual(requestBody(requests[0]?.[1]), {action:'open'});
  assert.equal(state.batch.id, 'batch-1');
  assert.equal(state.batch.status, 'queued');
  assert.equal(changes, 2);
  assert.equal(await submitBlindBatch(state, request, 'close', () => {}, () => 'key-2'), false);
  assert.equal(requests.length, 1);
 
- const unknownState = {batch:null};
- const failedRequest = async (path, options) => {
+ const unknownState: RefreshTarget & {batch: BatchState | null} = {batch:null};
+ const failedRequest: ApiRequest = async (path, options) => {
   requests.push([path, options]);
   throw new Error('Network unavailable');
  };
@@ -42,20 +58,24 @@ test('all-blinds batch submission is idempotent and a failed request stays locke
  assert.equal(await submitBlindBatch(unknownState, request, 'open', () => {}, () => 'key-3'), false);
  assert.equal(requests.length, requestCountBeforeRetry);
  assert.equal(await checkBlindBatch(unknownState, request, () => {}), true);
- assert.equal(requests.at(-1)[1].headers['Idempotency-Key'], 'key-2');
- assert.equal(JSON.parse(requests.at(-1)[1].body).action, 'close');
+ assert.equal(requestHeader(requests.at(-1)?.[1], 'Idempotency-Key'), 'key-2');
+ assert.equal(requestBody(requests.at(-1)?.[1]).action, 'close');
  assert.equal(unknownState.batch.id, 'batch-1');
 });
 
 test('batch polling preserves an unknown outcome for a known batch ID and updates terminal results', async () => {
  const {checkBlindBatch} = await import('../app.mjs');
- const state = {batch:{id:'batch-9', action:'close', status:'running', data:{status:'running'}}, notifications:[], notify(item){this.notifications.push(item);}};
+ const state: RefreshTarget & {batch: BatchState | null; notifications: Notification[]} = {
+  batch:{id:'batch-9', action:'close', status:'running', data:{status:'running'}},
+  notifications:[],
+  notify(item: Notification){this.notifications?.push(item);},
+ };
  let refreshPath = '';
- assert.equal(await checkBlindBatch(state, async path => { refreshPath = path; throw new Error('Temporary failure'); }, () => {}), false);
+ assert.equal(await checkBlindBatch(state, async (path: string) => { refreshPath = path; throw new Error('Temporary failure'); }, () => {}), false);
  assert.equal(refreshPath, '/api/control/v1/batches/batch-9');
  assert.equal(state.batch.status, 'outcome_unknown');
  assert.match(state.batch.error, /Temporary failure/);
- assert.equal(await checkBlindBatch(state, async path => ({id:'batch-9', action:'close', status:'partial', target_count:2, acknowledged_count:1, failed_count:1, pending_count:0, skipped_count:1, skipped:[{label:'Guest room',availability:'stale'}], targets:[{label:'Kitchen',status:'connection_failed'}]}), () => {}), true);
+ assert.equal(await checkBlindBatch(state, async (_path: string) => ({id:'batch-9', action:'close', status:'partial', target_count:2, acknowledged_count:1, failed_count:1, pending_count:0, skipped_count:1, skipped:[{label:'Guest room',availability:'stale'}], targets:[{label:'Kitchen',status:'connection_failed'}]}), () => {}), true);
  assert.equal(state.batch.status, 'partial');
  assert.equal(state.batch.data.acknowledged_count, 1);
  assert.equal(state.notifications.at(-1).tone, 'warning');
@@ -66,7 +86,7 @@ test('batch polling preserves an unknown outcome for a known batch ID and update
 test('batch progress stays contextual while a terminal batch result becomes a snackbar', async () => {
  const {submitBlindBatch} = await import('../app.mjs');
  const notifications = [];
- const state = {batch:null, notify:item=>notifications.push(item)};
+ const state: RefreshTarget & {batch: BatchState | null; notifications: Notification[]} = {batch:null, notifications, notify:item=>notifications.push(item)};
  const result = {id:'batch-done',action:'open',status:'completed',target_count:3,acknowledged_count:3,failed_count:0,pending_count:0,skipped_count:0,skipped:[],targets:[]};
  assert.equal(await submitBlindBatch(state,async()=>result,'open'),true);
  assert.equal(notifications.length,1);
@@ -98,7 +118,7 @@ test('explicit display mode overrides automatic viewport selection',()=>{
 
 test('all-blinds eligibility follows fresh availability, cooldown, and calibration state',()=>{
  const now=Date.parse('2026-11-05T23:00:00Z');
- const managed=[
+ const managed: Parameters<typeof batchEligibleCount>[0]=[
   {availability:'ready'},
   {availability:'ready',gatt_readiness:{cooldown_until:'2026-11-05T23:01:00Z'}},
   {availability:'ready',gatt_readiness:{cooldown_until:'2026-11-05T22:59:00Z'}},
@@ -119,20 +139,20 @@ test('command messages distinguish acknowledgement and uncertain outcomes',()=>{
 test('command poll failure refreshes position before movement controls unlock', async()=>{
  const id='blind-1';
  const token=Symbol('command');
- const state={
+ const state: CommandTarget={
   commands:{[id]:{status:'connecting',accepted_at:'2026-11-05T22:40:00.000Z'}},
   busy:new Set([id]),
   tokens:{[id]:token},
   managed:[{enrollment:{id},position:{current_closed_percent:100}}],
   observations:[{id:'old-observation'}],
   notifications:[],
-  notify(item){this.notifications.push(item);},
+  notify(item: Notification){this.notifications?.push(item);},
   serviceError:'Could not refresh diagnostics.',
   reconciliationRequired:new Set(),
  };
- const calls=[];
- const changes=[];
- const request=async path=>{
+ const calls: string[]=[];
+ const changes: Array<{busy:boolean;status:string | undefined;position:number | undefined}> = [];
+ const request: ApiRequest=async path=>{
   calls.push(path);
   if(path==='/api/control/v1/devices')return [{enrollment:{id},availability:'ready',position:{current_closed_percent:95},position_freshness:'fresh',position_observed_at:'2026-11-05T22:40:01.000Z'}];
   if(path==='/api/v1/devices')return [{id:'fresh-observation'}];
@@ -168,18 +188,18 @@ test('command poll failure refreshes position before movement controls unlock', 
 test('failed managed-position refresh keeps movement locked until a later fresh refresh', async()=>{
  const id='blind-1';
  const token=Symbol('command');
- const state={
+ const state: CommandTarget={
   commands:{[id]:{status:'connecting',accepted_at:'2026-11-05T22:40:00.000Z'}},
   busy:new Set([id]),
   tokens:{[id]:token},
   managed:[{enrollment:{id},availability:'stale',position:{current_closed_percent:100},position_freshness:'stale',position_observed_at:'2026-11-05T22:39:00.000Z'}],
   observations:[{id:'old-observation'}],
   notifications:[],
-  notify(item){this.notifications.push(item);},
+  notify(item: Notification){this.notifications?.push(item);},
   serviceError:'Unrelated service error.',
   reconciliationRequired:new Set(),
  };
- const request=async path=>{
+ const request: ApiRequest=async path=>{
   if(path==='/api/control/v1/devices')throw new Error('Managed-device request failed.');
   if(path==='/api/v1/devices')return [{id:'new-observation'}];
   throw new Error(`Unexpected request: ${path}`);
@@ -194,7 +214,7 @@ test('failed managed-position refresh keeps movement locked until a later fresh 
  assert.equal(state.serviceError,'Unrelated service error.');
  assert.match(state.notifications.at(-1).message,/movement controls remain locked/);
 
- const fullRefresh=async path=>{
+ const fullRefresh: ApiRequest=async path=>{
   if(path==='/api/control/v1/devices')return [{enrollment:{id},availability:'ready',position:{current_closed_percent:95},position_freshness:'fresh',position_observed_at:'2026-11-05T22:40:01.000Z'}];
   if(path==='/api/v1/devices')return [{id:'fresh-observation'}];
   if(path==='/api/v1/diagnostics')return {scanner:{adapter_available:true}};
@@ -213,18 +233,18 @@ test('failed managed-position refresh keeps movement locked until a later fresh 
 test('fresh pre-command observation does not unlock an uncertain movement', async()=>{
  const id='blind-1';
  const token=Symbol('command');
- const state={
+ const state: CommandTarget={
   commands:{[id]:{status:'connecting',accepted_at:'2026-11-05T22:40:00.000Z'}},
   busy:new Set([id]),
   tokens:{[id]:token},
   managed:[],
   observations:[],
   notifications:[],
-  notify(item){this.notifications.push(item);},
+  notify(item: Notification){this.notifications?.push(item);},
   serviceError:null,
   reconciliationRequired:new Set(),
  };
- const request=async path=>path==='/api/control/v1/devices'
+ const request: ApiRequest=async path=>path==='/api/control/v1/devices'
   ? [{enrollment:{id},availability:'ready',position_freshness:'fresh',position_observed_at:'2026-11-05T22:39:59.999Z'}]
   : [];
 
@@ -239,12 +259,13 @@ test('stale command poll failure cannot clear a newer command state', async()=>{
  const id='blind-1';
  const token=Symbol('new command');
  let refreshed=false;
- const state={
+ const state: CommandTarget={
   commands:{[id]:{status:'queued'}},
   busy:new Set([id]),
   tokens:{[id]:token},
+  reconciliationRequired:new Set(),
   notifications:[],
-  notify(item){this.notifications.push(item);},
+  notify(item: Notification){this.notifications?.push(item);},
  };
 
  const handled=await handleCommandPollFailure(state,id,Symbol('old command'),new Error('Not found.'),async()=>{refreshed=true;});
@@ -278,14 +299,14 @@ test('device-provided text is escaped',()=>assert.equal(escapeHtml('<img src="x"
 test('service refresh loads the simulator collection', async () => {
  const {refreshService} = await import('../app.mjs');
  const simulators = [{id:'simulator-1', advertised_name:'Somaris Simulator 1'}, {id:'simulator-2', advertised_name:'Somaris Simulator 2'}];
- const calls = [];
- const request = async path => {
+ const calls: string[] = [];
+ const request: ApiRequest = async path => {
   calls.push(path);
   if (path === '/api/dev/simulators') return simulators;
   if (path === '/api/v1/diagnostics') return {scanner:{adapter_available:true}};
   return [];
  };
- const state = {};
+ const state: RefreshTarget = {};
  await refreshService(state, request);
  assert.ok(calls.includes('/api/dev/simulators'));
  assert.deepEqual(state.simulators, simulators);
@@ -294,15 +315,15 @@ test('service refresh loads the simulator collection', async () => {
 
 test('service refresh loads recent activity and activity descriptions stay readable', async () => {
  const {refreshService} = await import('../app.mjs');
- const activity = [{kind:'command', action:'close', subject:'Study blind', status:'write_acknowledged'}];
- const calls = [];
- const request = async path => {
+ const activity: ActivityEntry[] = [{kind:'command', action:'close', subject:'Study blind', status:'write_acknowledged'}];
+ const calls: string[] = [];
+ const request: ApiRequest = async path => {
   calls.push(path);
   if (path === '/api/control/v1/audit-log') return activity;
   if (path === '/api/v1/diagnostics') return {scanner:{adapter_available:true}};
   return [];
  };
- const state = {};
+ const state: RefreshTarget = {};
  await refreshService(state, request);
  assert.ok(calls.includes('/api/control/v1/audit-log'));
  assert.deepEqual(state.activity, activity);
@@ -312,17 +333,17 @@ test('service refresh loads recent activity and activity descriptions stay reada
 
 test('service refresh errors notify once per outage and announce recovery', async () => {
  const {refreshService} = await import('../app.mjs');
- const notices = [];
- const dismissed = [];
- const state = {notify:item=>notices.push(item),dismissNotification:key=>dismissed.push(key)};
- const failed = async () => { throw new Error('Network unavailable'); };
+ const notices: Notification[] = [];
+ const dismissed: string[] = [];
+ const state: RefreshTarget = {notify:item=>notices.push(item),dismissNotification:key=>dismissed.push(key)};
+ const failed: ApiRequest = async () => { throw new Error('Network unavailable'); };
  await refreshService(state, failed);
  await refreshService(state, failed);
  assert.equal(notices.length,1);
  assert.match(notices[0].message,/Network unavailable/);
  assert.equal(notices[0].key,'service-refresh');
 
- const recovered = async path => path.endsWith('/diagnostics') ? {scanner:{adapter_available:true}} : [];
+ const recovered: ApiRequest = async path => path.endsWith('/diagnostics') ? {scanner:{adapter_available:true}} : [];
  await refreshService(state, recovered);
  assert.deepEqual(dismissed,['service-refresh']);
  assert.equal(notices.length,2);
@@ -332,15 +353,15 @@ test('service refresh errors notify once per outage and announce recovery', asyn
 
 test('enrollment errors notify in context and successful enrollment reports completion', async () => {
  const {enrollBlind} = await import('../app.mjs');
- const notices = [];
- const state = {notify:item=>notices.push(item)};
- const request = async (path, options) => {
+ const notices: Notification[] = [];
+ const state: RefreshTarget = {notify:item=>notices.push(item)};
+ const request: ApiRequest = async (path, options) => {
   if (options?.method === 'POST') throw new Error('Device is no longer fresh');
   return {};
  };
  const refresh = async () => {};
  assert.equal(await enrollBlind(state, request, refresh, 'blind-1', 'Hallway'), false);
- const successfulRequest = async (path, options) => options?.method === 'POST' ? {} : request(path, options);
+ const successfulRequest: ApiRequest = async (path, options) => options?.method === 'POST' ? {} : request(path, options);
  assert.equal(await enrollBlind(state, successfulRequest, refresh, 'blind-1', 'Hallway'), true);
  assert.equal(notices.length,2);
  assert.equal(notices[0].tone,'error');
@@ -364,12 +385,13 @@ test('battery display shows estimated percentage and retains cached and unavaila
 
 test('simulator enrollment limit explains how to add another later', async () => {
  const {enrollBlind} = await import('../app.mjs');
- const notices = [];
- const state = {notify:item=>notices.push(item)};
+ const notices: Notification[] = [];
+ const state: RefreshTarget = {notify:item=>notices.push(item)};
  const request = async () => {
-  const error = new Error('A maximum of two simulators can be enrolled at a time.');
-  error.status = 409;
-  error.code = 'simulator_limit_reached';
+  const error = Object.assign(new Error('A maximum of two simulators can be enrolled at a time.'), {
+   status:409,
+   code:'simulator_limit_reached',
+  });
   throw error;
  };
 
@@ -382,12 +404,20 @@ test('removing an enrollment sends DELETE, clears local device state, and refres
  const {removeEnrolledBlind} = await import('../app.mjs');
  const id = 'managed/a b';
  const token = Symbol('command');
- const notices=[];
- const state = {
+ const notices: Notification[]=[];
+ const state: RefreshTarget & {
+  managed: ManagedDevice[];
+  commands: Record<string, CommandRecord>;
+  busy: Set<string>;
+  tokens: Record<string, symbol>;
+  confirmingRemovalId: string | null;
+  removingEnrollmentId: string | null;
+ } = {
   managed:[{enrollment:{id}},{enrollment:{id:'other'}}],
   commands:{[id]:{status:'write_acknowledged'}},
   busy:new Set([id]), tokens:{[id]:token},
   confirmingRemovalId:id,
+  removingEnrollmentId:null,
   notify:item=>notices.push(item),
  };
  const calls = [];
@@ -412,8 +442,12 @@ test('removing an enrollment sends DELETE, clears local device state, and refres
 test('removal failures remain visible and keep the confirmation available for retry', async () => {
  const {removeEnrolledBlind} = await import('../app.mjs');
  const id = 'managed-1';
- const notices = [];
- const state = {managed:[{enrollment:{id}}], confirmingRemovalId:id, notify:item=>notices.push(item)};
+ const notices: Notification[] = [];
+ const state: RefreshTarget & {
+  managed: ManagedDevice[];
+  confirmingRemovalId: string | null;
+  removingEnrollmentId: string | null;
+ } = {managed:[{enrollment:{id}}], confirmingRemovalId:id, removingEnrollmentId:null, notify:item=>notices.push(item)};
  let refreshes = 0;
  const request = async () => { throw new Error('The enrollment has queued or running commands.'); };
 
