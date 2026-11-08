@@ -609,6 +609,7 @@ async fn api_docs_page_serves_html_with_json_and_yaml_contract_links() {
     assert!(html.contains("OpenAPI reference"));
     assert!(html.contains("/openapi.json"));
     assert!(html.contains("/openapi.yaml"));
+    assert!(html.contains("<script type=\"module\" src=\"/ui/api-docs.mjs\"></script>"));
 }
 
 #[tokio::test]

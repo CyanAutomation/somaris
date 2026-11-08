@@ -10,6 +10,11 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
     for (path, content_type, marker) in [
         ("/", "text/html", "rel=\"apple-touch-icon\""),
         ("/ui/app.mjs", "text/javascript", "resolveDisplayMode"),
+        (
+            "/ui/api-docs.mjs",
+            "text/javascript",
+            "loadOpenApiReference",
+        ),
         ("/ui/style.css", "text/css", ".app-shell"),
         ("/ui/components.mjs", "text/javascript", "blindState"),
         ("/ui/snackbar.mjs", "text/javascript", "class SnackbarQueue"),
