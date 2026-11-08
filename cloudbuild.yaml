@@ -4,17 +4,11 @@
 # Cloud Run does not expose Bluetooth hardware, so physical device control is unavailable.
 # The service is public and Somaris has no API authentication; use it as a simulator demo only.
 # Cloud Run's writable filesystem is temporary, so /data state can reset on instance restart.
-# Instance-based CPU and one minimum instance keep Somaris background tasks running, with
-# continuous instance billing while the demo instance is active.
-#
-# Configure a manual Cloud Build trigger for the Somaris GitHub repository and point it
-# at this file. The defaults reuse GoGoMio's europe-west1 Artifact Registry repository;
-# Somaris is stored as a separate image named "somaris" inside that repository.
-# Trigger substitutions can override these defaults when a different name or region is needed.
+
 
 substitutions:
   _GAR_REGION: europe-west1
-  _GAR_REPO: gogomio
+  _GAR_REPO: somaris
   _IMAGE_NAME: somaris
   _IMAGE_TAG: latest
   _CLOUD_RUN_REGION: europe-west1
