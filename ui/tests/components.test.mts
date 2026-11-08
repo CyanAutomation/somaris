@@ -251,7 +251,7 @@ test('panel device list omits its heading because panel count and add action liv
   assert.doesNotMatch(panel, /<h2[^>]*>Your blinds<\/h2>/);
   assert.match(panel, /<article>Blind<\/article>/);
 
-  const regular = renderDeviceList({count:1, panelMode:false, addButton:'', cardsMarkup:'<article>Blind</article>', emptyMarkup:''});
+  const regular = renderDeviceList({count:1, panelMode:false, cardsMarkup:'<article>Blind</article>', emptyMarkup:''});
   assert.match(regular, /<h2>Your blinds<\/h2>/);
 });
 

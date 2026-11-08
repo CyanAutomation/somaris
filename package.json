@@ -1,0 +1,17 @@
+{
+  "name": "somaris-ui",
+  "private": true,
+  "engines": {
+    "node": ">=26 <27"
+  },
+  "scripts": {
+    "build:ui": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.tests.json",
+    "test:ui": "node --test ui/tests/*.test.mts",
+    "check:ui": "npm run typecheck && npm run build:ui && npm run test:ui"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^5.9.3"
+  }
+}
