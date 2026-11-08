@@ -61,10 +61,6 @@ steps:
     waitFor:
       - build-and-push
 
-images:
-  - ${_GAR_REGION}-docker.pkg.dev/$PROJECT_ID/${_GAR_REPO}/${_IMAGE_NAME}:${_IMAGE_TAG}
-  - ${_GAR_REGION}-docker.pkg.dev/$PROJECT_ID/${_GAR_REPO}/${_IMAGE_NAME}:$BUILD_ID
-
 options:
   logging: CLOUD_LOGGING_ONLY
 
