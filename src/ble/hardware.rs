@@ -1006,14 +1006,18 @@ mod battery_tests {
         });
         let started_at = tokio::time::Instant::now();
 
-        let completed = tokio::time::timeout(
-            Duration::from_secs(10),
-            disconnect_with_timeout(disconnect),
-        )
-        .await;
+        let completed =
+            tokio::time::timeout(Duration::from_secs(10), disconnect_with_timeout(disconnect))
+                .await;
 
-        assert!(completed.is_ok(), "cleanup should stop waiting within its bound");
-        assert!(polled.load(Ordering::SeqCst), "cleanup should attempt the disconnect");
+        assert!(
+            completed.is_ok(),
+            "cleanup should stop waiting within its bound"
+        );
+        assert!(
+            polled.load(Ordering::SeqCst),
+            "cleanup should attempt the disconnect"
+        );
         assert!(tokio::time::Instant::now() - started_at < Duration::from_secs(10));
     }
 
@@ -1022,10 +1026,8 @@ mod battery_tests {
         // Contract: BLE-CLEANUP-01 in docs/test-contracts.md.
         let started_at = tokio::time::Instant::now();
 
-        disconnect_with_timeout(async {
-            Err::<(), _>(std::io::Error::other("disconnect failed"))
-        })
-        .await;
+        disconnect_with_timeout(async { Err::<(), _>(std::io::Error::other("disconnect failed")) })
+            .await;
 
         assert_eq!(tokio::time::Instant::now(), started_at);
     }
