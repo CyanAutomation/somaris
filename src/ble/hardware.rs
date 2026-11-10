@@ -978,9 +978,11 @@ mod battery_tests {
     use btleplug::api::Characteristic;
     use std::collections::BTreeSet;
     use std::sync::atomic::AtomicBool;
+    use std::task::Poll;
 
     #[tokio::test]
-    async fn disconnect_cleanup_invokes_disconnect_directly() {
+    async fn disconnect_cleanup_finishes_when_disconnect_succeeds() {
+        // Contract: BLE-CLEANUP-01 in docs/test-contracts.md.
         let called = Arc::new(AtomicBool::new(false));
         let called_by_disconnect = called.clone();
 
@@ -991,6 +993,43 @@ mod battery_tests {
         .await;
 
         assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_cleanup_bounds_a_disconnect_that_never_completes() {
+        // Contract: BLE-CLEANUP-01 in docs/test-contracts.md.
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_by_disconnect = polled.clone();
+        let disconnect = std::future::poll_fn(move |_| {
+            polled_by_disconnect.store(true, Ordering::SeqCst);
+            Poll::<Result<(), std::io::Error>>::Pending
+        });
+        let started_at = tokio::time::Instant::now();
+
+        let completed =
+            tokio::time::timeout(Duration::from_secs(10), disconnect_with_timeout(disconnect))
+                .await;
+
+        assert!(
+            completed.is_ok(),
+            "cleanup should stop waiting within its bound"
+        );
+        assert!(
+            polled.load(Ordering::SeqCst),
+            "cleanup should attempt the disconnect"
+        );
+        assert!(tokio::time::Instant::now() - started_at < Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_cleanup_finishes_when_disconnect_returns_an_error() {
+        // Contract: BLE-CLEANUP-01 in docs/test-contracts.md.
+        let started_at = tokio::time::Instant::now();
+
+        disconnect_with_timeout(async { Err::<(), _>(std::io::Error::other("disconnect failed")) })
+            .await;
+
+        assert_eq!(tokio::time::Instant::now(), started_at);
     }
 
     #[test]
