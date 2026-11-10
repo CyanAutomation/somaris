@@ -38,7 +38,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, mpsc, watch};
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -110,7 +110,7 @@ impl Default for QueueConfig {
             max_outstanding_commands: 1000,
             max_queued_per_device: 32,
             adapter_concurrency: 1,
-            adapter_scan_window_ms: 5_000,
+            adapter_scan_window_ms: 1_000,
             queue_wait_timeout_seconds: 120,
         }
     }
@@ -228,6 +228,7 @@ pub struct AppState {
     command_controls: Arc<Mutex<HashMap<String, BleCommandControl>>>,
     battery_controls: Arc<Mutex<HashMap<String, BleCommandControl>>>,
     adapter_slots: Arc<Semaphore>,
+    scan_window_generation: watch::Sender<u64>,
     ble_adapter: Arc<RwLock<Option<Arc<dyn BleAdapter>>>>,
     ble_enabled: bool,
     queue_config: QueueConfig,
@@ -471,12 +472,14 @@ impl AppState {
         let history_persisted_cursor = inner.history.back().map_or(0, |record| record.cursor);
         let history_persisted_count = inner.history.len();
         let queue_config = QueueConfig::default();
+        let (scan_window_generation, _) = watch::channel(0_u64);
         Self {
             inner: Arc::new(Mutex::new(inner)),
             device_locks: Arc::new(Mutex::new(HashMap::new())),
             command_controls: Arc::new(Mutex::new(HashMap::new())),
             battery_controls: Arc::new(Mutex::new(HashMap::new())),
             adapter_slots: Arc::new(Semaphore::new(queue_config.adapter_concurrency)),
+            scan_window_generation,
             ble_adapter: Arc::new(RwLock::new(None)),
             ble_enabled: false,
             queue_config,
@@ -619,16 +622,94 @@ impl AppState {
     }
 
     async fn persist(&self, inner: &Inner) -> Result<(), ()> {
+        self.persist_with_operation(inner, "state_update").await
+    }
+
+    async fn persist_with_operation(
+        &self,
+        inner: &Inner,
+        operation: &'static str,
+    ) -> Result<(), ()> {
         let Some(path) = &self.data_path else {
             self.state_changes.publish();
             return Ok(());
         };
-        let bytes = serde_json::to_vec_pretty(inner).map_err(|_| ())?;
+        let persist_started = Instant::now();
+        let serialization_started = Instant::now();
+        let bytes = match serde_json::to_vec_pretty(inner) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let serialization_ms = serialization_started.elapsed().as_millis() as u64;
+                let total_ms = persist_started.elapsed().as_millis() as u64;
+                tracing::warn!(
+                    target: "somaris::persistence",
+                    operation,
+                    serialization_ms,
+                    total_ms,
+                    %error,
+                    "Durable state serialization failed"
+                );
+                return Err(());
+            }
+        };
+        let serialization_ms = serialization_started.elapsed().as_millis() as u64;
+        let state_bytes = bytes.len();
         let path = path.clone();
-        tokio::task::spawn_blocking(move || atomic_write(&path, &bytes))
-            .await
-            .map_err(|_| ())?
-            .map_err(|_| ())?;
+        let durable_write_started = Instant::now();
+        let write_result = tokio::task::spawn_blocking(move || atomic_write(&path, &bytes)).await;
+        let durable_write_ms = durable_write_started.elapsed().as_millis() as u64;
+        let total_ms = persist_started.elapsed().as_millis() as u64;
+        let write_result = match write_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "somaris::persistence",
+                    operation,
+                    state_bytes,
+                    serialization_ms,
+                    durable_write_ms,
+                    total_ms,
+                    %error,
+                    "Durable state write failed"
+                );
+                Err(())
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "somaris::persistence",
+                    operation,
+                    state_bytes,
+                    serialization_ms,
+                    durable_write_ms,
+                    total_ms,
+                    %error,
+                    "Durable state write task failed"
+                );
+                Err(())
+            }
+        };
+        write_result?;
+        if total_ms >= 500 {
+            tracing::warn!(
+                target: "somaris::persistence",
+                operation,
+                state_bytes,
+                serialization_ms,
+                durable_write_ms,
+                total_ms,
+                "Durable state persistence was slow"
+            );
+        } else {
+            tracing::debug!(
+                target: "somaris::persistence",
+                operation,
+                state_bytes,
+                serialization_ms,
+                durable_write_ms,
+                total_ms,
+                "Durable state persisted"
+            );
+        }
         self.state_changes.publish();
         Ok(())
     }
@@ -873,6 +954,8 @@ impl AppState {
                 inner.scanner.last_error_code = None;
                 drop(inner);
                 drop(scan_permit);
+                self.scan_window_generation
+                    .send_modify(|generation| *generation = generation.saturating_add(1));
                 tokio::time::sleep(SCAN_RESTART_DELAY).await;
                 continue;
             }
@@ -4405,7 +4488,11 @@ async fn submit_command(
         Some(command_status_text(command.status).to_owned()),
         None,
     );
-    if state.persist(&inner).await.is_err() {
+    if state
+        .persist_with_operation(&inner, "command_acceptance")
+        .await
+        .is_err()
+    {
         return Err(ApiFailure::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "persistence_outcome_unknown",
@@ -4642,7 +4729,7 @@ async fn process_command_with_retry_budget(
         state.command_controls.lock().await.remove(&command_id);
         return;
     };
-    let _adapter_permit = if adapter_slot_reserved {
+    let adapter_permit = if adapter_slot_reserved {
         None
     } else {
         let Ok(permit) = state.adapter_slots.clone().acquire_owned().await else {
@@ -4755,7 +4842,9 @@ async fn process_command_with_retry_budget(
             .as_ref()
             .map_or(0, |config| config.write_response_delay_ms);
         set_activity_status(&mut inner, &command_id, "connecting", None);
-        let _ = state.persist(&inner).await;
+        let _ = state
+            .persist_with_operation(&inner, "command_connecting")
+            .await;
         (
             action,
             command_target_closed_percent,
@@ -4774,8 +4863,11 @@ async fn process_command_with_retry_budget(
             &command_id,
             action,
             command_target_closed_percent,
-            control,
-            execution_deadline,
+            PhysicalCommandExecution {
+                control,
+                deadline: execution_deadline,
+                adapter_permit,
+            },
             PhysicalCommandRetry {
                 first_attempt,
                 retry_budget,
@@ -4785,6 +4877,7 @@ async fn process_command_with_retry_budget(
         .await;
         return;
     };
+    drop(adapter_permit);
     let simulation_started = Instant::now();
     let delay = tokio::time::sleep(StdDuration::from_millis(
         connection_delay_ms.saturating_add(write_delay_ms),
@@ -4976,7 +5069,11 @@ async fn process_command_with_retry_budget(
             tracing::warn!("Could not persist simulator telemetry history.");
         }
     }
-    if state.persist(&inner).await.is_err() {
+    if state
+        .persist_with_operation(&inner, "simulator_command_completion")
+        .await
+        .is_err()
+    {
         tracing::warn!(%command_id, "Command result could not be persisted.");
     }
     drop(inner);
@@ -5014,7 +5111,11 @@ async fn record_command_radio_evidence(
         );
         attempt.advertisement_rssi_dbm = Some(target.advertisement_rssi_dbm);
     }
-    if state.persist(&inner).await.is_err() {
+    if state
+        .persist_with_operation(&inner, "command_radio_evidence")
+        .await
+        .is_err()
+    {
         tracing::warn!(%command_id, attempt = attempt_number, "Command radio evidence could not be persisted.");
     }
 }
@@ -5156,10 +5257,70 @@ fn retry_backoff(command_id: &str, attempt: u8, failure_streak: usize) -> std::t
     std::time::Duration::from_millis(base_ms / 2 + jitter_ms)
 }
 
+async fn yield_adapter_for_retry_scan(
+    state: &AppState,
+    adapter_permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    control: &BleCommandControl,
+    deadline: tokio::time::Instant,
+) -> Result<bool, BleFailure> {
+    let Some(permit) = adapter_permit.take() else {
+        return Ok(false);
+    };
+    let mut scan_generation = state.scan_window_generation.subscribe();
+    let previous_generation = *scan_generation.borrow_and_update();
+    drop(permit);
+
+    let scan_wait = std::time::Duration::from_millis(state.queue_config.adapter_scan_window_ms)
+        .saturating_add(SCAN_RESTART_DELAY)
+        .saturating_add(std::time::Duration::from_millis(250));
+    let scan_deadline = tokio::time::Instant::now() + scan_wait;
+    let scan_refreshed = tokio::select! {
+        biased;
+        _ = control.cancelled() => return Err(control.cancellation_failure()),
+        _ = tokio::time::sleep_until(deadline) => {
+            control.request_deadline_cancel();
+            return Err(control.cancellation_failure());
+        }
+        _ = tokio::time::sleep_until(scan_deadline) => false,
+        result = scan_generation.changed() => match result {
+            Ok(()) => *scan_generation.borrow() > previous_generation,
+            Err(_) => false,
+        },
+    };
+
+    let permit = tokio::select! {
+        biased;
+        _ = control.cancelled() => return Err(control.cancellation_failure()),
+        _ = tokio::time::sleep_until(deadline) => {
+            control.request_deadline_cancel();
+            return Err(control.cancellation_failure());
+        }
+        result = state.adapter_slots.clone().acquire_owned() => match result {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Err(BleFailure {
+                    stage: BleFailureStage::Adapter,
+                    retryable_before_write: false,
+                    write_may_have_been_sent: false,
+                    outcome_unknown: false,
+                });
+            }
+        },
+    };
+    *adapter_permit = Some(permit);
+    Ok(scan_refreshed)
+}
+
 struct PhysicalCommandRetry {
     first_attempt: u8,
     retry_budget: u8,
     failure_streak: usize,
+}
+
+struct PhysicalCommandExecution {
+    control: BleCommandControl,
+    deadline: tokio::time::Instant,
+    adapter_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5214,10 +5375,14 @@ async fn process_physical_command(
     command_id: &str,
     action: Action,
     command_target_closed_percent: Option<u8>,
-    control: BleCommandControl,
-    deadline: tokio::time::Instant,
+    execution: PhysicalCommandExecution,
     retry: PhysicalCommandRetry,
 ) {
+    let PhysicalCommandExecution {
+        control,
+        deadline,
+        mut adapter_permit,
+    } = execution;
     let PhysicalCommandRetry {
         first_attempt,
         retry_budget,
@@ -5352,11 +5517,19 @@ async fn process_physical_command(
             && retryable_prewrite_failure(failure)
         {
             let delay = retry_backoff(command_id, attempt, failure_streak);
+            let scan_refreshed =
+                match yield_adapter_for_retry_scan(state, &mut adapter_permit, &control, deadline)
+                    .await
+                {
+                    Ok(refreshed) => refreshed,
+                    Err(cancelled) => break Err(cancelled),
+                };
             tracing::warn!(
                 command_id,
                 attempt,
                 stage = failure.stage.as_str(),
                 retry_delay_ms = delay.as_millis() as u64,
+                scan_refreshed,
                 "Retrying physical command after a confirmed pre-write BLE failure"
             );
             if tokio::time::Instant::now() + delay < deadline {
@@ -5445,7 +5618,11 @@ async fn process_physical_command(
             completed_at,
         );
     }
-    if state.persist(&inner).await.is_err() {
+    if state
+        .persist_with_operation(&inner, "command_completion")
+        .await
+        .is_err()
+    {
         tracing::warn!(%command_id, "Physical command result could not be persisted.");
     }
     drop(inner);
@@ -5472,7 +5649,11 @@ async fn start_command_attempt(state: &AppState, command_id: &str, number: u8) {
             error_code: None,
         });
     }
-    if state.persist(&inner).await.is_err() {
+    if state
+        .persist_with_operation(&inner, "command_attempt_start")
+        .await
+        .is_err()
+    {
         tracing::warn!(%command_id, attempt = number, "Command attempt start could not be persisted.");
     }
 }
@@ -5515,7 +5696,11 @@ async fn finish_command_attempt(
             }
         }
     }
-    if state.persist(&inner).await.is_err() {
+    if state
+        .persist_with_operation(&inner, "command_attempt_result")
+        .await
+        .is_err()
+    {
         tracing::warn!(%command_id, attempt = number, "Command attempt result could not be persisted.");
     }
 }
