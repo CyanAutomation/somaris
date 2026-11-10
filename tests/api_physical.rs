@@ -506,6 +506,12 @@ async fn transient_service_discovery_failure_retries_only_before_a_write() {
     assert_eq!(command["attempts"][1]["phase_timings"]["connect_ms"], 2);
     assert!(command["attempts"][0]["duration_ms"].is_number());
     assert!(command["attempts"][1]["duration_ms"].is_number());
+    let scans_at_write = adapter.scans_at_write();
+    assert_eq!(scans_at_write.len(), 2);
+    assert!(
+        scans_at_write[1] > scans_at_write[0],
+        "a successful scan window should run between confirmed pre-write attempts"
+    );
 }
 
 #[tokio::test]
