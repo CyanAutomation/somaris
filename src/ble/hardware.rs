@@ -1,4 +1,6 @@
 use std::{
+    fmt::Display,
+    future::Future,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
@@ -655,49 +657,11 @@ impl BtleplugAdapter {
     }
 
     async fn disconnect(peripheral: &Peripheral) {
-        match tokio::time::timeout(Duration::from_secs(3), peripheral.is_connected()).await {
-            Ok(Ok(false)) => return,
-            Ok(Ok(true)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(operation = "connection_state", %error, "Could not confirm BLE connection state before disconnect");
-                return;
-            }
-            Err(_) => {
-                tracing::warn!(
-                    operation = "connection_state",
-                    timeout_seconds = 3,
-                    "BLE connection state check timed out before disconnect"
-                );
-                return;
-            }
-        }
-        match tokio::time::timeout(Duration::from_secs(5), peripheral.disconnect()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(operation = "disconnect", %error, "BLE disconnect failed")
-            }
-            Err(_) => tracing::warn!(
-                operation = "disconnect",
-                timeout_seconds = 5,
-                "BLE disconnect timed out"
-            ),
-        }
+        disconnect_with_timeout(peripheral.disconnect()).await;
     }
 
     async fn disconnect_after_interruption(peripheral: &Peripheral) {
-        match tokio::time::timeout(Duration::from_secs(5), peripheral.disconnect()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(operation = "disconnect", %error, "BLE connection cleanup after interruption failed");
-            }
-            Err(_) => {
-                tracing::warn!(
-                    operation = "disconnect",
-                    timeout_seconds = 5,
-                    "BLE connection cleanup after interruption timed out"
-                );
-            }
-        }
+        disconnect_with_timeout(peripheral.disconnect()).await;
     }
 
     async fn stop_scan(&self) -> Result<(), BleFailure> {
@@ -716,6 +680,24 @@ impl BtleplugAdapter {
                 Err(BleFailure::before_write(BleFailureStage::Adapter, true))
             }
         }
+    }
+}
+
+async fn disconnect_with_timeout<Fut, Error>(disconnect: Fut)
+where
+    Fut: Future<Output = Result<(), Error>>,
+    Error: Display,
+{
+    match tokio::time::timeout(Duration::from_secs(5), disconnect).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(operation = "disconnect", %error, "BLE disconnect failed")
+        }
+        Err(_) => tracing::warn!(
+            operation = "disconnect",
+            timeout_seconds = 5,
+            "BLE disconnect timed out"
+        ),
     }
 }
 
@@ -995,6 +977,21 @@ mod battery_tests {
     use super::*;
     use btleplug::api::Characteristic;
     use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test]
+    async fn disconnect_cleanup_invokes_disconnect_directly() {
+        let called = Arc::new(AtomicBool::new(false));
+        let called_by_disconnect = called.clone();
+
+        disconnect_with_timeout(async move {
+            called_by_disconnect.store(true, Ordering::SeqCst);
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+
+        assert!(called.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn stop_uses_a_short_first_connection_window_then_a_bounded_recovery_window() {
