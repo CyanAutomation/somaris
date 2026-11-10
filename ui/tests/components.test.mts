@@ -1,5 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
+import {parseHTML} from 'linkedom';
 import {
   blindState,
   movementStatusFromPositions,
@@ -14,7 +15,6 @@ import {
   renderButton,
   renderIconButton,
   renderAddBlindButton,
-  renderDestructiveButton,
   renderConfirmationPanel,
   renderDeviceList,
   renderBatchControls,
@@ -25,6 +25,11 @@ import {
   renderHomeSupportingSections,
   renderInfoGrid,
 } from '../components.mjs';
+
+function parseMarkup(markup: string) {
+  return parseHTML(`<!doctype html><html><body><main id="fixture">${markup}</main></body></html>`)
+    .document.querySelector('#fixture')!;
+}
 
 test('blind state prioritizes reported movement and otherwise describes current position', () => {
   assert.deepEqual(blindState(100, 'opening'), {label:'Opening', percentClosed:100});
@@ -146,65 +151,76 @@ test('shared button primitive escapes user text and supports icon-only accessibl
   assert.doesNotMatch(markup, /<span class="button-label">Open<\/span>/);
 });
 
-test('reusable icon button primitive provides consistent accessible icon controls', () => {
-  const markup = renderIconButton({label:'Refresh', action:'refresh', icon:'refresh'});
-  assert.match(markup, /class="button icon-button icon-action"/);
-  assert.match(markup, /aria-label="Refresh"/);
-  assert.match(markup, /title="Refresh"/);
-  assert.match(markup, /data-action="refresh"/);
-  assert.match(markup, /data-icon="refresh"/);
-  assert.doesNotMatch(markup, /button-label/);
+test('icon-only actions expose an accessible name and an actionable enabled state', () => {
+  // Contract: UI-CONTROL-01 in docs/test-contracts.md.
+  const root = parseMarkup(renderIconButton({label:'Refresh', action:'refresh', icon:'refresh'}));
+  const button = root.querySelector('button');
+  assert.ok(button);
+  assert.equal(button.getAttribute('aria-label'), 'Refresh');
+  assert.equal(button.getAttribute('title'), 'Refresh');
+  assert.equal(button.getAttribute('data-action'), 'refresh');
+  assert.equal(button.textContent, '');
+  assert.equal(button.querySelector('svg')?.getAttribute('aria-hidden'), 'true');
+
+  const disabled = parseMarkup(renderIconButton({label:'Refresh', action:'refresh', icon:'refresh', disabled:true}));
+  assert.notEqual(disabled.querySelector('button')?.getAttribute('disabled'), null);
 });
 
-test('destructive action primitive provides a visible danger button with an icon', () => {
-  const markup = renderDestructiveButton({label:'Remove blind', action:'remove:blind-1'});
-  assert.match(markup, /class="button danger"/);
-  assert.match(markup, /data-action="remove:blind-1"/);
-  assert.match(markup, /data-icon="trash"/);
-  assert.match(markup, /<span class="button-label">Remove blind<\/span>/);
-  assert.match(renderDestructiveButton({label:'Remove <blind>', action:'remove:x', disabled:true}), /disabled/);
-});
-
-test('reusable confirmation panel escapes copy and composes cancel and destructive actions', () => {
+test('confirmation panel exposes an escaped destructive choice with cancellation', () => {
+  // Contract: UI-CONTROL-01 in docs/test-contracts.md.
   const markup = renderConfirmationPanel({
-    title:'Remove <Hallway>?', message:'This removes <Hallway> from Somaris.',
+    title:'Remove <img src=x onerror=alert(1)>?', message:'This removes <Hallway> from Somaris.',
     confirmLabel:'Remove blind', confirmAction:'remove-confirm:blind-1',
     cancelAction:'remove-cancel:blind-1',
   });
-  assert.match(markup, /role="group" aria-label="Remove &lt;Hallway&gt;\?"/);
-  assert.match(markup, /This removes &lt;Hallway&gt; from Somaris\./);
-  assert.match(markup, /data-action="remove-cancel:blind-1"/);
-  assert.match(markup, /data-action="remove-confirm:blind-1"/);
-  assert.match(markup, /class="button danger"/);
-  const disabled = renderConfirmationPanel({
+
+  const root = parseMarkup(markup);
+  const panel = root.querySelector('[role="group"]');
+  assert.ok(panel);
+  assert.equal(panel.getAttribute('aria-label'), 'Remove <img src=x onerror=alert(1)>?');
+  assert.equal(panel.querySelector('h2')?.textContent, 'Remove <img src=x onerror=alert(1)>?');
+  assert.equal(panel.querySelector('p')?.textContent, 'This removes <Hallway> from Somaris.');
+  assert.equal(panel.querySelector('img'), null);
+  const buttons = [...panel.querySelectorAll('button')];
+  assert.equal(buttons.length, 2);
+  assert.deepEqual(buttons.map(button => button.textContent), ['Cancel', 'Remove blind']);
+  assert.deepEqual(buttons.map(button => button.getAttribute('data-action')),
+    ['remove-cancel:blind-1', 'remove-confirm:blind-1']);
+
+  const disabled = parseMarkup(renderConfirmationPanel({
     title:'Remove blind?', message:'Confirm removal.', confirmLabel:'Remove blind',
     confirmAction:'remove-confirm:blind-1', cancelAction:'remove-cancel:blind-1', disabled:true,
-  });
-  assert.equal((disabled.match(/ disabled/g) || []).length, 2);
+  }));
+  assert.ok([...disabled.querySelectorAll('button')].every(button => button.hasAttribute('disabled')));
 });
 
-test('shared badge and device-card header primitives keep card markup consistent and escaped', () => {
-  assert.equal(renderBadge({label:'Ready', tone:''}), '<span class="badge">Ready</span>');
-  assert.equal(renderBadge({label:'Stale <blind>', tone:'warn'}), '<span class="badge warn">Stale &lt;blind&gt;</span>');
+test('device badge and header expose escaped labels and accessible device details', () => {
+  // Contract: UI-CONTROL-01 in docs/test-contracts.md.
+  const badge = parseMarkup(renderBadge({label:'Stale <img src=x>', tone:'warn'}));
+  assert.equal(badge.querySelector('span')?.textContent, 'Stale <img src=x>');
+  assert.equal(badge.querySelector('img'), null);
 
-  const header = renderDeviceCardHeader({
+  const header = parseMarkup(renderDeviceCardHeader({
     id:'blind-<1>', label:'Bedroom <Left>', availabilityLabel:'Ready',
     availabilityTone:'', availabilityStatus:'ready', isSimulated:false, lastSeen:'Seen just now',
-  });
-  assert.match(header, /class="card-top device-card-header"/);
-  assert.match(header, /data-action="details:blind-&lt;1&gt;"/);
-  assert.match(header, /aria-label="View details for Bedroom &lt;Left&gt;"/);
-  assert.match(header, /class="status-indicator" role="img" aria-label="Ready" title="Ready"/);
+  }));
+  const details = header.querySelector('h3 button');
+  assert.equal(details?.textContent, 'Bedroom <Left>');
+  assert.equal(details?.getAttribute('aria-label'), 'View details for Bedroom <Left>');
+  assert.equal(details?.getAttribute('data-action'), 'details:blind-<1>');
+  const status = header.querySelector('[role="img"]');
+  assert.equal(status?.getAttribute('aria-label'), 'Ready');
+  assert.equal(header.querySelector('img'), null);
 });
 
 test('availability is a compact reusable icon indicator with an accessible status name', () => {
-  const ready = renderStatusIndicator({label:'Observed recently', status:'ready'});
-  assert.match(ready, /class="status-indicator"/);
-  assert.match(ready, /aria-label="Observed recently"/);
-  assert.match(ready, /title="Observed recently"/);
-  assert.match(ready, /data-icon="observed"/);
-  assert.doesNotMatch(ready, />Observed recently</);
-  assert.match(renderStatusIndicator({label:'Stale', tone:'warn', status:'stale'}), /data-icon="stale"/);
+  const ready = parseMarkup(renderStatusIndicator({label:'Observed recently', status:'ready'}));
+  const indicator = ready.querySelector('[role="img"]');
+  assert.equal(indicator?.getAttribute('aria-label'), 'Observed recently');
+  assert.equal(indicator?.getAttribute('title'), 'Observed recently');
+  assert.equal(indicator?.textContent, '');
+  const stale = parseMarkup(renderStatusIndicator({label:'Stale', tone:'warn', status:'stale'}));
+  assert.equal(stale.querySelector('[role="img"]')?.getAttribute('aria-label'), 'Stale');
 });
 
 test('add-blind action is a plus-only button with an accessible name and tooltip', () => {
@@ -216,30 +232,26 @@ test('add-blind action is a plus-only button with an accessible name and tooltip
   assert.doesNotMatch(markup, /class="button-label"/);
 });
 
-test('device card composes the state, named actions and reusable content areas', () => {
-  const card = renderBlindCard({
-    id:'blind-1', label:'Bedroom Left', isSimulated:false, lastSeen:'Seen just now',
-    availabilityLabel:'Ready', availabilityTone:'', availabilityStatus:'ready', positionPercent:100,
-    movementStatus:'opening', blindLines:11,
-    controlsMarkup:renderBlindActions({deviceId:'blind-1', blindLabel:'Bedroom Left', panelMode:true, disabled:false}),
-    messageMarkup:'', footerMarkup:'', panelMode:true,
-  });
-  assert.match(card, /class="card card--panel"/);
-  assert.match(card, /blind-state__label">Opening/);
-  assert.match(card, /blind-state__percent">100% closed/);
-  assert.match(card, /aria-label="Open Bedroom Left"/);
-  assert.match(card, /Bedroom Left/);
-  assert.match(card, /blind-state--panel/);
-});
+test('device cards expose blind identity, reported status, and named actions in both views', () => {
+  // Contract: UI-CONTROL-01 in docs/test-contracts.md.
+  for (const panelMode of [false, true]) {
+    const card = parseMarkup(renderBlindCard({
+      id:'blind-1', label:'Bedroom Left', isSimulated:false, lastSeen:'Seen just now',
+      availabilityLabel:'Observed recently', availabilityStatus:'ready', positionPercent:100,
+      movementStatus:'opening',
+      controlsMarkup:renderBlindActions({deviceId:'blind-1', blindLabel:'Bedroom Left', panelMode}),
+      panelMode,
+    }));
 
-test('regular device cards keep the shared components without panel-only variants', () => {
-  const card = renderBlindCard({
-    id:'blind-2', label:'Study', availabilityLabel:'Ready', availabilityStatus:'ready', positionPercent:25,
-    movementStatus:'at_target', controlsMarkup:'<div class="controls"></div>',
-  });
-  assert.match(card, /<article class="card">/);
-  assert.doesNotMatch(card, /card--panel|blind-state--panel/);
-  assert.match(card, /class="status-indicator" role="img" aria-label="Ready"/);
+    assert.equal(card.querySelector('article h3 button')?.textContent, 'Bedroom Left');
+    assert.equal(card.querySelector('article h3 button')?.getAttribute('aria-label'), 'View details for Bedroom Left');
+    assert.equal(card.querySelector('.blind-state__label')?.textContent, 'Opening');
+    assert.equal(card.querySelector('.blind-state__percent')?.textContent, '100% closed');
+    assert.equal(card.querySelector('[role="img"]')?.getAttribute('aria-label'), 'Observed recently');
+    assert.deepEqual([...card.querySelectorAll('.controls button')]
+      .map(button => button.getAttribute('aria-label')),
+    ['Open Bedroom Left', 'Stop Bedroom Left', 'Close Bedroom Left']);
+  }
 });
 
 test('panel device list omits its heading because panel count and add action live in the topbar', () => {
