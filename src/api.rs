@@ -26,7 +26,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        Path as RoutePath, Query, State,
+        FromRequestParts, Path as RoutePath, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -86,6 +86,19 @@ const SIMULATOR_ID: &str = "simulator-1";
 const SECOND_SIMULATOR_ID: &str = "simulator-2";
 const SIMULATOR_NAME: &str = "Somaris Simulator 1";
 const SECOND_SIMULATOR_NAME: &str = "Somaris Simulator 2";
+const DEMO_SIMULATOR_IDS: [&str; 4] = [
+    SIMULATOR_ID,
+    SECOND_SIMULATOR_ID,
+    "simulator-3",
+    "simulator-4",
+];
+const DEMO_SESSION_COOKIE: &str = "somaris-demo-session";
+const MAX_DEMO_SESSIONS: usize = 32;
+const DEMO_SESSION_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60);
+const DEMO_SESSION_COOKIE_MAX_AGE_SECONDS: u64 = 2 * 60 * 60;
+const MAX_DEMO_COMMANDS: usize = 128;
+const MAX_DEMO_BATCHES: usize = 64;
+const MAX_DEMO_HISTORY: usize = 5_000;
 const MAX_SIMULATOR_ENROLLMENTS: usize = 2;
 const MAX_COMMANDS: usize = 1000;
 const MAX_BATCHES: usize = 1000;
@@ -244,6 +257,66 @@ pub struct AppState {
     history_persisted_count: Arc<AtomicUsize>,
     data_path: Option<PathBuf>,
     state_changes: StateChangePublisher,
+    demo_mode: bool,
+    demo_sessions: Option<Arc<Mutex<DemoSessionStore>>>,
+    background_cancel: watch::Sender<bool>,
+    retained_command_limit: usize,
+    retained_batch_limit: usize,
+    history_limit: usize,
+}
+
+#[derive(Default)]
+struct DemoSessionStore {
+    sessions: HashMap<String, DemoSession>,
+}
+
+struct DemoSession {
+    state: AppState,
+    last_activity: Instant,
+}
+
+fn prune_expired_demo_sessions(store: &mut DemoSessionStore, now: Instant) {
+    store.sessions.retain(|_, session| {
+        let active = now.duration_since(session.last_activity) < DEMO_SESSION_IDLE_TIMEOUT;
+        if !active {
+            session.state.background_cancel.send_replace(true);
+        }
+        active
+    });
+}
+
+/// Request-scoped service state. In demo mode the extractor resolves the
+/// visitor's opaque cookie to an isolated in-memory state context.
+struct RequestState(AppState);
+
+impl FromRequestParts<AppState> for RequestState {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        app: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if !app.demo_mode {
+            return Ok(Self(app.clone()));
+        }
+        let session_id = demo_cookie_value(&parts.headers).ok_or_else(|| {
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                "demo_session_expired",
+                "Your demo session has expired. Reload the page to start a fresh demo.",
+            )
+        })?;
+        app.resolve_demo_session_state(session_id)
+            .await
+            .map(Self)
+            .ok_or_else(|| {
+                error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "demo_session_expired",
+                    "Your demo session has expired. Reload the page to start a fresh demo.",
+                )
+            })
+    }
 }
 
 struct AdapterCommandWaiter {
@@ -273,6 +346,8 @@ struct Inner {
     simulator_two: Option<Device>,
     #[serde(default)]
     simulator_two_config: Option<SimulatorConfig>,
+    #[serde(default)]
+    extra_simulators: HashMap<String, ExtraSimulator>,
     enrollments: HashMap<String, Enrollment>,
     commands: HashMap<String, Command>,
     command_idempotency: HashMap<String, String>,
@@ -302,6 +377,7 @@ struct DurableStateSnapshot<'a> {
     simulator_config: &'a SimulatorConfig,
     simulator_two: &'a Option<Device>,
     simulator_two_config: &'a Option<SimulatorConfig>,
+    extra_simulators: &'a HashMap<String, ExtraSimulator>,
     enrollments: &'a HashMap<String, Enrollment>,
     commands: &'a HashMap<String, Command>,
     command_idempotency: &'a HashMap<String, String>,
@@ -321,6 +397,7 @@ impl<'a> DurableStateSnapshot<'a> {
             simulator_config: &inner.simulator_config,
             simulator_two: &inner.simulator_two,
             simulator_two_config: &inner.simulator_two_config,
+            extra_simulators: &inner.extra_simulators,
             enrollments: &inner.enrollments,
             commands: &inner.commands,
             command_idempotency: &inner.command_idempotency,
@@ -332,6 +409,12 @@ impl<'a> DurableStateSnapshot<'a> {
             scanner: &inner.scanner,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExtraSimulator {
+    device: Device,
+    config: SimulatorConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +514,35 @@ impl AppState {
         Self::configured(true, Some(path.into()), None)
     }
 
+    /// Configure an isolated, simulator-only demo service.
+    pub fn with_demo_mode(mut self) -> Self {
+        self.demo_mode = true;
+        self.ble_enabled = false;
+        self.history_path = None;
+        self.history_storage_path = None;
+        self.data_path = None;
+        self.retained_command_limit = MAX_DEMO_COMMANDS;
+        self.retained_batch_limit = MAX_DEMO_BATCHES;
+        self.history_limit = MAX_DEMO_HISTORY;
+        self.demo_sessions = Some(Arc::new(Mutex::new(DemoSessionStore::default())));
+        self.queue_config.max_outstanding_commands = 32;
+        self.queue_config.max_queued_per_device = 8;
+        self.adapter_slots = Arc::new(Semaphore::new(self.queue_config.adapter_concurrency));
+        let mut inner = self
+            .inner
+            .try_lock()
+            .expect("new service state is not locked");
+        inner.simulator_enabled = true;
+        seed_demo_household(&mut inner, Utc::now());
+        drop(inner);
+        self
+    }
+
+    /// Construct a demo-mode service for embedded use and deterministic tests.
+    pub fn demo() -> Self {
+        Self::new().with_demo_mode()
+    }
+
     pub fn with_queue_config(mut self, config: QueueConfig) -> Result<Self, String> {
         let config = config.validate()?;
         self.adapter_slots = Arc::new(Semaphore::new(config.adapter_concurrency));
@@ -465,22 +577,37 @@ impl AppState {
     }
 
     pub async fn from_environment() -> io::Result<Self> {
-        let simulator_enabled = std::env::var("SOMARIS_SIMULATOR")
-            .map(|value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
-            .unwrap_or(true);
-        let history_path = std::env::var_os("SOMARIS_HISTORY_PATH").map(PathBuf::from);
-        let data_path = Some(
+        let demo_mode = std::env::var("SOMARIS_DEMO_MODE")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on"
+                )
+            })
+            .unwrap_or(false);
+        let simulator_enabled = demo_mode
+            || std::env::var("SOMARIS_SIMULATOR")
+                .map(|value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+                .unwrap_or(true);
+        let history_path = (!demo_mode)
+            .then(|| std::env::var_os("SOMARIS_HISTORY_PATH").map(PathBuf::from))
+            .flatten();
+        let data_path = (!demo_mode).then(|| {
             std::env::var_os("SOMARIS_DATA_DIR")
                 .map(|path| PathBuf::from(path).join("state.json"))
-                .unwrap_or_else(|| PathBuf::from("data/state.json")),
-        );
+                .unwrap_or_else(|| PathBuf::from("data/state.json"))
+        });
         let mut state = Self::configured(simulator_enabled, history_path, data_path);
-        state.ble_enabled = true;
         state = state
             .with_queue_config(QueueConfig::from_environment()?)
             .map_err(invalid_configuration)?;
         let origins = std::env::var("SOMARIS_ALLOWED_ORIGINS").unwrap_or_default();
         state.allowed_origins = parse_allowed_origins(&origins).map_err(invalid_configuration)?;
+        if demo_mode {
+            state = state.with_demo_mode();
+        } else {
+            state.ble_enabled = true;
+        }
         state.load_history_file().await?;
         state.load_durable_state().await?;
         state.resume_queued_commands().await;
@@ -510,6 +637,7 @@ impl AppState {
             simulator_config: SimulatorConfig::default(),
             simulator_two,
             simulator_two_config: Some(SimulatorConfig::default()),
+            extra_simulators: HashMap::new(),
             enrollments: HashMap::new(),
             commands: HashMap::new(),
             command_idempotency: HashMap::new(),
@@ -541,6 +669,7 @@ impl AppState {
         let queue_config = QueueConfig::default();
         let (pending_adapter_commands, _) = watch::channel(0_usize);
         let (scan_window_generation, _) = watch::channel(0_u64);
+        let (background_cancel, _) = watch::channel(false);
         Self {
             inner: Arc::new(Mutex::new(inner)),
             device_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -563,7 +692,84 @@ impl AppState {
             history_persisted_count: Arc::new(AtomicUsize::new(history_persisted_count)),
             data_path,
             state_changes: StateChangePublisher::default(),
+            demo_mode: false,
+            demo_sessions: None,
+            background_cancel,
+            retained_command_limit: MAX_COMMANDS,
+            retained_batch_limit: MAX_BATCHES,
+            history_limit: 50_000,
         }
+    }
+
+    fn new_demo_session_state(&self) -> AppState {
+        let mut state = Self::configured(true, None, None);
+        state.demo_mode = true;
+        state.ble_enabled = false;
+        state.queue_config = self.queue_config;
+        state.adapter_slots = Arc::new(Semaphore::new(state.queue_config.adapter_concurrency));
+        state.allowed_origins = self.allowed_origins.clone();
+        state.retained_command_limit = MAX_DEMO_COMMANDS;
+        state.retained_batch_limit = MAX_DEMO_BATCHES;
+        state.history_limit = MAX_DEMO_HISTORY;
+        let mut inner = state
+            .inner
+            .try_lock()
+            .expect("new session state is not locked");
+        seed_demo_household(&mut inner, Utc::now());
+        drop(inner);
+        state
+    }
+
+    async fn resolve_demo_session_state(&self, session_id: &str) -> Option<AppState> {
+        let sessions = self.demo_sessions.as_ref()?;
+        let now = Instant::now();
+        let mut store = sessions.lock().await;
+        prune_expired_demo_sessions(&mut store, now);
+        let session = store.sessions.get_mut(session_id)?;
+        session.last_activity = now;
+        Some(session.state.clone())
+    }
+
+    async fn create_or_refresh_demo_session(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<(String, AppState), Box<Response>> {
+        let Some(sessions) = &self.demo_sessions else {
+            return Err(Box::new(error_response(
+                StatusCode::NOT_FOUND,
+                "demo_mode_disabled",
+                "Demo sessions are not enabled on this service.",
+            )));
+        };
+        let now = Instant::now();
+        let requested_id = demo_cookie_value(headers);
+        let mut store = sessions.lock().await;
+        prune_expired_demo_sessions(&mut store, now);
+        if let Some(session_id) = requested_id
+            && let Some(session) = store.sessions.get_mut(session_id)
+        {
+            session.last_activity = now;
+            return Ok((session_id.to_owned(), session.state.clone()));
+        }
+        if store.sessions.len() >= MAX_DEMO_SESSIONS {
+            return Err(Box::new(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "demo_session_capacity",
+                "The demo is busy. Please try again in a few minutes.",
+            )));
+        }
+        let session_id = Uuid::new_v4().to_string();
+        let state = self.new_demo_session_state();
+        store.sessions.insert(
+            session_id.clone(),
+            DemoSession {
+                state: state.clone(),
+                last_activity: now,
+            },
+        );
+        drop(store);
+        state.spawn_background_tasks();
+        Ok((session_id, state))
     }
 
     async fn load_durable_state(&self) -> io::Result<()> {
@@ -678,6 +884,9 @@ impl AppState {
                 (persisted.simulator_two.as_mut(), second_config.as_ref())
             {
                 refresh_simulator_after_start(device, config, now);
+            }
+            for extra in persisted.extra_simulators.values_mut() {
+                refresh_simulator_after_start(&mut extra.device, &extra.config, now);
             }
         }
         *guard = persisted;
@@ -904,11 +1113,32 @@ impl AppState {
     }
 
     pub fn spawn_background_tasks(&self) {
+        if self.demo_mode
+            && let Some(sessions) = self.demo_sessions.clone()
+        {
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let mut store = sessions.lock().await;
+                    prune_expired_demo_sessions(&mut store, Instant::now());
+                }
+            });
+        }
         let state = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut cancelled = state.background_cancel.subscribe();
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = cancelled.changed() => {
+                        if changed.is_err() || *cancelled.borrow_and_update() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 let history = {
                     let mut inner = state.inner.lock().await;
                     let now = Utc::now();
@@ -945,6 +1175,26 @@ impl AppState {
                         advance_simulator(device, config, now);
                         device.last_seen_at = now;
                     }
+                    let mut extra_changed = false;
+                    for simulator in inner.extra_simulators.values_mut() {
+                        let before = simulator.device.position.as_ref().map(|position| {
+                            (
+                                position.current_closed_percent,
+                                position.target_closed_percent,
+                            )
+                        });
+                        if !simulator.config.telemetry_paused {
+                            advance_simulator(&mut simulator.device, &simulator.config, now);
+                            simulator.device.last_seen_at = now;
+                        }
+                        let after = simulator.device.position.as_ref().map(|position| {
+                            (
+                                position.current_closed_percent,
+                                position.target_closed_percent,
+                            )
+                        });
+                        extra_changed |= before != after;
+                    }
                     let primary_after = inner.simulator.position.as_ref().map(|position| {
                         (
                             position.current_closed_percent,
@@ -959,10 +1209,13 @@ impl AppState {
                             )
                         })
                     });
-                    if primary_before != primary_after || second_before != second_after {
+                    if primary_before != primary_after
+                        || second_before != second_after
+                        || extra_changed
+                    {
                         state.state_changes.publish();
                     }
-                    let recorded = record_history(&mut inner).unwrap_or(false);
+                    let recorded = record_history(&mut inner, state.history_limit).unwrap_or(false);
                     if recorded {
                         let revision = state.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
                         Some((state.pending_history(&inner.history), revision))
@@ -1269,7 +1522,7 @@ impl AppState {
                     history_changed |= record_history_for_device(&mut inner, simulator);
                 }
             }
-            prune_history(&mut inner);
+            prune_history(&mut inner, self.history_limit);
             if history_changed {
                 let revision = self.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
                 Some((self.pending_history(&inner.history), revision))
@@ -1472,6 +1725,7 @@ impl Default for SimulatorConfig {
 
 pub fn router(state: AppState) -> Router {
     let allowed_origins = state.allowed_origins.clone();
+    let demo_mode = state.demo_mode;
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(allowed_origins.clone()))
         .allow_methods([
@@ -1488,7 +1742,7 @@ pub fn router(state: AppState) -> Router {
             header::HeaderName::from_static("idempotency-key"),
         ])
         .expose_headers([header::ETAG]);
-    Router::new()
+    let app = Router::new()
         .route("/", get(ui_index))
         .route("/ui/style.css", get(ui_style))
         .route("/ui/components.css", get(ui_components_style))
@@ -1502,6 +1756,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/apple-touch-icon.png", get(ui_apple_touch_icon))
         .route("/api/v1/health", get(health).options(preflight))
         .route("/api/v1/ready", get(ready).options(preflight))
+        .route("/api/v1/demo", get(demo_info).options(preflight))
         .route("/api/v1/diagnostics", get(diagnostics).options(preflight))
         .route("/api/v1/devices", get(list_devices).options(preflight))
         .route("/api/v1/devices/{id}", get(get_device).options(preflight))
@@ -1564,12 +1819,18 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/openapi.json", get(openapi_json))
         .route("/openapi.yaml", get(openapi_yaml))
-        .route("/docs", get(api_docs))
-        .with_state(state)
+        .route("/docs", get(api_docs));
+    let app = if demo_mode {
+        app.route("/api/demo/session", post(demo_session).options(preflight))
+            .route("/api/demo/reset", post(reset_demo).options(preflight))
+    } else {
+        app
+    };
+    app.with_state(state)
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
-            allowed_origins,
+            (allowed_origins, demo_mode),
             enforce_cors_contract,
         ))
 }
@@ -1655,12 +1916,166 @@ async fn preflight() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+async fn demo_session(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state.demo_mode {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "demo_mode_disabled",
+            "Demo sessions are not enabled on this service.",
+        );
+    }
+    let (session_id, _) = match state.create_or_refresh_demo_session(&headers).await {
+        Ok(session) => session,
+        Err(response) => return *response,
+    };
+    let cookie = format!(
+        "{DEMO_SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={DEMO_SESSION_COOKIE_MAX_AGE_SECONDS}{}",
+        if request_is_secure(&headers) {
+            "; Secure"
+        } else {
+            ""
+        }
+    );
+    let mut response = Json(envelope(
+        DemoSessionInfo {
+            demo_mode: true,
+            idle_timeout_seconds: DEMO_SESSION_IDLE_TIMEOUT.as_secs(),
+        },
+        None,
+    ))
+    .into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn reset_demo(RequestState(state): RequestState) -> Response {
+    if !state.demo_mode {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let controls: Vec<_> = state
+        .command_controls
+        .lock()
+        .await
+        .values()
+        .cloned()
+        .collect();
+    for control in controls {
+        control.request_prewrite_cancel();
+    }
+    {
+        let mut inner = state.inner.lock().await;
+        seed_demo_household(&mut inner, Utc::now());
+    }
+    state.command_controls.lock().await.clear();
+    state.battery_controls.lock().await.clear();
+    state.state_changes.publish();
+    Json(envelope(
+        DemoResetResult {
+            reset: true,
+            message: "Your demo has been reset to its original household.".into(),
+        },
+        None,
+    ))
+    .into_response()
+}
+
+fn demo_cookie_value(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| {
+            (name == DEMO_SESSION_COOKIE && Uuid::parse_str(value).is_ok()).then_some(value)
+        })
+}
+
+fn request_is_secure(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
+        || headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|origin| origin.starts_with("https://"))
+}
+
+fn request_has_same_origin(request: &axum::extract::Request) -> bool {
+    let Some(origin) = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Url::parse(value).ok())
+    else {
+        return false;
+    };
+    if !matches!(origin.scheme(), "http" | "https")
+        || origin.host().is_none()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return false;
+    }
+    let scheme = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "http" | "https"))
+        .or_else(|| request.uri().scheme_str())
+        .unwrap_or("http");
+    let authority = request
+        .headers()
+        .get("x-forwarded-host")
+        .or_else(|| request.headers().get(header::HOST))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        });
+    let Some(authority) = authority else {
+        return false;
+    };
+    let Ok(expected) = Url::parse(&format!("{scheme}://{authority}")) else {
+        return false;
+    };
+    origin.origin() == expected.origin()
+}
+
 async fn enforce_cors_contract(
-    State(allowed_origins): State<Vec<HeaderValue>>,
+    State((allowed_origins, demo_mode)): State<(Vec<HeaderValue>, bool)>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
     let request_path = request.uri().path().to_owned();
+    if demo_mode
+        && request_path.starts_with("/api/")
+        && matches!(
+            *request.method(),
+            axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::DELETE
+        )
+        && !request_has_same_origin(&request)
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "demo_origin_denied",
+            "Demo changes must come from this Somaris page.",
+        );
+    }
     let is_preflight = request.method() == axum::http::Method::OPTIONS
         && request
             .headers()
@@ -1778,7 +2193,9 @@ fn static_response(
 async fn health(State(state): State<AppState>) -> Response {
     let inner = state.inner.lock().await;
     let scanner_status = inner.scanner.status.clone();
-    let status = if inner.scanner.adapter_available {
+    let bluetooth_adapter_ready = inner.scanner.adapter_available;
+    let simulator_ready = inner.simulator_enabled;
+    let status = if (state.demo_mode && simulator_ready) || bluetooth_adapter_ready {
         "healthy"
     } else {
         "degraded"
@@ -1786,6 +2203,9 @@ async fn health(State(state): State<AppState>) -> Response {
     let data = HealthData {
         status: status.to_owned(),
         scanner_status,
+        demo_mode: state.demo_mode,
+        simulator_ready,
+        bluetooth_adapter_ready,
         generated_at: Utc::now(),
     };
     Json(envelope(data, None)).into_response()
@@ -1793,10 +2213,15 @@ async fn health(State(state): State<AppState>) -> Response {
 
 async fn ready(State(state): State<AppState>) -> Response {
     let inner = state.inner.lock().await;
-    let ready = inner.scanner.adapter_available;
+    let bluetooth_adapter_ready = inner.scanner.adapter_available;
+    let simulator_ready = inner.simulator_enabled;
+    let ready = (state.demo_mode && simulator_ready) || bluetooth_adapter_ready;
     let data = HealthData {
         status: if ready { "healthy" } else { "degraded" }.to_owned(),
         scanner_status: inner.scanner.status.clone(),
+        demo_mode: state.demo_mode,
+        simulator_ready,
+        bluetooth_adapter_ready,
         generated_at: Utc::now(),
     };
     let status = if ready {
@@ -1807,7 +2232,17 @@ async fn ready(State(state): State<AppState>) -> Response {
     (status, Json(envelope(data, None))).into_response()
 }
 
-async fn diagnostics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn demo_info(State(state): State<AppState>) -> Response {
+    let inner = state.inner.lock().await;
+    let data = DemoModeInfo {
+        demo_mode: state.demo_mode,
+        simulator_ready: inner.simulator_enabled,
+        bluetooth_adapter_ready: inner.scanner.adapter_available,
+    };
+    Json(envelope(data, None)).into_response()
+}
+
+async fn diagnostics(RequestState(state): RequestState, headers: HeaderMap) -> Response {
     let mut inner = state.inner.lock().await;
     prune_registry(&mut inner, Utc::now());
     let retained = inner.devices.len()
@@ -1825,6 +2260,8 @@ async fn diagnostics(State(state): State<AppState>, headers: HeaderMap) -> Respo
         service_started_at: state.started_at,
         uptime_seconds: state.started.elapsed().as_secs_f64(),
         history_enabled: state.history_path.is_some(),
+        demo_mode: state.demo_mode,
+        simulator_ready: inner.simulator_enabled,
         scanner: ScannerDiagnostics {
             status: inner.scanner.status.clone(),
             adapter_available: inner.scanner.adapter_available,
@@ -1848,13 +2285,15 @@ async fn diagnostics(State(state): State<AppState>, headers: HeaderMap) -> Respo
     let validator = DiagnosticsValidator {
         service_started_at: data.service_started_at,
         history_enabled: data.history_enabled,
+        demo_mode: data.demo_mode,
+        simulator_ready: data.simulator_ready,
         scanner: &data.scanner,
         registry: &data.registry,
     };
     conditional_json(&headers, validator, envelope(&data, None))
 }
 
-async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn list_devices(RequestState(state): RequestState, headers: HeaderMap) -> Response {
     let mut inner = state.inner.lock().await;
     prune_registry(&mut inner, Utc::now());
     let mut devices: Vec<_> = inner.devices.values().cloned().collect();
@@ -1870,7 +2309,7 @@ async fn list_devices(State(state): State<AppState>, headers: HeaderMap) -> Resp
 }
 
 async fn get_device(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     RoutePath(id): RoutePath<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -1899,7 +2338,7 @@ async fn get_device(
 }
 
 async fn get_history(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     headers: HeaderMap,
     query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> Response {
@@ -1998,7 +2437,7 @@ async fn get_history(
     conditional_json(&headers, validator, &data)
 }
 
-async fn get_audit_log(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn get_audit_log(RequestState(state): RequestState, headers: HeaderMap) -> Response {
     let inner = state.inner.lock().await;
     let entries: Vec<_> = inner
         .audit_log
@@ -2014,7 +2453,7 @@ async fn get_audit_log(State(state): State<AppState>, headers: HeaderMap) -> Res
     )
 }
 
-async fn get_simulator(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn get_simulator(RequestState(state): RequestState, headers: HeaderMap) -> Response {
     let inner = state.inner.lock().await;
     if !inner.simulator_enabled {
         return error_response(
@@ -2029,7 +2468,7 @@ async fn get_simulator(State(state): State<AppState>, headers: HeaderMap) -> Res
     conditional_json(&headers, data.clone(), envelope(data, None))
 }
 
-async fn list_simulators(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn list_simulators(RequestState(state): RequestState, headers: HeaderMap) -> Response {
     let inner = state.inner.lock().await;
     if !inner.simulator_enabled {
         return error_response(
@@ -2047,14 +2486,14 @@ async fn list_simulators(State(state): State<AppState>, headers: HeaderMap) -> R
 }
 
 async fn set_simulator_scenario(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     payload: Result<Json<SimulatorScenarioRequest>, JsonRejection>,
 ) -> Response {
     set_simulator_scenario_for(state, SIMULATOR_ID, payload).await
 }
 
 async fn set_named_simulator_scenario(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     RoutePath(id): RoutePath<String>,
     payload: Result<Json<SimulatorScenarioRequest>, JsonRejection>,
 ) -> Response {
@@ -2155,14 +2594,14 @@ async fn set_simulator_scenario_for(
 }
 
 async fn reset_simulator(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     payload: Result<Json<SimulatorResetRequest>, JsonRejection>,
 ) -> Response {
     reset_simulator_for(state, SIMULATOR_ID, payload).await
 }
 
 async fn reset_named_simulator(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     RoutePath(id): RoutePath<String>,
     payload: Result<Json<SimulatorResetRequest>, JsonRejection>,
 ) -> Response {
@@ -2208,7 +2647,7 @@ async fn reset_simulator_for(
     device.movement_status = MovementStatus::AtTarget;
     device.last_seen_at = now;
     let subject = device.advertised_name.clone();
-    let history_changed = match record_history(&mut inner) {
+    let history_changed = match record_history(&mut inner, state.history_limit) {
         Ok(changed) => changed,
         Err(record) => {
             return error_response(
@@ -2405,7 +2844,29 @@ struct ApiError {
 struct HealthData {
     status: String,
     scanner_status: String,
+    demo_mode: bool,
+    simulator_ready: bool,
+    bluetooth_adapter_ready: bool,
     generated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DemoModeInfo {
+    demo_mode: bool,
+    simulator_ready: bool,
+    bluetooth_adapter_ready: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DemoSessionInfo {
+    demo_mode: bool,
+    idle_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DemoResetResult {
+    reset: bool,
+    message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2413,6 +2874,8 @@ struct Diagnostics {
     service_started_at: DateTime<Utc>,
     uptime_seconds: f64,
     history_enabled: bool,
+    demo_mode: bool,
+    simulator_ready: bool,
     scanner: ScannerDiagnostics,
     registry: RegistryDiagnostics,
 }
@@ -2421,6 +2884,8 @@ struct Diagnostics {
 struct DiagnosticsValidator<'a> {
     service_started_at: DateTime<Utc>,
     history_enabled: bool,
+    demo_mode: bool,
+    simulator_ready: bool,
     scanner: &'a ScannerDiagnostics,
     registry: &'a RegistryDiagnostics,
 }
@@ -2597,6 +3062,8 @@ pub struct Enrollment {
     logical_id: String,
     pub is_simulated: bool,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3127,6 +3594,106 @@ fn make_simulated_device(id: &str, name: &str, now: DateTime<Utc>) -> Device {
     }
 }
 
+fn seed_demo_household(inner: &mut Inner, now: DateTime<Utc>) {
+    let fixtures = [
+        (SIMULATOR_ID, "Living Room — Main Window", "Living Room", 75),
+        (
+            SECOND_SIMULATOR_ID,
+            "Living Room — Side Window",
+            "Living Room",
+            50,
+        ),
+        ("simulator-3", "Bedroom — Blackout Blind", "Bedroom", 100),
+        ("simulator-4", "Study — Desk Window", "Study", 25),
+    ];
+    inner.simulator_enabled = true;
+    retarget_simulated_device(&mut inner.simulator, SIMULATOR_ID, fixtures[0].1);
+    if inner.simulator_two.is_none() {
+        inner.simulator_two = Some(make_simulated_device(
+            SECOND_SIMULATOR_ID,
+            fixtures[1].1,
+            now,
+        ));
+    }
+    if let Some(device) = inner.simulator_two.as_mut() {
+        retarget_simulated_device(device, SECOND_SIMULATOR_ID, fixtures[1].1);
+    }
+    inner.simulator_config = SimulatorConfig::default();
+    inner.simulator_two_config = Some(SimulatorConfig::default());
+    inner.extra_simulators.clear();
+    for (id, name, _, _) in fixtures.iter().skip(2) {
+        inner.extra_simulators.insert(
+            (*id).to_owned(),
+            ExtraSimulator {
+                device: make_simulated_device(id, name, now),
+                config: SimulatorConfig::default(),
+            },
+        );
+    }
+    for (id, _, _, position) in fixtures {
+        if let Some((device, _)) = simulator_by_id_mut(inner, id) {
+            set_simulator_position(device, position, position, now);
+        }
+    }
+
+    inner.devices.clear();
+    inner.enrollments.clear();
+    for (id, name, room, _) in fixtures {
+        let Some((device, _)) = simulator_by_id(inner, id) else {
+            continue;
+        };
+        let Some(logical_id) = device.logical_id.clone() else {
+            continue;
+        };
+        let enrollment = Enrollment {
+            id: format!("demo-{id}"),
+            label: name.to_owned(),
+            advertised_name: name.to_owned(),
+            logical_id,
+            is_simulated: true,
+            created_at: now,
+            room: Some(room.to_owned()),
+        };
+        inner.enrollments.insert(enrollment.id.clone(), enrollment);
+    }
+    inner.commands.clear();
+    inner.command_idempotency.clear();
+    inner.batches.clear();
+    inner.batch_idempotency.clear();
+    inner.audit_log.clear();
+    inner.calibration_sessions.clear();
+    inner.history.clear();
+    inner.latest_history_by_device.clear();
+    inner.next_cursor = 1;
+    inner.scanner = ScannerCounters::unavailable();
+}
+
+fn set_simulator_position(
+    device: &mut Device,
+    current_closed_percent: u8,
+    target_closed_percent: u8,
+    observed_at: DateTime<Utc>,
+) {
+    device.position = Some(position_value(
+        current_closed_percent,
+        target_closed_percent,
+        observed_at,
+        Source::Simulator,
+    ));
+    device.last_seen_at = observed_at;
+    device.position_status = PositionStatus::Observed;
+    device.movement_status = movement_status(current_closed_percent, target_closed_percent);
+    let payload = simulated_manufacturer_payload(
+        &device.advertised_name,
+        current_closed_percent,
+        target_closed_percent,
+    );
+    let mut manufacturer_data = SOMA_MANUFACTURER_ID.to_le_bytes().to_vec();
+    manufacturer_data.extend_from_slice(&payload);
+    device.manufacturer_data_hex = hex::encode(manufacturer_data);
+    device.manufacturer_payload_hex = hex::encode(payload);
+}
+
 fn initialize_simulators(inner: &mut Inner, now: DateTime<Utc>) {
     let previous_primary_logical_id = inner.simulator.logical_id.clone();
     retarget_simulated_device(&mut inner.simulator, SIMULATOR_ID, SIMULATOR_NAME);
@@ -3228,7 +3795,10 @@ fn simulator_by_id<'a>(inner: &'a Inner, id: &str) -> Option<(&'a Device, &'a Si
             .simulator_two
             .as_ref()
             .zip(inner.simulator_two_config.as_ref()),
-        _ => None,
+        _ => inner
+            .extra_simulators
+            .get(id)
+            .map(|simulator| (&simulator.device, &simulator.config)),
     }
 }
 
@@ -3242,30 +3812,33 @@ fn simulator_by_id_mut<'a>(
             .simulator_two
             .as_mut()
             .zip(inner.simulator_two_config.as_mut()),
-        _ => None,
+        _ => inner
+            .extra_simulators
+            .get_mut(id)
+            .map(|simulator| (&mut simulator.device, &mut simulator.config)),
     }
 }
 
 fn simulator_id_for_logical_id(inner: &Inner, logical_id: &str) -> Option<&'static str> {
-    [SIMULATOR_ID, SECOND_SIMULATOR_ID].into_iter().find(|id| {
+    DEMO_SIMULATOR_IDS.into_iter().find(|id| {
         simulator_by_id(inner, id)
             .is_some_and(|(device, _)| device.logical_id.as_deref() == Some(logical_id))
     })
 }
 
 fn simulator_count(inner: &Inner) -> usize {
-    1 + usize::from(inner.simulator_two.is_some())
+    1 + usize::from(inner.simulator_two.is_some()) + inner.extra_simulators.len()
 }
 
 fn simulator_snapshots(inner: &Inner) -> Vec<Device> {
-    [SIMULATOR_ID, SECOND_SIMULATOR_ID]
+    DEMO_SIMULATOR_IDS
         .into_iter()
         .filter_map(|id| simulator_by_id(inner, id).map(|(device, _)| device_snapshot(device)))
         .collect()
 }
 
 fn simulator_statuses(inner: &Inner) -> Vec<SimulatorStatus> {
-    [SIMULATOR_ID, SECOND_SIMULATOR_ID]
+    DEMO_SIMULATOR_IDS
         .into_iter()
         .filter_map(|id| {
             simulator_by_id(inner, id).map(|(device, config)| simulator_status(device, config))
@@ -3293,7 +3866,7 @@ fn simulator_status(device: &Device, config: &SimulatorConfig) -> SimulatorStatu
     }
 }
 
-fn record_history(inner: &mut Inner) -> Result<bool, String> {
+fn record_history(inner: &mut Inner, history_limit: usize) -> Result<bool, String> {
     let mut devices: Vec<_> = inner.devices.values().cloned().collect();
     if inner.simulator_enabled {
         devices.extend(simulator_snapshots(inner));
@@ -3302,7 +3875,7 @@ fn record_history(inner: &mut Inner) -> Result<bool, String> {
     for device in devices {
         changed |= record_history_for_device(inner, &device);
     }
-    prune_history(inner);
+    prune_history(inner, history_limit);
     Ok(changed)
 }
 
@@ -3349,9 +3922,9 @@ fn record_history_for_device(inner: &mut Inner, device: &Device) -> bool {
     true
 }
 
-fn prune_history(inner: &mut Inner) {
-    if inner.history.len() > 50_000 {
-        let remove = inner.history.len() - 50_000;
+fn prune_history(inner: &mut Inner, history_limit: usize) {
+    if inner.history.len() > history_limit {
+        let remove = inner.history.len() - history_limit;
         for _ in 0..remove {
             let Some(record) = inner.history.pop_front() else {
                 break;
@@ -3650,7 +4223,7 @@ fn device_snapshot(simulator: &Device) -> Device {
     device
 }
 
-async fn list_managed_devices(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn list_managed_devices(RequestState(state): RequestState, headers: HeaderMap) -> Response {
     let devices = state.managed_devices_snapshot().await;
     conditional_json(
         &headers,
@@ -3660,7 +4233,7 @@ async fn list_managed_devices(State(state): State<AppState>, headers: HeaderMap)
 }
 
 async fn enroll_device(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     payload: Result<Json<EnrollmentRequest>, JsonRejection>,
 ) -> Response {
     let request = match parse_json(payload) {
@@ -3698,6 +4271,13 @@ async fn enroll_device(
             "The observed device was not found.",
         );
     };
+    if state.demo_mode && !observed.is_simulated {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "physical_control_disabled",
+            "Physical devices cannot be enrolled in demo mode.",
+        );
+    }
     if observed.freshness != Freshness::Fresh {
         return error_response(
             StatusCode::CONFLICT,
@@ -3729,12 +4309,20 @@ async fn enroll_device(
             .values()
             .filter(|entry| entry.is_simulated)
             .count()
-            >= MAX_SIMULATOR_ENROLLMENTS
+            >= if state.demo_mode {
+                DEMO_SIMULATOR_IDS.len()
+            } else {
+                MAX_SIMULATOR_ENROLLMENTS
+            }
     {
         return error_response(
             StatusCode::CONFLICT,
             "simulator_limit_reached",
-            "A maximum of two simulators can be enrolled. Remove a simulator before adding another.",
+            if state.demo_mode {
+                "A maximum of four demo blinds can be enrolled. Remove one before adding another."
+            } else {
+                "A maximum of two simulators can be enrolled. Remove a simulator before adding another."
+            },
         );
     }
     if !observed.is_simulated
@@ -3762,6 +4350,7 @@ async fn enroll_device(
         logical_id,
         is_simulated: observed.is_simulated,
         created_at: Utc::now(),
+        room: None,
     };
     inner
         .enrollments
@@ -3786,7 +4375,7 @@ async fn enroll_device(
 }
 
 async fn remove_enrollment(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     RoutePath(id): RoutePath<String>,
 ) -> Response {
     let mut inner = state.inner.lock().await;
@@ -3841,7 +4430,7 @@ async fn remove_enrollment(
 }
 
 async fn queue_command(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     RoutePath(id): RoutePath<String>,
     headers: HeaderMap,
     payload: Result<Json<CommandRequest>, JsonRejection>,
@@ -3933,7 +4522,7 @@ async fn queue_command(
 }
 
 async fn toggle_device(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     RoutePath(id): RoutePath<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -3994,7 +4583,7 @@ async fn toggle_device(
 }
 
 async fn queue_batch(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     headers: HeaderMap,
     payload: Result<Json<BatchCommandRequest>, JsonRejection>,
 ) -> Response {
@@ -4032,8 +4621,8 @@ async fn queue_batch(
                 "Idempotency-Key was already used with a different batch action.",
             );
         }
-        prune_journal(&mut inner);
-        prune_batch_journal(&mut inner);
+        prune_journal(&mut inner, state.retained_command_limit);
+        prune_batch_journal(&mut inner, state.retained_batch_limit);
         let mut enrollments: Vec<_> = inner.enrollments.values().cloned().collect();
         enrollments.sort_by(|a, b| a.label.cmp(&b.label));
         let ready_count = enrollments
@@ -4046,8 +4635,8 @@ async fn queue_batch(
                         || cooldown_remaining_seconds(&inner, &enrollment.id, Utc::now()).is_none())
             })
             .count();
-        if inner.commands.len().saturating_add(ready_count) > MAX_COMMANDS
-            || inner.batches.len() >= MAX_BATCHES
+        if inner.commands.len().saturating_add(ready_count) > state.retained_command_limit
+            || inner.batches.len() >= state.retained_batch_limit
         {
             return error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -4197,7 +4786,7 @@ async fn queue_batch(
 }
 
 async fn get_batch(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     RoutePath(id): RoutePath<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -4213,7 +4802,7 @@ async fn get_batch(
 }
 
 async fn get_command(
-    State(state): State<AppState>,
+    RequestState(state): RequestState,
     RoutePath(id): RoutePath<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -4248,7 +4837,7 @@ async fn command_snapshot(state: &AppState, command_id: &str) -> Option<Command>
     Some(command)
 }
 
-async fn get_queue(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn get_queue(RequestState(state): RequestState, headers: HeaderMap) -> Response {
     let inner = state.inner.lock().await;
     let pending: Vec<_> = inner
         .commands
@@ -4350,7 +4939,7 @@ fn make_command(
     }
 }
 
-fn prune_journal(inner: &mut Inner) {
+fn prune_journal(inner: &mut Inner, retained_limit: usize) {
     let cutoff = Utc::now() - ChronoDuration::hours(24);
     let mut terminal: Vec<_> = inner
         .commands
@@ -4375,7 +4964,7 @@ fn prune_journal(inner: &mut Inner) {
         .collect();
     let mut remaining = inner.commands.len().saturating_sub(remove.len());
     for (_, id) in terminal {
-        if remaining < MAX_COMMANDS {
+        if remaining < retained_limit {
             break;
         }
         if remove.insert(id) {
@@ -4391,7 +4980,7 @@ fn prune_journal(inner: &mut Inner) {
         .retain(|_, command_id| retained.contains(command_id));
 }
 
-fn prune_batch_journal(inner: &mut Inner) {
+fn prune_batch_journal(inner: &mut Inner, retained_limit: usize) {
     let cutoff = Utc::now() - ChronoDuration::hours(24);
     let mut terminal: Vec<_> = inner
         .batches
@@ -4411,7 +5000,7 @@ fn prune_batch_journal(inner: &mut Inner) {
         .collect();
     let mut remaining = inner.batches.len().saturating_sub(remove.len());
     for (_, id) in terminal {
-        if remaining < MAX_BATCHES {
+        if remaining < retained_limit {
             break;
         }
         if remove.insert(id) {
@@ -4453,8 +5042,8 @@ async fn submit_command(
             "Idempotency-Key was already used with a different action.",
         ));
     }
-    prune_journal(&mut inner);
-    if inner.commands.len() >= MAX_COMMANDS {
+    prune_journal(&mut inner, state.retained_command_limit);
+    if inner.commands.len() >= state.retained_command_limit {
         return Err(ApiFailure::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "command_journal_full",
@@ -5086,6 +5675,13 @@ async fn process_command_with_retry_budget(
 
     let mut inner = state.inner.lock().await;
     let now = Utc::now();
+    if !inner
+        .commands
+        .get(&command_id)
+        .is_some_and(|command| command.status == CommandStatus::Connecting)
+    {
+        return;
+    }
     let simulator_enabled = inner.simulator_enabled;
     let Some((device, config)) = simulator_by_id_mut(&mut inner, simulator_id) else {
         return;
@@ -5217,7 +5813,7 @@ async fn process_command_with_retry_budget(
             SimulatorScenario::Normal | SimulatorScenario::OutcomeUnknown
         )
     {
-        if record_history(&mut inner).unwrap_or(false) {
+        if record_history(&mut inner, state.history_limit).unwrap_or(false) {
             state.history_revision.fetch_add(1, Ordering::AcqRel);
         }
         let history_revision = state.history_revision.load(Ordering::Acquire);
@@ -6513,6 +7109,33 @@ fn command_status_text(status: CommandStatus) -> &'static str {
 mod security_hardening_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn expired_demo_session_signals_its_simulator_task_to_stop() {
+        let service = AppState::demo();
+        let session = service.new_demo_session_state();
+        let mut cancellation = session.background_cancel.subscribe();
+        session.spawn_background_tasks();
+
+        let mut store = DemoSessionStore::default();
+        store.sessions.insert(
+            "expired".into(),
+            DemoSession {
+                state: session,
+                last_activity: Instant::now()
+                    - DEMO_SESSION_IDLE_TIMEOUT
+                    - StdDuration::from_secs(1),
+            },
+        );
+        prune_expired_demo_sessions(&mut store, Instant::now());
+
+        assert!(store.sessions.is_empty());
+        tokio::time::timeout(StdDuration::from_secs(1), cancellation.changed())
+            .await
+            .expect("expired session cancellation should be delivered")
+            .expect("cancellation sender remains alive through the task");
+        assert!(*cancellation.borrow_and_update());
+    }
+
     fn history_sample(
         cursor: u64,
         seconds_ago: i64,
@@ -6641,7 +7264,7 @@ mod security_hardening_tests {
             (SECOND_SIMULATOR_ID, "Simulator 2"),
         ] {
             let response = enroll_device(
-                State(state.clone()),
+                RequestState(state.clone()),
                 Ok(Json(EnrollmentRequest {
                     observed_device_id: id.into(),
                     label: label.into(),
@@ -6652,7 +7275,7 @@ mod security_hardening_tests {
         }
 
         let rejected = enroll_device(
-            State(state.clone()),
+            RequestState(state.clone()),
             Ok(Json(EnrollmentRequest {
                 observed_device_id: "simulator-3".into(),
                 label: third_name.into(),
@@ -6667,7 +7290,7 @@ mod security_hardening_tests {
         assert_eq!(error["error"]["code"], "simulator_limit_reached");
 
         let physical = enroll_device(
-            State(state.clone()),
+            RequestState(state.clone()),
             Ok(Json(EnrollmentRequest {
                 observed_device_id: "physical-1".into(),
                 label: "Physical Blind".into(),
@@ -6698,12 +7321,15 @@ mod security_hardening_tests {
             .clone();
         drop(inner);
 
-        let removed =
-            remove_enrollment(State(state.clone()), RoutePath(removable_simulator_id)).await;
+        let removed = remove_enrollment(
+            RequestState(state.clone()),
+            RoutePath(removable_simulator_id),
+        )
+        .await;
         assert_eq!(removed.status(), StatusCode::NO_CONTENT);
 
         let replacement = enroll_device(
-            State(state.clone()),
+            RequestState(state.clone()),
             Ok(Json(EnrollmentRequest {
                 observed_device_id: "simulator-3".into(),
                 label: third_name.into(),
@@ -6802,6 +7428,7 @@ mod security_hardening_tests {
                     logical_id: old_logical_id,
                     is_simulated: true,
                     created_at: Utc::now(),
+                    room: None,
                 },
             );
             let mut persisted = serde_json::to_value(&*inner).unwrap();
@@ -7053,6 +7680,7 @@ mod security_hardening_tests {
                     logical_id: "soma-1023".into(),
                     is_simulated: false,
                     created_at: Utc::now(),
+                    room: None,
                 },
             );
         }
@@ -7086,6 +7714,7 @@ mod security_hardening_tests {
                     logical_id,
                     is_simulated: false,
                     created_at: Utc::now(),
+                    room: None,
                 },
             );
         }
@@ -7123,6 +7752,7 @@ mod security_hardening_tests {
                     logical_id,
                     is_simulated: false,
                     created_at: Utc::now(),
+                    room: None,
                 },
             );
         }
@@ -7164,6 +7794,7 @@ mod security_hardening_tests {
                     logical_id: device.logical_id.clone().unwrap(),
                     is_simulated: false,
                     created_at: Utc::now(),
+                    room: None,
                 };
                 inner.enrollments.insert(enrollment.id.clone(), enrollment);
             }
@@ -7288,6 +7919,7 @@ mod security_hardening_tests {
                     logical_id: "soma-enrolled-ambiguous".into(),
                     is_simulated: false,
                     created_at: Utc::now(),
+                    room: None,
                 },
             );
         }
@@ -7337,7 +7969,7 @@ mod security_hardening_tests {
             inner.history.push_back(record);
         }
 
-        prune_history(&mut inner);
+        prune_history(&mut inner, 50_000);
 
         assert_eq!(inner.history.len(), 50_000);
         assert_eq!(inner.history.front().unwrap().cursor, 2);

@@ -1124,10 +1124,13 @@ async fn durable_audit_log_is_trimmed_to_thirty_entries_when_loaded() {
 
 #[tokio::test]
 async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
-    let app = router(AppState::new());
+    let app = router(AppState::demo());
     let expected: &[(&str, &[&str])] = &[
         ("/api/v1/health", &["get", "options"]),
         ("/api/v1/ready", &["get", "options"]),
+        ("/api/v1/demo", &["get", "options"]),
+        ("/api/demo/session", &["post", "options"]),
+        ("/api/demo/reset", &["post", "options"]),
         ("/api/v1/diagnostics", &["get", "options"]),
         ("/api/v1/devices", &["get", "options"]),
         ("/api/v1/devices/{id}", &["get", "options"]),
@@ -1158,6 +1161,49 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
     assert_eq!(status, StatusCode::OK);
     let contract = contract.unwrap();
     assert_eq!(contract["info"]["title"], "Somaris API");
+    assert_eq!(contract["info"]["version"], "1.3.0");
+    assert_eq!(
+        contract["paths"]["/api/demo/session"]["post"]["responses"]["200"]["headers"]["Set-Cookie"]
+            ["schema"]["type"],
+        "string"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["DemoModeInfoEnvelope"]["properties"]["data"]["properties"]
+            ["demo_mode"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["DemoModeInfoEnvelope"]["properties"]["data"]["properties"]
+            ["simulator_ready"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["DemoModeInfoEnvelope"]["properties"]["data"]["properties"]
+            ["bluetooth_adapter_ready"]["type"],
+        "boolean"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["Enrollment"]["properties"]["room"]["type"],
+        "string"
+    );
+    for path in [
+        "/api/v1/diagnostics",
+        "/api/v1/devices",
+        "/api/v1/devices/{id}",
+        "/api/dev/simulators/{id}/scenario",
+        "/api/dev/simulators/{id}/reset",
+        "/api/control/v1/devices/{id}/commands",
+        "/api/control/v1/batches/{id}",
+    ] {
+        assert!(
+            contract["paths"][path]["parameters"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|parameter| parameter["$ref"] == "#/components/parameters/DemoSessionCookie"),
+            "demo session cookie missing from {path}"
+        );
+    }
     let managed = &contract["components"]["schemas"]["ManagedDevice"]["properties"];
     for field in [
         "capabilities",
@@ -1295,6 +1341,22 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
     }
 
     for (path, path_item) in contract["paths"].as_object().unwrap() {
+        let path_parameters = path_item["parameters"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for variable in path
+            .split('{')
+            .skip(1)
+            .filter_map(|part| part.split('}').next())
+        {
+            assert!(
+                path_parameters
+                    .iter()
+                    .any(|parameter| parameter["in"] == "path" && parameter["name"] == variable),
+                "OpenAPI path parameter {{{variable}}} is missing from {path}"
+            );
+        }
         let Some((_, expected_methods)) =
             expected.iter().find(|(known, _)| *known == path.as_str())
         else {
