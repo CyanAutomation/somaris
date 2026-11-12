@@ -143,7 +143,8 @@ const app = typeof document === 'undefined' ? null : document.querySelector<HTML
 const snackbarRoot = typeof document === 'undefined' ? null : document.querySelector<HTMLElement>('#snackbar-root');
 let renderSnackbars: (items: SnackbarItem[]) => void = () => {};
 const snackbarQueue = new SnackbarQueue({onChange:items => renderSnackbars(items)});
-const state: DashboardState = {managed:[], observations:[], diagnostics:null, activity:[], commands:{}, batch:null, serviceError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, busy:new Set(), reconciliationRequired:new Set(), tokens:{}, simulators:null, notify:item=>snackbarQueue.push(item), dismissNotification:key=>snackbarQueue.dismissByKey(key)};
+const state: DashboardState = {demoMode:false, managed:[], observations:[], diagnostics:null, activity:[], commands:{}, batch:null, serviceError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, busy:new Set(), reconciliationRequired:new Set(), tokens:{}, simulators:null, notify:item=>snackbarQueue.push(item), dismissNotification:key=>snackbarQueue.dismissByKey(key)};
+let demoSessionRecovery: Promise<void> | null = null;
 let displayPreference = storedDisplayPreference();
 const esc = escapeHtml;
 const relative = (date: string | null | undefined): string => { if (!date) return 'Never seen'; const seconds = Math.max(0, Math.floor((Date.now()-new Date(date).getTime())/1000)); if (!Number.isFinite(seconds)) return 'Time unavailable'; if(seconds < 60) return 'Seen just now'; if(seconds < 3600) return `Seen ${Math.floor(seconds/60)} min ago`; if(seconds < 86400) return `Seen ${Math.floor(seconds/3600)} hr ago`; return `Seen ${Math.floor(seconds/86400)} days ago`; };
@@ -157,8 +158,8 @@ function apiError(error: unknown): ApiError {
 function errorMessage(error: unknown): string {
  return error instanceof Error ? error.message : String(error);
 }
-async function api<T = unknown>(path: string, options: RequestInit = {}): Promise<T> {
- const response = await fetch(path, {cache:'no-store', ...options});
+async function api<T = unknown>(path: string, options: RequestInit = {}, recoverExpiredSession = true): Promise<T> {
+ const response = await fetch(path, {cache:'no-store', credentials:'same-origin', ...options});
  const body: unknown = await response.json().catch(() => ({}));
  const envelope = isRecord(body) ? body : {};
  const errorValue = isRecord(envelope.error) ? envelope.error : {};
@@ -166,6 +167,19 @@ async function api<T = unknown>(path: string, options: RequestInit = {}): Promis
   const error = new Error(String(errorValue.message ?? envelope.message ?? `Request failed (${response.status})`)) as ApiError;
   error.status = response.status;
   if (typeof errorValue.code === 'string') error.code = errorValue.code;
+  if (recoverExpiredSession && state.demoMode && error.code === 'demo_session_expired' && path !== '/api/demo/session') {
+   if (!demoSessionRecovery) {
+    demoSessionRecovery = api('/api/demo/session', {method:'POST'}, false)
+     .then(() => {
+      state.commands = {}; state.batch = null; state.busy.clear(); state.reconciliationRequired.clear();
+      snackbarQueue.push({message:'Your demo session expired. A fresh demonstration was started.',tone:'warning'});
+     })
+     .finally(() => { demoSessionRecovery = null; });
+   }
+   await demoSessionRecovery;
+   if (!options.method || options.method.toUpperCase() === 'GET') return api<T>(path, options, false);
+   error.message = 'Your demo session expired and a fresh demo was started. Review the reset demo before continuing.';
+  }
   throw error;
  }
  return envelope.data as T;
@@ -423,7 +437,7 @@ function card(device: ManagedDevice): string {
  const calibrationMessage=device.calibration_mode_active?'<p class="message warn">Endpoint calibration is active. Normal movement is paused until calibration ends.</p>':'';
  const footerMarkup=`${batteryDisplay(o?.battery)}<button type="button" class="text-button" data-action="details:${esc(e.id)}">View details &nbsp; ↗</button>`;
  return renderBlindCard({
-  id:e.id, label:blindLabel, isSimulated:e.is_simulated, lastSeen:relative(device.last_seen_at),
+  id:e.id, label:blindLabel, isSimulated:e.is_simulated, room:e.room, lastSeen:relative(device.last_seen_at),
   availabilityLabel:label, availabilityTone:tone,
   availabilityStatus:device.availability,
   positionPercent:p, movementStatus:o?.movement_status ?? 'unavailable', blindLines:lines,
@@ -443,7 +457,7 @@ function activityPanel() {
 }
 function home() {
  const panelMode = document.documentElement.dataset.displayMode === 'panel';
- const hero = panelMode ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div></section>`;
+ const hero = panelMode ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>${state.demoMode?'Explore a simulated home.':'Your space, your way.'}</h1><p>${state.demoMode?'Control four simulated blinds. Your changes only affect this demonstration.':'A quieter way to keep your blinds just where you like them.'}</p></div></section>`;
  const empty = panelMode
   ? `<div class="panel empty"><h3>No blinds yet</h3><p>Add a nearby blind to see its status and controls here.</p></div>`
   : `<div class="panel empty"><div class="empty-icon">☼</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p></div>`;
@@ -467,7 +481,7 @@ function home() {
  });
  return `${hero}${listMarkup}${supportingSections}`;
 }
-function scannerSummary(){ const s=state.diagnostics?.scanner; if(!s) return 'Service status unavailable'; return s.adapter_available ? (s.scan_active?'Bluetooth adapter available · scanning':'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
+function scannerSummary(){ const s=state.diagnostics?.scanner; if(state.demoMode)return state.diagnostics?.simulator_ready?'Demo ready · Simulated devices':'Demo simulator unavailable'; if(!s) return 'Service status unavailable'; return s.adapter_available ? (s.scan_active?'Bluetooth adapter available · scanning':'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
 function back(){ return '<button class="text-button back" data-action="home">← &nbsp; Back to your blinds</button>'; }
 function addPage(){ const available=state.observations.filter(o=>!state.managed.some(m=>m.enrollment.logical_id===o.logical_id && !!m.enrollment.is_simulated===!!o.is_simulated)); return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p><div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length?`<div class="stack">${available.map(o=>`<form class="panel device-row" data-enroll="${esc(o.id)}"><div><h3>${esc(o.advertised_name||o.device_name||'Unnamed blind')}</h3><p class="subtle">${o.is_simulated?'Simulator · ':''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field">Display name<input name="label" maxlength="64" required value="${esc(o.advertised_name||o.device_name||'Blind')}"></label></div><button class="button" ${o.freshness!=='fresh'?'disabled':''}>Add blind</button></form>`).join('')}</div>`:`<div class="panel empty"><div class="empty-icon">⌁</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available?'Keep your blind nearby and refresh in a moment.': 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${button('Refresh devices','refresh','secondary')}</div>`}`; }
 function detailPage(id: string): string {
@@ -486,6 +500,7 @@ function detailPage(id: string): string {
   {label:'Signal',value:o?.rssi_dbm!=null?`${o.rssi_dbm} dBm`:'Unavailable'},
   {label:'Battery voltage',value:o?.battery?.voltage_mv!=null?`${o.battery.voltage_mv} mV${o.battery.status!=='observed'?' (cached)':''}`:'Unavailable'},
   {label:'Source',value:d.enrollment.is_simulated?'Simulator':'Bluetooth'},
+  ...(d.enrollment.room?[{label:'Room',value:d.enrollment.room}]:[]),
  ...(d.gatt_readiness ? [
   {label:'Last GATT command',value:gattReadinessLabel(d.gatt_readiness)},
   {label:'Transport evidence',value:gattTransportEvidenceLabel(d.gatt_readiness.transport_evidence)},
@@ -527,15 +542,18 @@ function simulatorControls(): string {
 function servicePage(): string {
  const scanner=state.diagnostics?.scanner;
  const fields: {label: string; value: string | number}[]=[
-  {label:'Service',value:state.serviceError?'Connection problem':'Connected'},
-  {label:'Bluetooth adapter',value:scanner?.adapter_available?'Available':'Unavailable'},
-  {label:'Scanner',value:scanner?.status||'Unavailable'},
-  {label:'Advertisements seen',value:scanner?.soma_advertisements_seen??'—'},
-  {label:'Last scanner error',value:scanner?.last_error_code||'None reported'},
+  {label:'Service',value:state.serviceError?'Connection problem':state.demoMode?(state.diagnostics?.simulator_ready?'Demo ready · Simulated devices':'Simulator unavailable'):'Connected'},
+  {label:'Bluetooth adapter',value:state.demoMode?'Not used in demo':scanner?.adapter_available?'Available':'Unavailable'},
+  {label:'Scanner',value:state.demoMode?'Disabled in demo':scanner?.status||'Unavailable'},
+  {label:'Advertisements seen',value:state.demoMode?'Not collected':scanner?.soma_advertisements_seen??'—'},
+  {label:'Last scanner error',value:state.demoMode?'Not applicable':scanner?.last_error_code||'None reported'},
   {label:'Telemetry history',value:state.diagnostics?.history_enabled?'Enabled':'Not enabled'},
   {label:'Simulators',value:state.simulators?.length??'Unavailable or disabled'},
  ];
- return `${back()}<h1 class="page-title">Service status</h1><p class="page-intro">A closer look at the Somaris service and Bluetooth scanner.</p>${renderInfoGrid(fields)}${simulatorControls()}`;
+ return `${back()}<h1 class="page-title">Service status</h1><p class="page-intro">A closer look at the Somaris service and ${state.demoMode?'simulated devices. The Bluetooth scanner is disabled for this demo.':'Bluetooth scanner.'}</p>${renderInfoGrid(fields)}${state.demoMode?'':simulatorControls()}`;
+}
+function demoBanner(): string {
+ return `<section class="demo-banner" aria-label="Somaris demonstration"><div><p class="eyebrow">Somaris Demo</p><p>Explore a simulated smart home. Your changes only affect this demonstration.</p></div><button type="button" class="button secondary" data-action="demo-reset">Reset demo</button></section>`;
 }
 function page(): string {return location.hash.slice(1)||'home'}
 function render(): void {
@@ -543,7 +561,8 @@ function render(): void {
  const activeElement=document.activeElement;
  const focused=activeElement instanceof HTMLElement && app.contains(activeElement) ? activeElement.dataset.action ?? null : null;
  const p=page();
- app.innerHTML=p==='add'?addPage():p==='service'?servicePage():p.startsWith('details/')?detailPage(decodeURIComponent(p.slice(8))):home();
+ const content=p==='add'?addPage():p==='service'?servicePage():p.startsWith('details/')?detailPage(decodeURIComponent(p.slice(8))):home();
+ app.innerHTML=`${state.demoMode?demoBanner():''}${content}`;
  const topActions=document.querySelector<HTMLElement>('#top-actions');
  if(topActions){
   const activeElement=document.activeElement;
@@ -554,8 +573,8 @@ function render(): void {
    blindCount:state.managed.length,
    panelMode:document.documentElement.dataset.displayMode==='panel',
    displayPreference,
-   serviceLabel:state.serviceError?'Disconnected':!state.diagnostics?'Connecting':state.diagnostics.scanner?.adapter_available?'Connected':'Service degraded',
-   serviceTone:state.serviceError?'bad':state.diagnostics?.scanner?.adapter_available?'good':'',
+   serviceLabel:state.serviceError?'Disconnected':!state.diagnostics?'Connecting':state.diagnostics.demo_mode&&state.diagnostics.simulator_ready?'Demo ready · Simulated devices':state.diagnostics.scanner?.adapter_available?'Connected':'Service degraded',
+   serviceTone:state.serviceError?'bad':state.diagnostics?.demo_mode&&state.diagnostics.simulator_ready?'good':state.diagnostics?.scanner?.adapter_available?'good':'',
   });
   const replacement=focusId ? document.getElementById(focusId) : focusLabel ? [...topActions.querySelectorAll<HTMLElement>('[aria-label]')].find(el=>el.getAttribute('aria-label')===focusLabel) : null;
   replacement?.focus({preventScroll:true});
@@ -587,6 +606,7 @@ export async function refreshService(target: RefreshTarget, request: ApiRequest)
       managed:managed as ManagedDevice[],
       observations:observations as Observation[],
       diagnostics:diagnostics as Diagnostics,
+      demoMode:(diagnostics as Diagnostics).demo_mode === true,
       simulators:simulators as Simulator[] | null,
       activity:activity as ActivityEntry[],
     });
@@ -596,6 +616,29 @@ export async function refreshService(target: RefreshTarget, request: ApiRequest)
   } catch (error) {
     serviceFailure(target,error);
   }
+}
+
+export async function resetDemo(
+ target: RefreshTarget,
+ request: ApiRequest,
+ refreshData: () => Promise<unknown>,
+ confirmReset: () => boolean = () => true,
+): Promise<boolean> {
+ if(!confirmReset())return false;
+ try{
+  await request('/api/demo/reset',{method:'POST'});
+  if(target.commands)target.commands={};
+  if(target.batch!==undefined)target.batch=null;
+  target.busy?.clear();
+  target.reconciliationRequired?.clear();
+  if(target.tokens)target.tokens={};
+  await refreshData();
+  notifyTarget(target,{message:'Your demo was reset to the original household.',tone:'success'});
+  return true;
+ }catch(error){
+  notifyTarget(target,{message:`Could not reset the demo: ${errorMessage(error)}`,tone:'error'});
+  return false;
+ }
 }
 
 function hasPostCommandFreshPosition(command: CommandRecord | undefined, device: ManagedDevice | null | undefined): boolean {
@@ -832,9 +875,9 @@ if(app){
   return previous !== document.documentElement.dataset.displayMode;
  };
  applyDisplayMode();
- render();
- window.addEventListener('resize', () => { if (applyDisplayMode()) render(); });
- window.addEventListener('hashchange',render);
+ let initialized=false;
+ window.addEventListener('resize', () => { if (applyDisplayMode()&&initialized) render(); });
+ window.addEventListener('hashchange',()=>{if(initialized)render();});
  actionRoot.addEventListener('click', (event: MouseEvent)=>{
   const target=closestHtmlElement(event.target,'[data-action]');
   if(!target)return;
@@ -860,6 +903,12 @@ if(app){
   else if(action==='details' && arg)location.hash=`details/${encodeURIComponent(arg)}`;
   else if(action==='refresh')void refresh();
   else if(action==='sim-reset' && arg)void simulatorReset(arg);
+  else if(action==='demo-reset')void resetDemo(
+   state,
+   api,
+   ()=>refreshService(state,api),
+   ()=>globalThis.confirm('Reset your demo? This restores all four blinds and clears this session’s activity.'),
+  ).then(()=>render());
   else if(action==='remove'){
    state.confirmingRemovalId=managedDeviceId;
    state.pendingRemovalFocusId=managedDeviceId;
@@ -934,7 +983,16 @@ if(app){
   if(added)location.hash='home';
   render();
  });
- void refresh();
- setInterval(()=>void refresh(true),5000);
+ const initializeDashboard=async()=>{
+  try{
+   const mode=await api<{demo_mode:boolean}>('/api/v1/demo');
+   state.demoMode=mode.demo_mode===true;
+   if(state.demoMode)await api('/api/demo/session',{method:'POST'});
+   await refresh();
+  }catch(error){serviceFailure(state,error);render();}
+  finally{initialized=true;}
+ };
+ void initializeDashboard();
+ setInterval(()=>{if(initialized)void refresh(true);},5000);
  }
 }

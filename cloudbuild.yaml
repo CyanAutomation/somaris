@@ -1,9 +1,8 @@
-# Builds the existing Somaris image and deploys it as a simulator demo on Cloud Run.
-# No application or Dockerfile configuration is changed: the image already listens on
-# 0.0.0.0:8080 and enables the built-in simulators by default.
-# Cloud Run does not expose Bluetooth hardware, so physical device control is unavailable.
-# The service is public and Somaris has no API authentication; use it as a simulator demo only.
-# Cloud Run's writable filesystem is temporary, so /data state can reset on instance restart.
+# Builds the Somaris image and deploys a simulator-only public demo on Cloud Run.
+# SOMARIS_DEMO_MODE disables physical BLE discovery and control, creates four seeded blinds,
+# and keeps each visitor's state in a bounded in-memory session. Cloud Run is held to one
+# instance because visitor sessions are process-local. Restarts clear those sessions.
+# The session cookie isolates demo state; it is not user authentication.
 
 
 substitutions:
@@ -58,6 +57,8 @@ steps:
       - "1"
       - --memory
       - 512Mi
+      - --set-env-vars
+      - SOMARIS_DEMO_MODE=true
     waitFor:
       - build-and-push
 
