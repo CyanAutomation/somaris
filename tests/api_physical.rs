@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 use somaris::{
     api::{AppState, QueueConfig, router},
     ble::{
-        BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureStage,
-        BleObservation,
+        BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureCause,
+        BleFailureStage, BleObservation, BleScanControl,
     },
     controller::ServiceAction,
 };
@@ -137,6 +137,37 @@ impl FakeBleAdapter {
     fn writes(&self) -> Vec<ServiceAction> {
         self.writes.lock().unwrap().clone()
     }
+
+    async fn scan_impl(
+        &self,
+        observations: mpsc::Sender<BleObservation>,
+        window: Duration,
+        control: Option<BleScanControl>,
+    ) -> Result<(), BleFailure> {
+        self.scan_active.store(true, Ordering::SeqCst);
+        for observation in &self.observations {
+            if observations.send(observation.clone()).await.is_err() {
+                self.finish_scan();
+                return Ok(());
+            }
+        }
+        if let Some(control) = control {
+            tokio::select! {
+                _ = control.cancelled() => {},
+                _ = tokio::time::sleep(window) => {},
+            }
+        } else {
+            tokio::time::sleep(window).await;
+        }
+        self.finish_scan();
+        Ok(())
+    }
+
+    fn finish_scan(&self) {
+        self.scan_active.store(false, Ordering::SeqCst);
+        self.completed_scans.fetch_add(1, Ordering::SeqCst);
+        self.scan_finished.notify_one();
+    }
 }
 
 #[async_trait]
@@ -146,18 +177,16 @@ impl BleAdapter for FakeBleAdapter {
         observations: mpsc::Sender<BleObservation>,
         window: Duration,
     ) -> Result<(), BleFailure> {
-        self.scan_active.store(true, Ordering::SeqCst);
-        for observation in &self.observations {
-            if observations.send(observation.clone()).await.is_err() {
-                self.scan_active.store(false, Ordering::SeqCst);
-                return Ok(());
-            }
-        }
-        tokio::time::sleep(window).await;
-        self.scan_active.store(false, Ordering::SeqCst);
-        self.completed_scans.fetch_add(1, Ordering::SeqCst);
-        self.scan_finished.notify_one();
-        Ok(())
+        self.scan_impl(observations, window, None).await
+    }
+
+    async fn scan_with_control(
+        &self,
+        observations: mpsc::Sender<BleObservation>,
+        window: Duration,
+        control: BleScanControl,
+    ) -> Result<(), BleFailure> {
+        self.scan_impl(observations, window, Some(control)).await
     }
 
     async fn write_action(
@@ -207,6 +236,7 @@ impl BleAdapter for FakeBleAdapter {
         if !control.begin_write() {
             return Err(BleFailure {
                 stage: BleFailureStage::CommandPreempted,
+                cause: None,
                 retryable_before_write: false,
                 write_may_have_been_sent: false,
                 outcome_unknown: false,
@@ -473,6 +503,7 @@ async fn scanned_blind_can_be_enrolled_and_supported_actions_are_written() {
 async fn transient_service_discovery_failure_retries_only_before_a_write() {
     let retryable = BleFailure {
         stage: BleFailureStage::ServiceResolution,
+        cause: None,
         retryable_before_write: true,
         write_may_have_been_sent: false,
         outcome_unknown: false,
@@ -518,6 +549,7 @@ async fn transient_service_discovery_failure_retries_only_before_a_write() {
 async fn gatt_readiness_keeps_last_ack_after_a_later_connection_failure() {
     let unavailable = BleFailure {
         stage: BleFailureStage::DeviceConnection,
+        cause: Some(BleFailureCause::ConnectionAbortedByLocal),
         retryable_before_write: false,
         write_may_have_been_sent: false,
         outcome_unknown: false,
@@ -535,6 +567,10 @@ async fn gatt_readiness_keeps_last_ack_after_a_later_connection_failure() {
     );
     let failed = submit(&app, &managed_id, "later-connect-failure", "open").await;
     assert_eq!(failed["status"], "connection_failed");
+    assert_eq!(
+        failed["attempts"][0]["failure_cause"],
+        "connection_aborted_by_local"
+    );
 
     let (_, response) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
     let gatt = &response.unwrap()["data"][0]["gatt_readiness"];
@@ -553,6 +589,7 @@ async fn gatt_readiness_keeps_last_ack_after_a_later_connection_failure() {
 async fn repeated_confirmed_prewrite_failures_open_a_per_device_cooldown() {
     let failure = BleFailure {
         stage: BleFailureStage::DeviceConnection,
+        cause: None,
         retryable_before_write: true,
         write_may_have_been_sent: false,
         outcome_unknown: false,
@@ -598,6 +635,7 @@ async fn repeated_confirmed_prewrite_failures_open_a_per_device_cooldown() {
 async fn already_queued_movement_is_deferred_if_prior_commands_open_cooldown() {
     let failure = BleFailure {
         stage: BleFailureStage::DeviceConnection,
+        cause: None,
         retryable_before_write: true,
         write_may_have_been_sent: false,
         outcome_unknown: false,
@@ -673,6 +711,7 @@ async fn already_queued_movement_is_deferred_if_prior_commands_open_cooldown() {
 async fn stop_batch_attempts_each_blind_before_retrying_a_failed_stop() {
     let failure = BleFailure {
         stage: BleFailureStage::DeviceConnection,
+        cause: None,
         retryable_before_write: true,
         write_may_have_been_sent: false,
         outcome_unknown: false,
@@ -969,6 +1008,7 @@ async fn command_deadline_bounds_wait_for_an_unresponsive_adapter_cleanup() {
 async fn retry_is_refused_when_write_may_have_been_sent() {
     let ambiguous_prewrite_flag = BleFailure {
         stage: BleFailureStage::ServiceResolution,
+        cause: None,
         retryable_before_write: true,
         write_may_have_been_sent: true,
         outcome_unknown: true,
@@ -1037,6 +1077,44 @@ async fn gatt_commands_wait_until_the_adapter_scan_window_ends() {
 }
 
 #[tokio::test]
+async fn physical_command_reports_adapter_queue_wait_ms() {
+    let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
+    let app = app_with_adapter(adapter).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let command = submit(&app, &managed_id, "queue-wait-field", "close").await;
+
+    assert!(command["queue_wait_ms"].is_number());
+}
+
+#[tokio::test]
+async fn physical_command_interrupts_an_active_scan_window() {
+    let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
+    let app = app_with_adapter_and_scan_window(adapter.clone(), 5_000).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    assert!(adapter.scan_active.load(Ordering::SeqCst));
+
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "interrupt-scan-window")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+
+    let command = tokio::time::timeout(Duration::from_secs(1), wait_for_command(&app, &command_id))
+        .await
+        .expect("a physical command should yield an active scan promptly");
+    assert_eq!(command["status"], "write_acknowledged");
+    assert!(command["queue_wait_ms"].as_u64().unwrap() < 1_000);
+    assert!(!adapter.gatt_overlapped_scan());
+}
+
+#[tokio::test]
 async fn physical_toggle_uses_fresh_closed_position_and_enqueues_open() {
     let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
     let app = app_with_adapter(adapter.clone()).await;
@@ -1074,6 +1152,7 @@ async fn physical_toggle_uses_fresh_closed_position_and_enqueues_open() {
 async fn uncertain_gatt_write_is_reported_without_automatic_retry() {
     let uncertain = BleFailure {
         stage: BleFailureStage::GattWrite,
+        cause: None,
         retryable_before_write: false,
         write_may_have_been_sent: true,
         outcome_unknown: true,
@@ -1151,10 +1230,17 @@ async fn scanner_yield_keeps_api_ready_while_adapter_is_available() {
 }
 
 async fn app_with_adapter(adapter: Arc<FakeBleAdapter>) -> Router {
+    app_with_adapter_and_scan_window(adapter, 100).await
+}
+
+async fn app_with_adapter_and_scan_window(
+    adapter: Arc<FakeBleAdapter>,
+    adapter_scan_window_ms: u64,
+) -> Router {
     let state = AppState::new()
         .with_ble_adapter(adapter)
         .with_queue_config(QueueConfig {
-            adapter_scan_window_ms: 100,
+            adapter_scan_window_ms,
             ..QueueConfig::default()
         })
         .unwrap();

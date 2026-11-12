@@ -16,7 +16,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use crate::{
     ble::{
         BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureStage,
-        BleObservation, BtleplugAdapter, SOMA_MANUFACTURER_ID, decode_ba71_voltage,
+        BleObservation, BleScanControl, BtleplugAdapter, SOMA_MANUFACTURER_ID, decode_ba71_voltage,
         parse_soma_payload,
     },
     controller::ServiceAction,
@@ -228,6 +228,7 @@ pub struct AppState {
     command_controls: Arc<Mutex<HashMap<String, BleCommandControl>>>,
     battery_controls: Arc<Mutex<HashMap<String, BleCommandControl>>>,
     adapter_slots: Arc<Semaphore>,
+    pending_adapter_commands: watch::Sender<usize>,
     scan_window_generation: watch::Sender<u64>,
     ble_adapter: Arc<RwLock<Option<Arc<dyn BleAdapter>>>>,
     ble_enabled: bool,
@@ -243,6 +244,24 @@ pub struct AppState {
     history_persisted_count: Arc<AtomicUsize>,
     data_path: Option<PathBuf>,
     state_changes: StateChangePublisher,
+}
+
+struct AdapterCommandWaiter {
+    pending: watch::Sender<usize>,
+}
+
+impl AdapterCommandWaiter {
+    fn new(pending: watch::Sender<usize>) -> Self {
+        pending.send_modify(|count| *count = count.saturating_add(1));
+        Self { pending }
+    }
+}
+
+impl Drop for AdapterCommandWaiter {
+    fn drop(&mut self) {
+        self.pending
+            .send_modify(|count| *count = count.saturating_sub(1));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,6 +539,7 @@ impl AppState {
         let history_persisted_cursor = inner.history.back().map_or(0, |record| record.cursor);
         let history_persisted_count = inner.history.len();
         let queue_config = QueueConfig::default();
+        let (pending_adapter_commands, _) = watch::channel(0_usize);
         let (scan_window_generation, _) = watch::channel(0_u64);
         Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -527,6 +547,7 @@ impl AppState {
             command_controls: Arc::new(Mutex::new(HashMap::new())),
             battery_controls: Arc::new(Mutex::new(HashMap::new())),
             adapter_slots: Arc::new(Semaphore::new(queue_config.adapter_concurrency)),
+            pending_adapter_commands,
             scan_window_generation,
             ble_adapter: Arc::new(RwLock::new(None)),
             ble_enabled: false,
@@ -998,6 +1019,16 @@ impl AppState {
                 tracing::error!("BLE adapter coordination semaphore closed; scanner stopped");
                 return;
             };
+            let mut command_waiters = self.pending_adapter_commands.subscribe();
+            if *command_waiters.borrow_and_update() > 0 {
+                drop(scan_permit);
+                while *command_waiters.borrow_and_update() > 0 {
+                    if command_waiters.changed().await.is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
             let (sender, mut receiver) = mpsc::channel(128);
             {
                 let mut inner = self.inner.lock().await;
@@ -1009,17 +1040,47 @@ impl AppState {
             }
             let scan_window =
                 std::time::Duration::from_millis(self.queue_config.adapter_scan_window_ms);
-            let scan = tokio::spawn(async move { adapter.scan(sender, scan_window).await });
-            while let Some(observation) = receiver.recv().await {
-                self.store_ble_observation(observation).await;
+            let scan_control = BleScanControl::new();
+            let scan_task_control = scan_control.clone();
+            let mut scan = tokio::spawn(async move {
+                adapter
+                    .scan_with_control(sender, scan_window, scan_task_control)
+                    .await
+            });
+            let mut scan_result = None;
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut scan => {
+                        scan_result = Some(result);
+                        break;
+                    }
+                    observation = receiver.recv() => match observation {
+                        Some(observation) => self.store_ble_observation(observation).await,
+                        None => break,
+                    },
+                    changed = command_waiters.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        if *command_waiters.borrow_and_update() > 0 {
+                            scan_control.cancel();
+                            break;
+                        }
+                    }
+                }
             }
-            let failure = match scan.await {
+            if scan_result.is_none() {
+                scan_result = Some(scan.await);
+            }
+            let failure = match scan_result.expect("scan task result should be collected") {
                 Ok(Ok(())) => None,
                 Ok(Err(failure)) => Some(failure),
                 Err(error) => {
                     tracing::error!(%error, "BLE scan task terminated unexpectedly");
                     Some(BleFailure {
                         stage: BleFailureStage::Adapter,
+                        cause: None,
                         retryable_before_write: true,
                         write_may_have_been_sent: false,
                         outcome_unknown: false,
@@ -2749,6 +2810,8 @@ struct Command {
     toggle_observed_at: Option<DateTime<Utc>>,
     status: CommandStatus,
     accepted_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queue_wait_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2787,6 +2850,8 @@ struct CommandAttempt {
     advertisement_rssi_dbm: Option<i16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure_cause: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_code: Option<String>,
 }
@@ -4271,6 +4336,7 @@ fn make_command(
         toggle_observed_at: None,
         status: CommandStatus::Queued,
         accepted_at: now,
+        queue_wait_ms: None,
         started_at: None,
         completed_at: None,
         expires_at: now + ChronoDuration::seconds(queue_wait_timeout_seconds),
@@ -4809,6 +4875,8 @@ async fn process_command_with_retry_budget(
         state.command_controls.lock().await.remove(&command_id);
         return;
     };
+    let adapter_waiter = (!adapter_slot_reserved)
+        .then(|| AdapterCommandWaiter::new(state.pending_adapter_commands.clone()));
     let adapter_permit = if adapter_slot_reserved {
         None
     } else {
@@ -4818,6 +4886,7 @@ async fn process_command_with_retry_budget(
         };
         Some(permit)
     };
+    drop(adapter_waiter);
     let (
         action,
         command_target_closed_percent,
@@ -4830,6 +4899,17 @@ async fn process_command_with_retry_budget(
         failure_streak,
     ) = {
         let mut inner = state.inner.lock().await;
+        let execution_started_at = Utc::now();
+        if let Some(command) = inner.commands.get_mut(&command_id)
+            && command.status == CommandStatus::Queued
+        {
+            let queue_wait_ms = execution_started_at
+                .signed_duration_since(command.accepted_at)
+                .num_milliseconds()
+                .max(0) as u64;
+            command.queue_wait_ms.get_or_insert(queue_wait_ms);
+            command.started_at.get_or_insert(execution_started_at);
+        }
         let simulator_id = inner
             .enrollments
             .get(&managed_device_id)
@@ -4887,7 +4967,7 @@ async fn process_command_with_retry_budget(
             return;
         }
         command.status = CommandStatus::Connecting;
-        let started_at = command.started_at.unwrap_or_else(Utc::now);
+        let started_at = command.started_at.unwrap_or(execution_started_at);
         command.started_at = Some(started_at);
         let first_attempt = command
             .attempts
@@ -4907,6 +4987,7 @@ async fn process_command_with_retry_budget(
             advertisement_age_ms: None,
             advertisement_rssi_dbm: None,
             failure_stage: None,
+            failure_cause: None,
             error_code: None,
         });
         let execution_deadline = tokio::time::Instant::now() + COMMAND_EXECUTION_TIMEOUT;
@@ -5380,6 +5461,7 @@ async fn yield_adapter_for_retry_scan(
             Err(_) => {
                 return Err(BleFailure {
                     stage: BleFailureStage::Adapter,
+                    cause: None,
                     retryable_before_write: false,
                     write_may_have_been_sent: false,
                     outcome_unknown: false,
@@ -5515,6 +5597,7 @@ async fn process_physical_command(
                     failure_code_override = Some(code);
                     Err(BleFailure {
                         stage: BleFailureStage::IdentityVerification,
+                        cause: None,
                         retryable_before_write: false,
                         write_may_have_been_sent: false,
                         outcome_unknown: false,
@@ -5525,6 +5608,7 @@ async fn process_physical_command(
                     let Some(adapter) = state.ble_adapter.read().await.clone() else {
                         let failure = BleFailure {
                             stage: BleFailureStage::Adapter,
+                            cause: None,
                             retryable_before_write: true,
                             write_may_have_been_sent: false,
                             outcome_unknown: false,
@@ -5726,6 +5810,7 @@ async fn start_command_attempt(state: &AppState, command_id: &str, number: u8) {
             advertisement_age_ms: None,
             advertisement_rssi_dbm: None,
             failure_stage: None,
+            failure_cause: None,
             error_code: None,
         });
     }
@@ -5767,6 +5852,7 @@ async fn finish_command_attempt(
             Err(failure) => {
                 attempt.phase = failure.stage.as_str().into();
                 attempt.failure_stage = Some(failure.stage.as_str().into());
+                attempt.failure_cause = failure.cause.map(|cause| cause.as_str().into());
                 attempt.error_code = Some(ble_failure_code(failure).into());
                 attempt.write_state = if failure.write_may_have_been_sent {
                     WriteState::PossiblySent
@@ -5882,6 +5968,7 @@ async fn process_batch(state: AppState, batch_id: String) {
         (action, ids)
     };
     let _stop_batch_adapter_permits = if action == Action::Stop {
+        let command_waiter = AdapterCommandWaiter::new(state.pending_adapter_commands.clone());
         let mut permits = Vec::with_capacity(state.queue_config.adapter_concurrency);
         for _ in 0..state.queue_config.adapter_concurrency {
             let Ok(permit) = state.adapter_slots.clone().acquire_owned().await else {
@@ -5889,6 +5976,7 @@ async fn process_batch(state: AppState, batch_id: String) {
             };
             permits.push(permit);
         }
+        drop(command_waiter);
         Some(permits)
     } else {
         None
@@ -7383,6 +7471,7 @@ mod security_hardening_tests {
             advertisement_age_ms: None,
             advertisement_rssi_dbm: None,
             failure_stage: None,
+            failure_cause: None,
             error_code: None,
         });
         let command_id = command.id.clone();
