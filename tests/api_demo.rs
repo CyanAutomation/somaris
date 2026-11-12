@@ -6,9 +6,11 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use somaris::api::{AppState, router};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tower::ServiceExt;
 
 const ORIGIN: &str = "http://somaris.test";
+static NEXT_IDEMPOTENCY_KEY: AtomicU64 = AtomicU64::new(1);
 
 async fn request(
     app: &Router,
@@ -16,6 +18,17 @@ async fn request(
     uri: &str,
     cookie: Option<&str>,
     body: Option<Value>,
+) -> (StatusCode, axum::http::HeaderMap, Option<Value>) {
+    request_with_idempotency_key(app, method, uri, cookie, body, None).await
+}
+
+async fn request_with_idempotency_key(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    cookie: Option<&str>,
+    body: Option<Value>,
+    idempotency_key: Option<&str>,
 ) -> (StatusCode, axum::http::HeaderMap, Option<Value>) {
     let mut builder = Request::builder()
         .method(method.clone())
@@ -27,8 +40,14 @@ async fn request(
     if let Some(cookie) = cookie {
         builder = builder.header(header::COOKIE, cookie);
     }
-    if uri.contains("/commands") || uri == "/api/control/v1/batches" {
-        builder = builder.header("idempotency-key", "demo-isolation-test");
+    if method == Method::POST && (uri.contains("/commands") || uri == "/api/control/v1/batches") {
+        let key = idempotency_key.map(str::to_owned).unwrap_or_else(|| {
+            format!(
+                "demo-isolation-test-{}",
+                NEXT_IDEMPOTENCY_KEY.fetch_add(1, Ordering::Relaxed)
+            )
+        });
+        builder = builder.header("idempotency-key", key);
     }
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
     if !payload.is_empty() {
@@ -213,12 +232,13 @@ async fn demo_visitors_are_isolated_and_reset_only_the_current_session() {
         .as_str()
         .unwrap();
 
-    let (status, _, command) = request(
+    let (status, _, command) = request_with_idempotency_key(
         &app,
         Method::POST,
         &format!("/api/control/v1/devices/{main_id}/commands"),
         Some(&visitor_a),
         Some(json!({"action": "close"})),
+        Some("reset-idempotency-key"),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -261,7 +281,15 @@ async fn demo_visitors_are_isolated_and_reset_only_the_current_session() {
     let after_command_b = devices(&app, &visitor_b).await;
     assert_eq!(positions(&after_command_b), positions(&before_b));
     let after_command_a = devices(&app, &visitor_a).await;
-    assert_eq!(after_command_a[1]["position"]["target_closed_percent"], 100);
+    assert_eq!(
+        after_command_a
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|device| device["enrollment"]["id"] == main_id)
+            .unwrap()["position"]["target_closed_percent"],
+        100
+    );
 
     let (status, _, batch) = request(
         &app,
@@ -313,12 +341,13 @@ async fn demo_visitors_are_isolated_and_reset_only_the_current_session() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(activity.unwrap()["data"], json!([]));
 
-    let (status, _, replacement_command) = request(
+    let (status, _, replacement_command) = request_with_idempotency_key(
         &app,
         Method::POST,
         &format!("/api/control/v1/devices/{main_id}/commands"),
         Some(&visitor_a),
         Some(json!({"action": "close"})),
+        Some("reset-idempotency-key"),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
