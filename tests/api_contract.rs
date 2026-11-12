@@ -1239,6 +1239,16 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
             .is_some()
     );
     assert!(
+        contract["components"]["schemas"]["CommandAttempt"]["properties"]
+            .get("failure_cause")
+            .is_some()
+    );
+    assert!(
+        contract["components"]["schemas"]["Command"]["properties"]
+            .get("queue_wait_ms")
+            .is_some()
+    );
+    assert!(
         contract["paths"]["/api/control/v1/devices/{id}/commands"]["post"]["responses"]
             .get("429")
             .is_some()
