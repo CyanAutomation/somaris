@@ -673,6 +673,20 @@ async fn queue_limits_match_documented_defaults_and_can_be_configured() {
     assert_eq!(queue["adapter_concurrency"], 1);
     assert_eq!(queue["adapter_scan_window_ms"], 1000);
     assert_eq!(queue["command_execution_timeout_seconds"], 45);
+    let template_scan_window = include_str!("../.env.example")
+        .lines()
+        .find_map(|line| line.strip_prefix("SOMARIS_ADAPTER_SCAN_WINDOW_MS="))
+        .expect("the environment template should specify its scan window");
+    assert_eq!(template_scan_window, "1000");
+    let compose_scan_window = include_str!("../docker-compose.yaml")
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("- SOMARIS_ADAPTER_SCAN_WINDOW_MS=${SOMARIS_ADAPTER_SCAN_WINDOW_MS:-")
+                .and_then(|value| value.strip_suffix('}'))
+        })
+        .expect("the compose template should specify its scan window fallback");
+    assert_eq!(compose_scan_window, "1000");
 
     let configured_app = router(
         AppState::new()

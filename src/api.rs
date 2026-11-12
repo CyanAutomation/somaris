@@ -236,6 +236,7 @@ pub struct AppState {
     started_at: DateTime<Utc>,
     started: Instant,
     history_path: Option<PathBuf>,
+    history_storage_path: Option<PathBuf>,
     history_persist_lock: Arc<Mutex<()>>,
     history_revision: Arc<AtomicU64>,
     history_persisted_cursor: Arc<AtomicU64>,
@@ -263,6 +264,9 @@ struct Inner {
     /// Persist calibration status so a restart cannot silently re-enable ordinary movement.
     #[serde(default)]
     calibration_sessions: HashMap<String, CalibrationSessionStatus>,
+    // Kept in memory for movement feedback and in an append-only sidecar.
+    // Legacy snapshots may still contain it and are migrated on load.
+    #[serde(default)]
     history: VecDeque<HistoryObservation>,
     #[serde(skip)]
     latest_history_by_device: HashMap<String, HistoryObservation>,
@@ -270,6 +274,45 @@ struct Inner {
     scanner: ScannerCounters,
     #[serde(skip)]
     devices: HashMap<String, Device>,
+}
+
+#[derive(Serialize)]
+struct DurableStateSnapshot<'a> {
+    simulator_enabled: bool,
+    simulator: &'a Device,
+    simulator_config: &'a SimulatorConfig,
+    simulator_two: &'a Option<Device>,
+    simulator_two_config: &'a Option<SimulatorConfig>,
+    enrollments: &'a HashMap<String, Enrollment>,
+    commands: &'a HashMap<String, Command>,
+    command_idempotency: &'a HashMap<String, String>,
+    batches: &'a HashMap<String, Batch>,
+    batch_idempotency: &'a HashMap<String, String>,
+    audit_log: &'a VecDeque<AuditEntry>,
+    calibration_sessions: &'a HashMap<String, CalibrationSessionStatus>,
+    next_cursor: u64,
+    scanner: &'a ScannerCounters,
+}
+
+impl<'a> DurableStateSnapshot<'a> {
+    fn without_history(inner: &'a Inner) -> Self {
+        Self {
+            simulator_enabled: inner.simulator_enabled,
+            simulator: &inner.simulator,
+            simulator_config: &inner.simulator_config,
+            simulator_two: &inner.simulator_two,
+            simulator_two_config: &inner.simulator_two_config,
+            enrollments: &inner.enrollments,
+            commands: &inner.commands,
+            command_idempotency: &inner.command_idempotency,
+            batches: &inner.batches,
+            batch_idempotency: &inner.batch_idempotency,
+            audit_log: &inner.audit_log,
+            calibration_sessions: &inner.calibration_sessions,
+            next_cursor: inner.next_cursor,
+            scanner: &inner.scanner,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +474,11 @@ impl AppState {
         data_path: Option<PathBuf>,
     ) -> Self {
         let started_at = Utc::now();
+        let history_storage_path = history_path.clone().or_else(|| {
+            data_path
+                .as_ref()
+                .map(|path| path.with_extension("history.jsonl"))
+        });
         let simulator = make_simulated_device(SIMULATOR_ID, SIMULATOR_NAME, started_at);
         let simulator_two = Some(make_simulated_device(
             SECOND_SIMULATOR_ID,
@@ -456,7 +504,7 @@ impl AppState {
             scanner: ScannerCounters::unavailable(),
             devices: HashMap::new(),
         };
-        if let Some(path) = &history_path {
+        if let Some(path) = &history_storage_path {
             inner.history = read_history(path).unwrap_or_default().into();
             inner.next_cursor = inner
                 .history
@@ -487,6 +535,7 @@ impl AppState {
             started_at,
             started: Instant::now(),
             history_path,
+            history_storage_path,
             history_persist_lock: Arc::new(Mutex::new(())),
             history_revision: Arc::new(AtomicU64::new(0)),
             history_persisted_cursor: Arc::new(AtomicU64::new(history_persisted_cursor)),
@@ -511,6 +560,32 @@ impl AppState {
         let now = Utc::now();
         initialize_simulators(&mut persisted, now);
         let mut guard = self.inner.lock().await;
+        // The append-only history sidecar is authoritative over the legacy
+        // copy embedded in state.json. Import that legacy copy once when the
+        // sidecar is empty, then keep it out of all future core snapshots.
+        if self.history_storage_path.is_some() && !guard.history.is_empty() {
+            persisted.history = std::mem::take(&mut guard.history);
+            persisted.next_cursor = guard.next_cursor;
+        } else if let Some(history_path) = &self.history_storage_path
+            && !persisted.history.is_empty()
+        {
+            let mut bytes = Vec::new();
+            for record in &persisted.history {
+                serde_json::to_writer(&mut bytes, record)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                bytes.push(b'\n');
+            }
+            let append_path = history_path.clone();
+            tokio::task::spawn_blocking(move || append_and_sync(&append_path, &bytes))
+                .await
+                .map_err(io::Error::other)??;
+            self.history_persisted_cursor.store(
+                persisted.history.back().map_or(0, |record| record.cursor),
+                Ordering::Release,
+            );
+            self.history_persisted_count
+                .store(persisted.history.len(), Ordering::Release);
+        }
         persisted.simulator_enabled = guard.simulator_enabled;
         persisted.scanner = ScannerCounters::unavailable();
         for command in persisted.commands.values_mut() {
@@ -597,7 +672,7 @@ impl AppState {
     }
 
     async fn load_history_file(&self) -> io::Result<()> {
-        let Some(path) = &self.history_path else {
+        let Some(path) = &self.history_storage_path else {
             return Ok(());
         };
         let history = read_history(path)?;
@@ -636,7 +711,12 @@ impl AppState {
         };
         let persist_started = Instant::now();
         let serialization_started = Instant::now();
-        let bytes = match serde_json::to_vec_pretty(inner) {
+        let serialized = if self.history_storage_path.is_some() {
+            serde_json::to_vec_pretty(&DurableStateSnapshot::without_history(inner))
+        } else {
+            serde_json::to_vec_pretty(inner)
+        };
+        let bytes = match serialized {
             Ok(bytes) => bytes,
             Err(error) => {
                 let serialization_ms = serialization_started.elapsed().as_millis() as u64;
@@ -719,7 +799,7 @@ impl AppState {
         history: &[HistoryObservation],
         revision: u64,
     ) -> Result<(), ()> {
-        let Some(path) = &self.history_path else {
+        let Some(path) = &self.history_storage_path else {
             return Ok(());
         };
         // Coalesce nearby scanner and simulator updates. A newer revision owns
@@ -6638,6 +6718,12 @@ mod security_hardening_tests {
             );
             let mut persisted = serde_json::to_value(&*inner).unwrap();
             let object = persisted.as_object_mut().unwrap();
+            // Preserve the history field found in state files written before it
+            // moved to its separate telemetry journal.
+            object.insert(
+                "history".into(),
+                serde_json::to_value(&inner.history).unwrap(),
+            );
             object.remove("simulator_two");
             object.remove("simulator_two_config");
             std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
@@ -6681,6 +6767,109 @@ mod security_hardening_tests {
             logical_id_for_name(SIMULATOR_NAME, "simulator")
         );
         assert_eq!(managed_device(&inner, enrollment).availability, "ready");
+    }
+
+    #[tokio::test]
+    async fn durable_state_snapshot_does_not_include_volatile_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let state = AppState::configured(true, None, Some(path.clone()));
+        let history_path = path.with_extension("history.jsonl");
+        let history;
+        {
+            let mut inner = state.inner.lock().await;
+            inner.history.push_back(history_sample(1, 0, 50, 100));
+            inner.next_cursor = 2;
+            history = inner.history.iter().cloned().collect::<Vec<_>>();
+            state
+                .persist_history(&history, state.history_revision.load(Ordering::Acquire))
+                .await
+                .unwrap();
+            state.persist(&inner).await.unwrap();
+        }
+
+        let persisted: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            !persisted.as_object().unwrap().contains_key("history"),
+            "high-churn telemetry must not be copied into every durable state snapshot"
+        );
+        assert_eq!(read_history(&history_path).unwrap().len(), 1);
+
+        let restored = AppState::configured(true, None, Some(path.clone()));
+        restored.load_history_file().await.unwrap();
+        restored.load_durable_state().await.unwrap();
+        assert_eq!(restored.inner.lock().await.history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_history_is_migrated_to_the_history_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let history_path = state_path.with_extension("history.jsonl");
+        let legacy_state = AppState::configured(true, None, Some(state_path.clone()));
+        {
+            let mut inner = legacy_state.inner.lock().await;
+            inner.history.push_back(history_sample(1, 0, 50, 100));
+            inner.next_cursor = 2;
+            let mut persisted = serde_json::to_value(&*inner).unwrap();
+            persisted.as_object_mut().unwrap().insert(
+                "history".into(),
+                serde_json::to_value(&inner.history).unwrap(),
+            );
+            fs::write(&state_path, serde_json::to_vec(&persisted).unwrap()).unwrap();
+        }
+
+        let restored = AppState::configured(true, None, Some(state_path));
+        restored.load_history_file().await.unwrap();
+        restored.load_durable_state().await.unwrap();
+
+        let migrated = read_history(&history_path).unwrap();
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].cursor, 1);
+        assert_eq!(restored.inner.lock().await.history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_journal_remains_authoritative_over_core_state_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let history_path = directory.path().join("history.jsonl");
+        let state_path = directory.path().join("state.json");
+        let core_state = AppState::configured(true, None, Some(state_path.clone()));
+        {
+            let inner = core_state.inner.lock().await;
+            core_state.persist(&inner).await.unwrap();
+        }
+
+        let mut legacy_snapshot: Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        let legacy_history = vec![history_sample(2, 0, 10, 100)];
+        legacy_snapshot.as_object_mut().unwrap().insert(
+            "history".into(),
+            serde_json::to_value(legacy_history).unwrap(),
+        );
+        legacy_snapshot["next_cursor"] = Value::from(3);
+        fs::write(&state_path, serde_json::to_vec(&legacy_snapshot).unwrap()).unwrap();
+
+        let record = history_sample(1, 0, 50, 100);
+        let mut history_line = serde_json::to_vec(&record).unwrap();
+        history_line.push(b'\n');
+        append_and_sync(&history_path, &history_line).unwrap();
+
+        let restored = AppState::configured(true, Some(history_path), Some(state_path));
+        restored.load_history_file().await.unwrap();
+        restored.load_durable_state().await.unwrap();
+
+        let inner = restored.inner.lock().await;
+        assert_eq!(inner.history.len(), 1);
+        assert_eq!(inner.history[0].cursor, 1);
+        assert_eq!(
+            inner.history[0]
+                .position
+                .as_ref()
+                .unwrap()
+                .current_closed_percent,
+            50
+        );
     }
 
     #[test]

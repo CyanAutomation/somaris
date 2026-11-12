@@ -348,11 +348,34 @@ pub trait BleAdapter: Send + Sync {
 #[derive(Clone)]
 pub struct BtleplugAdapter {
     adapter: Adapter,
+    connection_cache: Arc<Mutex<Option<CachedConnection>>>,
+}
+
+const CONNECTION_REUSE_WINDOW: Duration = Duration::from_secs(5);
+
+struct CachedConnection {
+    peripheral: Peripheral,
+    peripheral_id: String,
+    expected_name: String,
+    last_used: std::time::Instant,
+}
+
+fn connection_reusable(
+    cached_peripheral_id: &str,
+    cached_expected_name: &str,
+    last_used: std::time::Instant,
+    requested_peripheral_id: &str,
+    requested_expected_name: &str,
+    now: std::time::Instant,
+) -> bool {
+    cached_peripheral_id.eq_ignore_ascii_case(requested_peripheral_id)
+        && cached_expected_name == requested_expected_name
+        && now.saturating_duration_since(last_used) < CONNECTION_REUSE_WINDOW
 }
 
 fn connect_timeout(action: ServiceAction, attempt: u8) -> Duration {
     match (action, attempt) {
-        (ServiceAction::Stop, 1) => Duration::from_secs(12),
+        (ServiceAction::Stop, 1) => Duration::from_secs(6),
         (ServiceAction::Stop, _) => Duration::from_secs(20),
         _ => Duration::from_secs(30),
     }
@@ -437,7 +460,125 @@ impl BtleplugAdapter {
             .into_iter()
             .next()
             .ok_or_else(|| BleFailure::before_write(BleFailureStage::Adapter, true))?;
-        Ok(Self { adapter })
+        Ok(Self {
+            adapter,
+            connection_cache: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn take_cached_connection(&self) -> Option<CachedConnection> {
+        self.connection_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    async fn cache_connection(
+        &self,
+        peripheral: &Peripheral,
+        peripheral_id: &str,
+        expected_name: &str,
+    ) {
+        let cached = CachedConnection {
+            peripheral: peripheral.clone(),
+            peripheral_id: peripheral_id.to_owned(),
+            expected_name: expected_name.to_owned(),
+            last_used: std::time::Instant::now(),
+        };
+        let last_used = cached.last_used;
+        let previous = self
+            .connection_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(cached);
+        if let Some(previous) = previous {
+            Self::disconnect(&previous.peripheral).await;
+        }
+
+        let connection_cache = self.connection_cache.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CONNECTION_REUSE_WINDOW).await;
+            let expired = {
+                let mut cache = connection_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if cache
+                    .as_ref()
+                    .is_some_and(|cached| cached.last_used == last_used)
+                {
+                    cache.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(expired) = expired {
+                Self::disconnect(&expired.peripheral).await;
+            }
+        });
+    }
+
+    async fn reuse_cached_connection(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        control: &BleCommandControl,
+    ) -> Result<Option<Peripheral>, BleFailure> {
+        let Some(cached) = self.take_cached_connection() else {
+            return Ok(None);
+        };
+        let mut disconnect_guard = DisconnectGuard::new(&cached.peripheral);
+        if !connection_reusable(
+            &cached.peripheral_id,
+            &cached.expected_name,
+            cached.last_used,
+            peripheral_id,
+            expected_name,
+            std::time::Instant::now(),
+        ) {
+            disconnect_guard.disconnect().await;
+            return Ok(None);
+        }
+
+        control.record_phase(BlePhase::PeripheralLookup, Duration::ZERO);
+        let connection = tokio::select! {
+            biased;
+            _ = control.cancelled() => {
+                disconnect_guard.disconnect().await;
+                return Err(control.cancellation_failure());
+            }
+            result = tokio::time::timeout(Duration::from_secs(3), cached.peripheral.is_connected()) => result,
+        };
+        match connection {
+            Ok(Ok(true)) => {
+                control.record_phase(BlePhase::Connect, Duration::ZERO);
+                control.record_phase(BlePhase::ServiceDiscovery, Duration::ZERO);
+            }
+            Ok(Ok(false)) | Ok(Err(_)) | Err(_) => {
+                disconnect_guard.disconnect().await;
+                return Ok(None);
+            }
+        }
+
+        let identity_started = std::time::Instant::now();
+        let identity = tokio::select! {
+            biased;
+            _ = control.cancelled() => {
+                control.record_phase(
+                    BlePhase::IdentityVerification,
+                    identity_started.elapsed(),
+                );
+                disconnect_guard.disconnect().await;
+                return Err(control.cancellation_failure());
+            }
+            result = Self::verify_identity(&cached.peripheral, expected_name) => result,
+        };
+        control.record_phase(BlePhase::IdentityVerification, identity_started.elapsed());
+        if let Err(error) = identity {
+            disconnect_guard.disconnect().await;
+            return Err(error);
+        }
+        disconnect_guard.disarm();
+        Ok(Some(cached.peripheral))
     }
 
     async fn peripheral_at(&self, peripheral_id: &str) -> Result<Peripheral, BleFailure> {
@@ -534,6 +675,13 @@ impl BtleplugAdapter {
         attempt: u8,
         control: &BleCommandControl,
     ) -> Result<Peripheral, BleFailure> {
+        if let Some(peripheral) = self
+            .reuse_cached_connection(peripheral_id, expected_name, control)
+            .await?
+        {
+            return Ok(peripheral);
+        }
+
         let lookup_started = std::time::Instant::now();
         let lookup_result = tokio::select! {
             biased;
@@ -883,16 +1031,24 @@ impl BleAdapter for BtleplugAdapter {
             ) => result,
         };
         control.record_phase(BlePhase::GattWrite, write_started.elapsed());
-        let disconnect_started = std::time::Instant::now();
-        disconnect_guard.disconnect().await;
-        control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
         match result {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                disconnect_guard.disarm();
+                self.cache_connection(&peripheral, peripheral_id, expected_name)
+                    .await;
+                Ok(())
+            }
             Ok(Err(error)) => {
+                let disconnect_started = std::time::Instant::now();
+                disconnect_guard.disconnect().await;
+                control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
                 tracing::warn!(operation = "gatt_write", %error, "BLE write failed after write may have been sent");
                 Err(BleFailure::during_write(false))
             }
             Err(_) => {
+                let disconnect_started = std::time::Instant::now();
+                disconnect_guard.disconnect().await;
+                control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
                 tracing::warn!(
                     operation = "gatt_write",
                     timeout_seconds = 10,
@@ -1036,7 +1192,7 @@ mod battery_tests {
     fn stop_uses_a_short_first_connection_window_then_a_bounded_recovery_window() {
         assert_eq!(
             connect_timeout(ServiceAction::Stop, 1),
-            Duration::from_secs(12)
+            Duration::from_secs(6)
         );
         assert_eq!(
             connect_timeout(ServiceAction::Stop, 2),
@@ -1046,6 +1202,46 @@ mod battery_tests {
             connect_timeout(ServiceAction::Close, 1),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn cached_connection_reuse_requires_same_identity_and_a_fresh_session() {
+        let now = std::time::Instant::now();
+        let fresh = now - Duration::from_secs(4);
+        let expired = now - Duration::from_secs(5);
+
+        assert!(connection_reusable(
+            "hallway-id",
+            "HallwayBlind",
+            fresh,
+            "hallway-id",
+            "HallwayBlind",
+            now
+        ));
+        assert!(!connection_reusable(
+            "hallway-id",
+            "HallwayBlind",
+            fresh,
+            "other-id",
+            "HallwayBlind",
+            now
+        ));
+        assert!(!connection_reusable(
+            "hallway-id",
+            "HallwayBlind",
+            fresh,
+            "hallway-id",
+            "BedroomBlind",
+            now
+        ));
+        assert!(!connection_reusable(
+            "hallway-id",
+            "HallwayBlind",
+            expired,
+            "hallway-id",
+            "HallwayBlind",
+            now
+        ));
     }
 
     #[test]
