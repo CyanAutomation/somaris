@@ -360,6 +360,17 @@ test('topbar composes the plus-only add action beside a named mode toggle and re
   }
 });
 
+test('demo device cards show optional room metadata without changing control semantics', () => {
+  const card = renderBlindCard({
+    id:'demo-living', label:'Living Room — Main Window', room:'Living Room', isSimulated:true,
+    lastSeen:'Seen just now', availabilityLabel:'Observed recently', positionPercent:75,
+    movementStatus:'at_target', controlsMarkup:'OPEN STOP CLOSE',
+  });
+  assert.match(card, /Living Room — Main Window/);
+  assert.match(card, /class="subtle room-label">Living Room<\/div>/);
+  assert.match(card, /OPEN STOP CLOSE/);
+});
+
 test('panel home omits supporting sections while regular view retains activity and service', () => {
   assert.equal(renderHomeSupportingSections({panelMode:true, activityMarkup:'ACTIVITY', serviceMarkup:'SERVICE'}), '');
   assert.equal(

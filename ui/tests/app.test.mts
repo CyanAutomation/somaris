@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, batchEligibleCount, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, resolveDisplayMode} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, resetDemo, resolveDisplayMode} from '../app.mjs';
 import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
 
 type CommandTarget = RefreshTarget & {
@@ -24,6 +24,42 @@ test('automatic display mode distinguishes square panels from phones and desktop
  assert.equal(resolveDisplayMode('auto', 390, 844), 'mobile');
  assert.equal(resolveDisplayMode('auto', 1440, 900), 'desktop');
  assert.equal(resolveDisplayMode('auto', 800, 560), 'desktop');
+});
+
+test('demo readiness stays positive while the physical adapter remains unavailable', async () => {
+ const state: RefreshTarget & {demoMode:boolean; serviceError:string|null} = {demoMode:false,serviceError:null};
+ const request: ApiRequest = async path => {
+  if(path==='/api/control/v1/devices')return [];
+  if(path==='/api/v1/devices')return [];
+  if(path==='/api/v1/diagnostics')return {demo_mode:true,simulator_ready:true,scanner:{adapter_available:false,status:'unavailable'}};
+  if(path==='/api/dev/simulators')return [];
+  if(path==='/api/control/v1/audit-log')return [];
+  throw new Error(`Unexpected path ${path}`);
+ };
+ await refreshService(state,request);
+ assert.equal(state.demoMode,true);
+ assert.equal(state.diagnostics?.simulator_ready,true);
+ assert.equal(state.diagnostics?.scanner?.adapter_available,false);
+ assert.equal(state.serviceError,null);
+});
+
+test('reset demo clears client command state and refreshes after confirmation', async () => {
+ const messages: string[] = [];
+ const target: RefreshTarget & {commands:Record<string,CommandRecord>;batch:BatchState|null;busy:Set<string>;notify:(item:{message:string})=>void} = {
+  commands:{'demo-1':{status:'queued'}}, batch:{action:'open',status:'queued'}, busy:new Set(['demo-1']), notify:item=>messages.push(item.message),
+ };
+ const calls: string[] = [];
+ const request: ApiRequest = async path => { calls.push(path); return {reset:true}; };
+ let refreshed = false;
+ assert.equal(await resetDemo(target,request,async()=>{refreshed=true;},()=>false),false);
+ assert.deepEqual(calls,[]);
+ assert.equal(await resetDemo(target,request,async()=>{refreshed=true;}),true);
+ assert.deepEqual(calls,['/api/demo/reset']);
+ assert.deepEqual(target.commands,{});
+ assert.equal(target.batch,null);
+ assert.equal(target.busy.size,0);
+ assert.equal(refreshed,true);
+ assert.match(messages.at(-1) ?? '',/reset to the original household/);
 });
 
 test('all-blinds batch submission is idempotent and a failed request stays locked for safe recovery', async () => {

@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Somaris API",
-    "version": "1.2.0",
-    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, percentage-position, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes typed supported commands. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. Two built-in simulators remain available for software development under the distinct names Somaris Simulator 1 and Somaris Simulator 2. Their positions and failure settings are independent, and simulated commands never use Bluetooth. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. BLE scans use bounded windows and yield exclusive adapter access to GATT operations between windows. The control API has no authentication and is intended for a trusted network; CORS is not authentication."
+    "version": "1.3.0",
+    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, percentage-position, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes typed supported commands. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. Two built-in simulators remain available for software development under the distinct names Somaris Simulator 1 and Somaris Simulator 2. Their positions and failure settings are independent, and simulated commands never use Bluetooth. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. BLE scans use bounded windows and yield exclusive adapter access to GATT operations between windows. The control API has no authentication and is intended for a trusted network; CORS is not authentication. SOMARIS_DEMO_MODE is opt-in and creates a simulator-only demo. In demo mode, stateful device, simulator, command, batch, and activity API paths require the HttpOnly somaris-demo-session cookie returned by POST /api/demo/session. The cookie isolates visitor state; it is not authentication. Demo sessions are held in memory, expire after 30 minutes idle, are limited to 32 active sessions, and are lost on service restart. Demo mutations require a same-origin Origin header; CORS is not an access-control boundary."
   },
   "servers": [
     {
@@ -14,10 +14,10 @@
     "/api/v1/health": {
       "get": {
         "operationId": "getHealth",
-        "summary": "Check HTTP service liveness and scanner status",
+        "summary": "Check HTTP service availability",
         "responses": {
           "200": {
-            "description": "The HTTP API is available. A degraded response means the BLE adapter is unavailable while the API remains usable.",
+            "description": "The HTTP API is available. In demo mode a ready simulator reports healthy while Bluetooth adapter telemetry remains truthful.",
             "content": {
               "application/json": {
                 "schema": {
@@ -47,20 +47,10 @@
     "/api/v1/ready": {
       "get": {
         "operationId": "getReadiness",
-        "summary": "Check whether the Bluetooth adapter is ready",
+        "summary": "Check demo simulator or physical adapter readiness",
         "responses": {
           "200": {
-            "description": "The service has a Bluetooth adapter available. Scanning may briefly yield the adapter to a GATT operation.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HealthEnvelope"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "The HTTP service is alive but the Bluetooth adapter is unavailable.",
+            "description": "A functioning demo simulator is ready, or the physical Bluetooth adapter is available in normal mode.",
             "content": {
               "application/json": {
                 "schema": {
@@ -71,6 +61,16 @@
           },
           "405": {
             "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "description": "The physical adapter is unavailable in normal mode; this response does not apply when a configured demo simulator is ready.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthEnvelope"
+                }
+              }
+            }
           }
         }
       },
@@ -118,7 +118,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/v1/devices": {
       "get": {
@@ -172,7 +177,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/v1/devices/{id}": {
       "parameters": [
@@ -184,6 +194,9 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
         }
       ],
       "get": {
@@ -320,6 +333,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
           "503": {
             "description": "Persistent history is disabled.",
             "content": {
@@ -329,9 +345,6 @@
                 }
               }
             }
-          },
-          "405": {
-            "$ref": "#/components/responses/Error"
           }
         }
       },
@@ -346,7 +359,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/dev/simulator": {
       "get": {
@@ -382,7 +400,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/dev/simulator/scenario": {
       "put": {
@@ -415,10 +438,10 @@
           "404": {
             "$ref": "#/components/responses/Error"
           },
-          "415": {
+          "405": {
             "$ref": "#/components/responses/Error"
           },
-          "405": {
+          "415": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -434,7 +457,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/dev/simulator/reset": {
       "post": {
@@ -480,7 +508,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/dev/simulators": {
       "get": {
@@ -516,7 +549,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/dev/simulators/{id}/scenario": {
       "parameters": [
@@ -532,6 +570,9 @@
               "simulator-2"
             ]
           }
+        },
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
         }
       ],
       "put": {
@@ -564,10 +605,10 @@
           "404": {
             "$ref": "#/components/responses/Error"
           },
-          "415": {
+          "405": {
             "$ref": "#/components/responses/Error"
           },
-          "405": {
+          "415": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -599,6 +640,9 @@
               "simulator-2"
             ]
           }
+        },
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
         }
       ],
       "post": {
@@ -631,10 +675,10 @@
           "404": {
             "$ref": "#/components/responses/Error"
           },
-          "415": {
+          "405": {
             "$ref": "#/components/responses/Error"
           },
-          "405": {
+          "415": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -667,10 +711,10 @@
               }
             }
           },
-          "503": {
+          "405": {
             "$ref": "#/components/responses/Error"
           },
-          "405": {
+          "503": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -703,6 +747,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
           "409": {
             "$ref": "#/components/responses/Error",
             "description": "Conflict. Includes duplicate_device, ambiguous_device, or simulator_limit_reached when two simulators are already enrolled."
@@ -711,9 +758,6 @@
             "$ref": "#/components/responses/Error"
           },
           "503": {
-            "$ref": "#/components/responses/Error"
-          },
-          "405": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -729,7 +773,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/control/v1/devices/{id}": {
       "parameters": [
@@ -741,6 +790,9 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
         }
       ],
       "delete": {
@@ -754,13 +806,13 @@
           "404": {
             "$ref": "#/components/responses/Error"
           },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
           "409": {
             "$ref": "#/components/responses/Error"
           },
           "503": {
-            "$ref": "#/components/responses/Error"
-          },
-          "405": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -788,6 +840,9 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
         }
       ],
       "post": {
@@ -834,7 +889,13 @@
           "404": {
             "$ref": "#/components/responses/Error"
           },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
           "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "415": {
             "$ref": "#/components/responses/Error"
           },
           "429": {
@@ -842,18 +903,21 @@
             "headers": {
               "Retry-After": {
                 "description": "Seconds until another movement request is accepted.",
-                "schema": {"type": "integer", "minimum": 1}
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                }
               }
             },
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}
-          },
-          "415": {
-            "$ref": "#/components/responses/Error"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           },
           "503": {
-            "$ref": "#/components/responses/Error"
-          },
-          "405": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -881,6 +945,9 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
         }
       ],
       "post": {
@@ -917,6 +984,9 @@
           "404": {
             "$ref": "#/components/responses/Error"
           },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
           "409": {
             "$ref": "#/components/responses/Error"
           },
@@ -925,15 +995,21 @@
             "headers": {
               "Retry-After": {
                 "description": "Seconds until another movement request is accepted.",
-                "schema": {"type": "integer", "minimum": 1}
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                }
               }
             },
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorEnvelope"}}}
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           },
           "503": {
-            "$ref": "#/components/responses/Error"
-          },
-          "405": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -993,6 +1069,9 @@
           "400": {
             "$ref": "#/components/responses/Error"
           },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
           "409": {
             "$ref": "#/components/responses/Error"
           },
@@ -1008,9 +1087,6 @@
                 }
               }
             }
-          },
-          "405": {
-            "$ref": "#/components/responses/Error"
           }
         }
       },
@@ -1025,7 +1101,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/control/v1/batches/{id}": {
       "parameters": [
@@ -1037,6 +1118,9 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
         }
       ],
       "get": {
@@ -1079,7 +1163,7 @@
       "get": {
         "operationId": "getRecentActivity",
         "summary": "Read the latest 30 changes and control outcomes",
-        "description": "Returns the most recent enrollment changes, command outcomes, batch outcomes, and simulator changes, newest first. This bounded activity log is stored with persistent service state and does not require SOMARIS_HISTORY_PATH. Caller identity is not available because the control API has no authentication.",
+        "description": "Returns the most recent enrollment changes, command outcomes, batch outcomes, and simulator changes, newest first. This bounded activity log is stored with persistent service state and does not require SOMARIS_HISTORY_PATH. Caller identity is not available because the control API has no authentication. In demo mode this activity belongs only to the cookie-scoped visitor session and is cleared by POST /api/demo/reset.",
         "responses": {
           "200": {
             "description": "Up to 30 recent activity entries.",
@@ -1118,7 +1202,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/control/v1/queue": {
       "get": {
@@ -1136,10 +1225,10 @@
               }
             }
           },
-          "503": {
+          "405": {
             "$ref": "#/components/responses/Error"
           },
-          "405": {
+          "503": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -1155,7 +1244,12 @@
             "$ref": "#/components/responses/Error"
           }
         }
-      }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
     },
     "/api/control/v1/commands/{id}": {
       "parameters": [
@@ -1167,6 +1261,9 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
         }
       ],
       "get": {
@@ -1258,6 +1355,132 @@
           }
         }
       }
+    },
+    "/api/v1/demo": {
+      "get": {
+        "operationId": "getDemoMode",
+        "summary": "Read demo mode and simulator readiness",
+        "description": "This service-level signal is available before demo session bootstrap. In normal mode demo_mode is false. simulator_ready describes simulated-device availability; bluetooth_adapter_ready reports adapter telemetry without implying a physical connection.",
+        "responses": {
+          "200": {
+            "description": "Demo activation and readiness flags.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemoModeInfoEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightDemoMode",
+        "summary": "Same-origin browser preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/demo/session": {
+      "post": {
+        "operationId": "bootstrapDemoSession",
+        "summary": "Create or resume the current visitor demo session",
+        "description": "Demo mode only. Reuses a valid cookie or creates an isolated in-memory session with four seeded blinds. The cookie is HttpOnly, SameSite=Strict, Secure over HTTPS, and scoped to Path=/. It is an isolation identifier, not user authentication. Bootstrap and state-changing demo requests require a same-origin Origin header.",
+        "responses": {
+          "200": {
+            "description": "The session is ready for dashboard API requests.",
+            "headers": {
+              "Set-Cookie": {
+                "description": "Opaque demo session cookie. Its server-side state expires after 30 minutes without activity.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemoSessionInfoEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "description": "Demo mode is disabled; this route is not registered in normal mode."
+          },
+          "503": {
+            "description": "The bounded in-memory session store is at capacity.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightDemoSession",
+        "summary": "Same-origin browser preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/demo/reset": {
+      "post": {
+        "operationId": "resetDemoSession",
+        "summary": "Reset only the current visitor demo",
+        "description": "Demo mode only. Cancels outstanding demo commands, restores the four seeded blinds and settings, and clears this session’s commands, batches, idempotency records, history, and activity. It cannot reach physical devices or another session. Requires a valid demo session cookie and same-origin Origin header.",
+        "responses": {
+          "200": {
+            "description": "The current session was restored to its seeded state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DemoResetResultEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightDemoReset",
+        "summary": "Same-origin browser preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1330,7 +1553,10 @@
             "required": [
               "status",
               "scanner_status",
-              "generated_at"
+              "generated_at",
+              "demo_mode",
+              "simulator_ready",
+              "bluetooth_adapter_ready"
             ],
             "properties": {
               "status": {
@@ -1354,8 +1580,21 @@
                 "type": "string",
                 "format": "date-time",
                 "description": "UTC health snapshot time."
+              },
+              "demo_mode": {
+                "type": "boolean",
+                "description": "Whether SOMARIS_DEMO_MODE is active."
+              },
+              "simulator_ready": {
+                "type": "boolean",
+                "description": "Whether simulated devices are configured and ready."
+              },
+              "bluetooth_adapter_ready": {
+                "type": "boolean",
+                "description": "Truthful adapter availability; false does not prevent demo readiness."
               }
-            }
+            },
+            "description": "Service availability, simulator readiness, and truthful Bluetooth adapter readiness."
           },
           "meta": {
             "$ref": "#/components/schemas/Meta"
@@ -1468,7 +1707,9 @@
               "uptime_seconds",
               "history_enabled",
               "scanner",
-              "registry"
+              "registry",
+              "demo_mode",
+              "simulator_ready"
             ],
             "properties": {
               "service_started_at": {
@@ -1488,6 +1729,14 @@
               },
               "registry": {
                 "$ref": "#/components/schemas/RegistryDiagnostics"
+              },
+              "demo_mode": {
+                "type": "boolean",
+                "description": "Whether diagnostics belong to the isolated demo service."
+              },
+              "simulator_ready": {
+                "type": "boolean",
+                "description": "Whether simulated devices are configured and ready."
               }
             }
           },
@@ -2170,7 +2419,7 @@
         "properties": {
           "id": {
             "type": "string",
-            "description": "Persistent opaque managed-device ID."
+            "description": "Opaque managed-device ID. Demo IDs are scoped to the visitor session and held in memory."
           },
           "label": {
             "type": "string"
@@ -2185,11 +2434,15 @@
           },
           "is_simulated": {
             "type": "boolean",
-            "description": "True for the in-memory synthetic device; it is persisted so restart recovery keeps transport routing explicit."
+            "description": "True for an in-memory synthetic device; demo mode contains simulated devices only."
           },
           "created_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "room": {
+            "type": "string",
+            "description": "Optional room fixture label for a seeded demo blind."
           }
         }
       },
@@ -2259,7 +2512,12 @@
           },
           "movement_status": {
             "type": "string",
-            "enum": ["closing", "opening", "at_target", "unavailable"],
+            "enum": [
+              "closing",
+              "opening",
+              "at_target",
+              "unavailable"
+            ],
             "description": "Derived from motor-reported current and target positions."
           },
           "motion_feedback": {
@@ -2268,19 +2526,33 @@
           },
           "position_status": {
             "type": "string",
-            "enum": ["observed", "unsupported", "invalid_payload", "not_observed"]
+            "enum": [
+              "observed",
+              "unsupported",
+              "invalid_payload",
+              "not_observed"
+            ]
           },
           "position_freshness": {
             "type": "string",
-            "enum": ["fresh", "stale"]
+            "enum": [
+              "fresh",
+              "stale"
+            ]
           },
           "position_source": {
             "type": "string",
-            "enum": ["ble_advertisement", "simulator"]
+            "enum": [
+              "ble_advertisement",
+              "simulator"
+            ]
           },
           "position_confidence": {
             "type": "string",
-            "enum": ["project_confirmed", "simulated"]
+            "enum": [
+              "project_confirmed",
+              "simulated"
+            ]
           },
           "position_observed_at": {
             "type": "string",
@@ -2300,15 +2572,40 @@
       },
       "DeviceCapabilities": {
         "type": "object",
-        "required": ["open", "close", "stop", "set_position", "set_motor_speed", "calibrate_endpoints", "position_feedback"],
+        "required": [
+          "open",
+          "close",
+          "stop",
+          "set_position",
+          "set_motor_speed",
+          "calibrate_endpoints",
+          "position_feedback"
+        ],
         "properties": {
-          "open": {"type": "boolean"},
-          "close": {"type": "boolean"},
-          "stop": {"type": "boolean"},
-          "set_position": {"type": "boolean", "description": "Whether this controller supports arbitrary V2 percentage positioning."},
-          "set_motor_speed": {"type": "boolean", "description": "Whether this controller supports setting motor speed as a percentage; SOMA firmware 2.2.0 or later is required."},
-          "calibrate_endpoints": {"type": "boolean", "description": "Whether this controller supports supervised endpoint calibration."},
-          "position_feedback": {"type": "boolean"}
+          "open": {
+            "type": "boolean"
+          },
+          "close": {
+            "type": "boolean"
+          },
+          "stop": {
+            "type": "boolean"
+          },
+          "set_position": {
+            "type": "boolean",
+            "description": "Whether this controller supports arbitrary V2 percentage positioning."
+          },
+          "set_motor_speed": {
+            "type": "boolean",
+            "description": "Whether this controller supports setting motor speed as a percentage; SOMA firmware 2.2.0 or later is required."
+          },
+          "calibrate_endpoints": {
+            "type": "boolean",
+            "description": "Whether this controller supports supervised endpoint calibration."
+          },
+          "position_feedback": {
+            "type": "boolean"
+          }
         }
       },
       "GattReadiness": {
@@ -2384,14 +2681,25 @@
       },
       "MotionFeedback": {
         "type": "object",
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "properties": {
           "status": {
             "type": "string",
-            "enum": ["awaiting_progress", "progress_observed", "stalled", "target_reached", "unavailable"],
+            "enum": [
+              "awaiting_progress",
+              "progress_observed",
+              "stalled",
+              "target_reached",
+              "unavailable"
+            ],
             "description": "Derived from motor position advertisements. Stall detection requires fresh position telemetry and never causes an automatic movement command."
           },
-          "last_progress_at": {"type": "string", "format": "date-time"},
+          "last_progress_at": {
+            "type": "string",
+            "format": "date-time"
+          },
           "estimated_travel_rate_percent_per_second": {
             "type": "number",
             "minimum": 0,
@@ -2872,13 +3180,34 @@
       "BleAttemptTimings": {
         "type": "object",
         "properties": {
-          "peripheral_lookup_ms": {"type": "integer", "minimum": 0},
-          "connect_ms": {"type": "integer", "minimum": 0},
-          "service_discovery_ms": {"type": "integer", "minimum": 0},
-          "identity_verification_ms": {"type": "integer", "minimum": 0},
-          "gatt_discovery_ms": {"type": "integer", "minimum": 0},
-          "gatt_write_ms": {"type": "integer", "minimum": 0},
-          "disconnect_ms": {"type": "integer", "minimum": 0}
+          "peripheral_lookup_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "connect_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "service_discovery_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "identity_verification_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "gatt_discovery_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "gatt_write_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "disconnect_ms": {
+            "type": "integer",
+            "minimum": 0
+          }
         }
       },
       "QueueDiagnostics": {
@@ -2986,6 +3315,111 @@
           "meta": {
             "$ref": "#/components/schemas/Meta"
           }
+        }
+      },
+      "DemoModeInfoEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "demo_mode",
+              "simulator_ready",
+              "bluetooth_adapter_ready"
+            ],
+            "properties": {
+              "demo_mode": {
+                "type": "boolean"
+              },
+              "simulator_ready": {
+                "type": "boolean"
+              },
+              "bluetooth_adapter_ready": {
+                "type": "boolean",
+                "description": "Physical adapter telemetry; demo mode never claims adapter readiness."
+              }
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "DemoSessionInfoEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "demo_mode",
+              "idle_timeout_seconds"
+            ],
+            "properties": {
+              "demo_mode": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "idle_timeout_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Idle time before this in-memory visitor session expires."
+              }
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      },
+      "DemoResetResultEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "reset",
+              "message"
+            ],
+            "properties": {
+              "reset": {
+                "type": "boolean",
+                "enum": [
+                  true
+                ]
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        }
+      }
+    },
+    "parameters": {
+      "DemoSessionCookie": {
+        "name": "somaris-demo-session",
+        "in": "cookie",
+        "required": false,
+        "description": "Required for these stateful paths when SOMARIS_DEMO_MODE=true. Omitted in normal mode. The cookie isolates a demo context but is not authentication.",
+        "schema": {
+          "type": "string"
         }
       }
     }

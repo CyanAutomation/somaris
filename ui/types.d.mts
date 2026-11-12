@@ -37,6 +37,7 @@ export interface Enrollment {
   advertised_name?: string | null;
   label?: string;
   is_simulated?: boolean;
+  room?: string;
 }
 
 export interface ManagedDevice {
@@ -157,6 +158,8 @@ export interface BatchState {
 }
 
 export interface Diagnostics {
+  demo_mode?: boolean;
+  simulator_ready?: boolean;
   scanner?: {
     adapter_available?: boolean;
     scan_active?: boolean;
@@ -213,6 +216,7 @@ export interface ApiError extends Error {
 export type ApiRequest = (path: string, options?: RequestInit) => Promise<unknown>;
 
 export interface RefreshTarget {
+  demoMode?: boolean;
   managed?: ManagedDevice[];
   observations?: Observation[];
   diagnostics?: Diagnostics | null;
@@ -233,6 +237,7 @@ export interface RefreshTarget {
 }
 
 export interface DashboardState extends RefreshTarget {
+  demoMode: boolean;
   managed: ManagedDevice[];
   observations: Observation[];
   diagnostics: Diagnostics | null;
