@@ -45,9 +45,11 @@ struct ActionGate {
     action: ServiceAction,
     after_write: bool,
     ignore_cancellation: bool,
+    cleanup_delay: Duration,
     paused: AtomicBool,
     entered: Notify,
     cancel_seen: Notify,
+    cleanup_started: Notify,
     release: Notify,
 }
 
@@ -63,9 +65,25 @@ impl ActionGate {
             action,
             after_write,
             ignore_cancellation: false,
+            cleanup_delay: Duration::ZERO,
             paused: AtomicBool::new(true),
             entered: Notify::new(),
             cancel_seen: Notify::new(),
+            cleanup_started: Notify::new(),
+            release: Notify::new(),
+        })
+    }
+
+    fn with_prewrite_cleanup_delay(action: ServiceAction, cleanup_delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            action,
+            after_write: false,
+            ignore_cancellation: false,
+            cleanup_delay,
+            paused: AtomicBool::new(true),
+            entered: Notify::new(),
+            cancel_seen: Notify::new(),
+            cleanup_started: Notify::new(),
             release: Notify::new(),
         })
     }
@@ -75,9 +93,11 @@ impl ActionGate {
             action,
             after_write: true,
             ignore_cancellation: true,
+            cleanup_delay: Duration::ZERO,
             paused: AtomicBool::new(true),
             entered: Notify::new(),
             cancel_seen: Notify::new(),
+            cleanup_started: Notify::new(),
             release: Notify::new(),
         })
     }
@@ -170,6 +190,40 @@ impl FakeBleAdapter {
     }
 }
 
+/// Preserves the original trait implementation to exercise the default, non-preemptible scan.
+struct LegacyScanAdapter(Arc<FakeBleAdapter>);
+
+#[async_trait]
+impl BleAdapter for LegacyScanAdapter {
+    async fn scan(
+        &self,
+        observations: mpsc::Sender<BleObservation>,
+        window: Duration,
+    ) -> Result<(), BleFailure> {
+        self.0.scan(observations, window).await
+    }
+
+    async fn write_action(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+        action: ServiceAction,
+        control: &BleCommandControl,
+    ) -> Result<(), BleFailure> {
+        self.0
+            .write_action(peripheral_id, expected_name, action, control)
+            .await
+    }
+
+    async fn read_battery(
+        &self,
+        peripheral_id: &str,
+        expected_name: &str,
+    ) -> Result<Vec<u8>, BleFailure> {
+        self.0.read_battery(peripheral_id, expected_name).await
+    }
+}
+
 #[async_trait]
 impl BleAdapter for FakeBleAdapter {
     async fn scan(
@@ -223,7 +277,13 @@ impl BleAdapter for FakeBleAdapter {
             gate.entered.notify_one();
             tokio::select! {
                 biased;
-                _ = control.cancelled() => return Err(control.cancellation_failure()),
+                _ = control.cancelled() => {
+                    if !gate.cleanup_delay.is_zero() {
+                        gate.cleanup_started.notify_one();
+                        tokio::time::sleep(gate.cleanup_delay).await;
+                    }
+                    return Err(control.cancellation_failure());
+                }
                 _ = gate.release.notified() => {}
             }
         }
@@ -837,6 +897,58 @@ async fn stop_preempts_an_in_flight_movement_before_the_gatt_write() {
 }
 
 #[tokio::test]
+async fn stop_waits_for_cancelled_prewrite_cleanup_before_reusing_adapter() {
+    let cleanup_delay = Duration::from_millis(100);
+    let gate = ActionGate::with_prewrite_cleanup_delay(ServiceAction::Close, cleanup_delay);
+    let adapter = Arc::new(FakeBleAdapter::with_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "cleanup-before-stop")],
+        Some(json!({"action": "close"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let close_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .expect("movement should reach the pre-write gate");
+
+    let stop_requested_at = tokio::time::Instant::now();
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "stop-after-cleanup")],
+        Some(json!({"action": "stop"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let stop_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    tokio::time::timeout(Duration::from_secs(2), gate.cleanup_started.notified())
+        .await
+        .expect("pre-write cleanup should start after Stop cancels the movement");
+    assert!(
+        adapter.writes().is_empty(),
+        "Stop must not write while the previous adapter operation is cleaning up"
+    );
+
+    let close = wait_for_command(&app, &close_id).await;
+    let stop = wait_for_command(&app, &stop_id).await;
+    assert_eq!(close["status"], "cancelled");
+    assert_eq!(stop["status"], "write_acknowledged");
+    assert!(tokio::time::Instant::now() - stop_requested_at >= cleanup_delay);
+    assert_eq!(adapter.writes(), [ServiceAction::Stop]);
+}
+
+#[tokio::test]
 async fn stop_waits_for_a_movement_once_its_gatt_write_has_started() {
     let gate = ActionGate::new(ServiceAction::Close, true);
     let adapter = Arc::new(FakeBleAdapter::with_gate(
@@ -1115,6 +1227,24 @@ async fn physical_command_interrupts_an_active_scan_window() {
 }
 
 #[tokio::test]
+async fn legacy_scan_adapter_finishes_its_window_before_command_access() {
+    let fake = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
+    let legacy: Arc<dyn BleAdapter> = Arc::new(LegacyScanAdapter(fake.clone()));
+    let app = app_with_ble_adapter_and_scan_window(legacy, 800).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    assert!(fake.scan_active.load(Ordering::SeqCst));
+    let scans_before = fake.completed_scans.load(Ordering::SeqCst);
+
+    let command = submit(&app, &managed_id, "legacy-scan-window", "close").await;
+
+    assert_eq!(command["status"], "write_acknowledged");
+    assert!(command["queue_wait_ms"].as_u64().unwrap() >= 400);
+    assert!(fake.completed_scans.load(Ordering::SeqCst) > scans_before);
+    assert!(!fake.gatt_overlapped_scan());
+}
+
+#[tokio::test]
 async fn physical_toggle_uses_fresh_closed_position_and_enqueues_open() {
     let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
     let app = app_with_adapter(adapter.clone()).await;
@@ -1235,6 +1365,13 @@ async fn app_with_adapter(adapter: Arc<FakeBleAdapter>) -> Router {
 
 async fn app_with_adapter_and_scan_window(
     adapter: Arc<FakeBleAdapter>,
+    adapter_scan_window_ms: u64,
+) -> Router {
+    app_with_ble_adapter_and_scan_window(adapter, adapter_scan_window_ms).await
+}
+
+async fn app_with_ble_adapter_and_scan_window(
+    adapter: Arc<dyn BleAdapter>,
     adapter_scan_window_ms: u64,
 ) -> Router {
     let state = AppState::new()
