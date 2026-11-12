@@ -374,8 +374,9 @@ pub trait BleAdapter: Send + Sync {
     ) -> Result<(), BleFailure>;
 
     /// Cooperatively stops an active scan when adapter capacity is needed for a command.
-    /// Legacy adapters keep their existing scan implementation; adapters with an active
-    /// radio scan should override this method and stop it before returning.
+    /// The default is non-preemptible: it waits for `scan` to return, normally at the end of
+    /// `window`. Adapters that own active radio discovery should override this method, stop the
+    /// scan, and only then return; dropping an active scan future may leave radio discovery on.
     async fn scan_with_control(
         &self,
         observations: mpsc::Sender<BleObservation>,
@@ -486,7 +487,7 @@ impl DisconnectGuard {
 
     async fn abort_connection(&mut self) {
         if let Some(peripheral) = self.0.take() {
-            BtleplugAdapter::disconnect_after_interruption(&peripheral).await;
+            BtleplugAdapter::disconnect(&peripheral).await;
         }
     }
 }
@@ -892,10 +893,6 @@ impl BtleplugAdapter {
     }
 
     async fn disconnect(peripheral: &Peripheral) {
-        disconnect_with_timeout(peripheral.disconnect()).await;
-    }
-
-    async fn disconnect_after_interruption(peripheral: &Peripheral) {
         disconnect_with_timeout(peripheral.disconnect()).await;
     }
 
