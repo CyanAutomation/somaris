@@ -1113,22 +1113,11 @@ impl AppState {
     }
 
     pub fn spawn_background_tasks(&self) {
-        if self.demo_mode
-            && let Some(sessions) = self.demo_sessions.clone()
-        {
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    interval.tick().await;
-                    let mut store = sessions.lock().await;
-                    prune_expired_demo_sessions(&mut store, Instant::now());
-                }
-            });
-        }
         let state = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             let mut cancelled = state.background_cancel.subscribe();
+            let mut last_demo_session_prune = tokio::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}
@@ -1138,6 +1127,16 @@ impl AppState {
                         }
                         continue;
                     }
+                }
+                // Keep session cleanup on the simulator task's lifecycle instead of
+                // spawning a separate process-lifetime sweeper.
+                if state.demo_mode
+                    && last_demo_session_prune.elapsed() >= StdDuration::from_secs(60)
+                    && let Some(sessions) = &state.demo_sessions
+                {
+                    let mut store = sessions.lock().await;
+                    prune_expired_demo_sessions(&mut store, Instant::now());
+                    last_demo_session_prune = tokio::time::Instant::now();
                 }
                 let history = {
                     let mut inner = state.inner.lock().await;
@@ -2002,10 +2001,6 @@ fn request_is_secure(headers: &HeaderMap) -> bool {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"))
-        || headers
-            .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|origin| origin.starts_with("https://"))
 }
 
 fn request_has_same_origin(request: &axum::extract::Request) -> bool {
@@ -7109,6 +7104,23 @@ fn command_status_text(status: CommandStatus) -> &'static str {
 mod security_hardening_tests {
     use super::*;
 
+    #[test]
+    fn secure_cookie_flag_uses_forwarded_transport_not_origin_scheme() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://somaris.test"),
+        );
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert!(!request_is_secure(&headers));
+
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(request_is_secure(&headers));
+
+        headers.remove("x-forwarded-proto");
+        assert!(!request_is_secure(&headers));
+    }
+
     #[tokio::test]
     async fn expired_demo_session_signals_its_simulator_task_to_stop() {
         let service = AppState::demo();
@@ -7134,6 +7146,33 @@ mod security_hardening_tests {
             .expect("expired session cancellation should be delivered")
             .expect("cancellation sender remains alive through the task");
         assert!(*cancellation.borrow_and_update());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn demo_background_ticker_prunes_expired_sessions() {
+        let service = AppState::demo();
+        let session = service.new_demo_session_state();
+        let sessions = service.demo_sessions.as_ref().unwrap().clone();
+        sessions.lock().await.sessions.insert(
+            "expired".into(),
+            DemoSession {
+                state: session,
+                last_activity: Instant::now()
+                    - DEMO_SESSION_IDLE_TIMEOUT
+                    - StdDuration::from_secs(1),
+            },
+        );
+
+        service.spawn_background_tasks();
+        for _ in 0..=61 {
+            tokio::time::advance(StdDuration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            if sessions.lock().await.sessions.is_empty() {
+                break;
+            }
+        }
+
+        assert!(sessions.lock().await.sessions.is_empty());
     }
 
     fn history_sample(
