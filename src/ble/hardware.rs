@@ -18,7 +18,7 @@ use btleplug::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use uuid::Uuid;
 
 use crate::controller::{ServiceAction, encode_service_action, service_action_target};
@@ -68,9 +68,79 @@ impl BleFailureStage {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BleFailureCause {
+    ConnectionTimeout,
+    ConnectionAbortedByLocal,
+    ConnectionTransportError,
+}
+
+impl BleFailureCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectionTimeout => "connection_timeout",
+            Self::ConnectionAbortedByLocal => "connection_aborted_by_local",
+            Self::ConnectionTransportError => "connection_transport_error",
+        }
+    }
+
+    fn from_connect_error(error: &impl Display) -> Self {
+        let normalized = error
+            .to_string()
+            .to_ascii_lowercase()
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>();
+        if normalized.contains("leconnectionabortbylocal") {
+            Self::ConnectionAbortedByLocal
+        } else {
+            Self::ConnectionTransportError
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct BleScanControl {
+    cancelled: watch::Sender<bool>,
+}
+
+impl BleScanControl {
+    pub fn new() -> Self {
+        let (cancelled, _) = watch::channel(false);
+        Self { cancelled }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.cancelled.borrow()
+    }
+
+    pub async fn cancelled(&self) {
+        let mut receiver = self.cancelled.subscribe();
+        loop {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Default for BleScanControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BleFailure {
     pub stage: BleFailureStage,
+    pub cause: Option<BleFailureCause>,
     pub retryable_before_write: bool,
     pub write_may_have_been_sent: bool,
     pub outcome_unknown: bool,
@@ -109,6 +179,7 @@ impl BleFailure {
     fn before_write(stage: BleFailureStage, retryable: bool) -> Self {
         Self {
             stage,
+            cause: None,
             retryable_before_write: retryable,
             write_may_have_been_sent: false,
             outcome_unknown: false,
@@ -118,6 +189,7 @@ impl BleFailure {
     fn during_write(outcome_unknown: bool) -> Self {
         Self {
             stage: BleFailureStage::GattWrite,
+            cause: None,
             retryable_before_write: false,
             write_may_have_been_sent: true,
             outcome_unknown,
@@ -131,6 +203,7 @@ impl BleFailure {
             } else {
                 BleFailureStage::CommandDeadline
             },
+            cause: None,
             retryable_before_write: !write_may_have_been_sent,
             write_may_have_been_sent,
             outcome_unknown: write_may_have_been_sent,
@@ -140,6 +213,7 @@ impl BleFailure {
     pub(crate) fn command_preempted() -> Self {
         Self {
             stage: BleFailureStage::CommandPreempted,
+            cause: None,
             retryable_before_write: false,
             write_may_have_been_sent: false,
             outcome_unknown: false,
@@ -299,6 +373,19 @@ pub trait BleAdapter: Send + Sync {
         window: Duration,
     ) -> Result<(), BleFailure>;
 
+    /// Cooperatively stops an active scan when adapter capacity is needed for a command.
+    /// The default is non-preemptible: it waits for `scan` to return, normally at the end of
+    /// `window`. Adapters that own active radio discovery should override this method, stop the
+    /// scan, and only then return; dropping an active scan future may leave radio discovery on.
+    async fn scan_with_control(
+        &self,
+        observations: mpsc::Sender<BleObservation>,
+        window: Duration,
+        _control: BleScanControl,
+    ) -> Result<(), BleFailure> {
+        self.scan(observations, window).await
+    }
+
     /// Executes one physical action and must observe cancellation until `begin_write` wins.
     /// After cancellation it must finish best-effort disconnect cleanup before returning.
     async fn write_action(
@@ -375,9 +462,9 @@ fn connection_reusable(
 
 fn connect_timeout(action: ServiceAction, attempt: u8) -> Duration {
     match (action, attempt) {
-        (ServiceAction::Stop, 1) => Duration::from_secs(6),
-        (ServiceAction::Stop, _) => Duration::from_secs(20),
-        _ => Duration::from_secs(30),
+        (ServiceAction::Stop, _) => Duration::from_secs(6),
+        (_, 1) => Duration::from_secs(8),
+        _ => Duration::from_secs(6),
     }
 }
 
@@ -400,7 +487,7 @@ impl DisconnectGuard {
 
     async fn abort_connection(&mut self) {
         if let Some(peripheral) = self.0.take() {
-            BtleplugAdapter::disconnect_after_interruption(&peripheral).await;
+            BtleplugAdapter::disconnect(&peripheral).await;
         }
     }
 }
@@ -709,13 +796,14 @@ impl BtleplugAdapter {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(operation = "connect", %error, "BLE operation failed before write");
+                let cause = BleFailureCause::from_connect_error(&error);
                 let disconnect_started = std::time::Instant::now();
                 disconnect_guard.abort_connection().await;
                 control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
-                return Err(BleFailure::before_write(
-                    BleFailureStage::DeviceConnection,
-                    true,
-                ));
+                return Err(BleFailure {
+                    cause: Some(cause),
+                    ..BleFailure::before_write(BleFailureStage::DeviceConnection, true)
+                });
             }
             Err(_) => {
                 tracing::warn!(
@@ -726,10 +814,10 @@ impl BtleplugAdapter {
                 let disconnect_started = std::time::Instant::now();
                 disconnect_guard.abort_connection().await;
                 control.record_phase(BlePhase::Disconnect, disconnect_started.elapsed());
-                return Err(BleFailure::before_write(
-                    BleFailureStage::DeviceConnection,
-                    true,
-                ));
+                return Err(BleFailure {
+                    cause: Some(BleFailureCause::ConnectionTimeout),
+                    ..BleFailure::before_write(BleFailureStage::DeviceConnection, true)
+                });
             }
         }
         let service_discovery_started = std::time::Instant::now();
@@ -808,10 +896,6 @@ impl BtleplugAdapter {
         disconnect_with_timeout(peripheral.disconnect()).await;
     }
 
-    async fn disconnect_after_interruption(peripheral: &Peripheral) {
-        disconnect_with_timeout(peripheral.disconnect()).await;
-    }
-
     async fn stop_scan(&self) -> Result<(), BleFailure> {
         match tokio::time::timeout(Duration::from_secs(5), self.adapter.stop_scan()).await {
             Ok(Ok(())) => Ok(()),
@@ -829,32 +913,12 @@ impl BtleplugAdapter {
             }
         }
     }
-}
 
-async fn disconnect_with_timeout<Fut, Error>(disconnect: Fut)
-where
-    Fut: Future<Output = Result<(), Error>>,
-    Error: Display,
-{
-    match tokio::time::timeout(Duration::from_secs(5), disconnect).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(operation = "disconnect", %error, "BLE disconnect failed")
-        }
-        Err(_) => tracing::warn!(
-            operation = "disconnect",
-            timeout_seconds = 5,
-            "BLE disconnect timed out"
-        ),
-    }
-}
-
-#[async_trait]
-impl BleAdapter for BtleplugAdapter {
-    async fn scan(
+    async fn scan_inner(
         &self,
         observations: mpsc::Sender<BleObservation>,
         window: Duration,
+        control: Option<BleScanControl>,
     ) -> Result<(), BleFailure> {
         let mut events = match tokio::time::timeout(Duration::from_secs(10), self.adapter.events())
             .await
@@ -896,7 +960,7 @@ impl BleAdapter for BtleplugAdapter {
             }
         }
 
-        let scan_result = tokio::time::timeout(window, async {
+        let scan_events = async {
             while let Some(event) = events.next().await {
                 let peripheral_id = match event {
                     CentralEvent::DeviceDiscovered(id)
@@ -936,13 +1000,62 @@ impl BleAdapter for BtleplugAdapter {
                 }
             }
             Err(BleFailure::before_write(BleFailureStage::Adapter, true))
-        })
-        .await;
+        };
+        let (scan_result, cancelled) = if let Some(control) = control {
+            tokio::select! {
+                biased;
+                _ = control.cancelled() => (Ok(Ok(())), true),
+                result = tokio::time::timeout(window, scan_events) => (result, false),
+            }
+        } else {
+            (tokio::time::timeout(window, scan_events).await, false)
+        };
         self.stop_scan().await?;
+        if cancelled {
+            return Ok(());
+        }
         match scan_result {
             Err(_) => Ok(()),
             Ok(result) => result,
         }
+    }
+}
+
+async fn disconnect_with_timeout<Fut, Error>(disconnect: Fut)
+where
+    Fut: Future<Output = Result<(), Error>>,
+    Error: Display,
+{
+    match tokio::time::timeout(Duration::from_secs(5), disconnect).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(operation = "disconnect", %error, "BLE disconnect failed")
+        }
+        Err(_) => tracing::warn!(
+            operation = "disconnect",
+            timeout_seconds = 5,
+            "BLE disconnect timed out"
+        ),
+    }
+}
+
+#[async_trait]
+impl BleAdapter for BtleplugAdapter {
+    async fn scan(
+        &self,
+        observations: mpsc::Sender<BleObservation>,
+        window: Duration,
+    ) -> Result<(), BleFailure> {
+        self.scan_inner(observations, window, None).await
+    }
+
+    async fn scan_with_control(
+        &self,
+        observations: mpsc::Sender<BleObservation>,
+        window: Duration,
+        control: BleScanControl,
+    ) -> Result<(), BleFailure> {
+        self.scan_inner(observations, window, Some(control)).await
     }
 
     async fn write_action(
@@ -1132,6 +1245,33 @@ fn is_battery_characteristic(characteristic: &Characteristic) -> bool {
 mod battery_tests {
     use super::*;
     use btleplug::api::Characteristic;
+
+    #[tokio::test]
+    async fn scan_cancellation_is_observed_even_if_requested_before_waiting() {
+        let control = BleScanControl::new();
+        control.cancel();
+
+        tokio::time::timeout(Duration::from_millis(20), control.cancelled())
+            .await
+            .expect("watch-based cancellation must not lose an early signal");
+        assert!(control.is_cancelled());
+    }
+
+    #[test]
+    fn connect_failures_are_reduced_to_stable_public_causes() {
+        assert_eq!(
+            BleFailureCause::from_connect_error(&"LE-Connection-Abort-By-Local (0x16)"),
+            BleFailureCause::ConnectionAbortedByLocal
+        );
+        assert_eq!(
+            BleFailureCause::from_connect_error(&"org.bluez.Error.Failed"),
+            BleFailureCause::ConnectionTransportError
+        );
+        assert_eq!(
+            BleFailureCause::ConnectionTimeout.as_str(),
+            "connection_timeout"
+        );
+    }
     use std::collections::BTreeSet;
     use std::sync::atomic::AtomicBool;
     use std::task::Poll;
@@ -1196,11 +1336,15 @@ mod battery_tests {
         );
         assert_eq!(
             connect_timeout(ServiceAction::Stop, 2),
-            Duration::from_secs(20)
+            Duration::from_secs(6)
         );
         assert_eq!(
             connect_timeout(ServiceAction::Close, 1),
-            Duration::from_secs(30)
+            Duration::from_secs(8)
+        );
+        assert_eq!(
+            connect_timeout(ServiceAction::Close, 2),
+            Duration::from_secs(6)
         );
     }
 

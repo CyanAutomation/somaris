@@ -2,8 +2,8 @@ mod hardware;
 mod protocol;
 
 pub use hardware::{
-    BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureStage, BleObservation,
-    BlePhase, BtleplugAdapter,
+    BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureCause, BleFailureStage,
+    BleObservation, BlePhase, BleScanControl, BtleplugAdapter,
 };
 pub use protocol::{
     BA71_CHARACTERISTIC_UUID, BatteryReading, BleDecodeError, ParsedSomaAdvertisement,
