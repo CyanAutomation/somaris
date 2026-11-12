@@ -2739,6 +2739,11 @@
             "type": "string",
             "format": "date-time"
           },
+          "queue_wait_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Time from acceptance until the command obtains serialized adapter access."
+          },
           "started_at": {
             "type": "string",
             "format": "date-time",
@@ -2849,6 +2854,15 @@
           },
           "failure_stage": {
             "type": "string"
+          },
+          "failure_cause": {
+            "type": "string",
+            "enum": [
+              "connection_timeout",
+              "connection_aborted_by_local",
+              "connection_transport_error"
+            ],
+            "description": "Stable connection setup cause when the operating system reports one. Raw host error text is not exposed."
           },
           "error_code": {
             "type": "string"
