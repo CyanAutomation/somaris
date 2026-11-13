@@ -239,7 +239,7 @@ pub struct AppState {
     inner: Arc<Mutex<Inner>>,
     device_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     command_controls: Arc<Mutex<HashMap<String, BleCommandControl>>>,
-    battery_controls: Arc<Mutex<HashMap<String, BleCommandControl>>>,
+    background_read_controls: Arc<Mutex<HashMap<String, Vec<BleCommandControl>>>>,
     adapter_slots: Arc<Semaphore>,
     pending_adapter_commands: watch::Sender<usize>,
     scan_window_generation: watch::Sender<u64>,
@@ -453,6 +453,10 @@ struct ScannerCounters {
     last_error_code: Option<String>,
     retry_count: u64,
     error_count: u64,
+    #[serde(default)]
+    adapter_recovery_count: u64,
+    #[serde(default)]
+    last_adapter_recovered_at: Option<DateTime<Utc>>,
     advertisements_seen: u64,
     observations_stored: u64,
     malformed_payload_count: u64,
@@ -471,6 +475,8 @@ impl ScannerCounters {
             last_error_code: Some("adapter_unavailable".into()),
             retry_count: 0,
             error_count: 0,
+            adapter_recovery_count: 0,
+            last_adapter_recovered_at: None,
             advertisements_seen: 0,
             observations_stored: 0,
             malformed_payload_count: 0,
@@ -674,7 +680,7 @@ impl AppState {
             inner: Arc::new(Mutex::new(inner)),
             device_locks: Arc::new(Mutex::new(HashMap::new())),
             command_controls: Arc::new(Mutex::new(HashMap::new())),
-            battery_controls: Arc::new(Mutex::new(HashMap::new())),
+            background_read_controls: Arc::new(Mutex::new(HashMap::new())),
             adapter_slots: Arc::new(Semaphore::new(queue_config.adapter_concurrency)),
             pending_adapter_commands,
             scan_window_generation,
@@ -1236,6 +1242,7 @@ impl AppState {
     }
 
     async fn scanner_supervisor(&self) {
+        let mut recovering_adapter = false;
         loop {
             let mut adapter = self.ble_adapter.read().await.clone();
             if adapter.is_none() {
@@ -1345,6 +1352,12 @@ impl AppState {
                 inner.scanner.status = "available".into();
                 inner.scanner.adapter_available = true;
                 inner.scanner.last_error_code = None;
+                if recovering_adapter {
+                    inner.scanner.adapter_recovery_count =
+                        inner.scanner.adapter_recovery_count.saturating_add(1);
+                    inner.scanner.last_adapter_recovered_at = Some(Utc::now());
+                    recovering_adapter = false;
+                }
                 drop(inner);
                 drop(scan_permit);
                 self.scan_window_generation
@@ -1362,6 +1375,9 @@ impl AppState {
             let adapter_failed = failure
                 .as_ref()
                 .is_some_and(|failure| failure.stage == BleFailureStage::Adapter);
+            if adapter_failed {
+                recovering_adapter = true;
+            }
             {
                 let mut inner = self.inner.lock().await;
                 inner.scanner.scan_active = false;
@@ -1601,10 +1617,7 @@ impl AppState {
         adapter: Arc<dyn BleAdapter>,
     ) -> bool {
         let control = BleCommandControl::new();
-        self.battery_controls
-            .lock()
-            .await
-            .insert(managed_id.clone(), control.clone());
+        self.register_background_read(&managed_id, &control).await;
         let lock = {
             let mut locks = self.device_locks.lock().await;
             locks
@@ -1640,7 +1653,7 @@ impl AppState {
             control.is_cancelled()
         }
         .await;
-        self.battery_controls.lock().await.remove(&managed_id);
+        self.unregister_background_read(&managed_id, &control).await;
         preempted
     }
 
@@ -1696,9 +1709,35 @@ impl AppState {
         }
     }
 
-    async fn preempt_battery_read(&self, managed_device_id: &str) {
-        if let Some(control) = self.battery_controls.lock().await.get(managed_device_id) {
-            control.request_prewrite_cancel();
+    async fn preempt_background_read(&self, managed_device_id: &str) {
+        let reads = self.background_read_controls.lock().await;
+        if let Some(controls) = reads.get(managed_device_id) {
+            for control in controls {
+                control.request_prewrite_cancel();
+            }
+        }
+    }
+
+    async fn register_background_read(&self, managed_device_id: &str, control: &BleCommandControl) {
+        self.background_read_controls
+            .lock()
+            .await
+            .entry(managed_device_id.to_owned())
+            .or_default()
+            .push(control.clone());
+    }
+
+    async fn unregister_background_read(
+        &self,
+        managed_device_id: &str,
+        control: &BleCommandControl,
+    ) {
+        let mut controls = self.background_read_controls.lock().await;
+        if let Some(registered) = controls.get_mut(managed_device_id) {
+            registered.retain(|candidate| !candidate.same_instance(control));
+            if registered.is_empty() {
+                controls.remove(managed_device_id);
+            }
         }
     }
 }
@@ -1798,6 +1837,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/control/v1/devices/{id}/commands",
             post(queue_command).options(preflight),
+        )
+        .route(
+            "/api/control/v1/devices/{id}/motor-settings",
+            get(get_motor_settings).options(preflight),
         )
         .route(
             "/api/control/v1/devices/{id}/toggle",
@@ -1971,7 +2014,7 @@ async fn reset_demo(RequestState(state): RequestState) -> Response {
         seed_demo_household(&mut inner, Utc::now());
     }
     state.command_controls.lock().await.clear();
-    state.battery_controls.lock().await.clear();
+    state.background_read_controls.lock().await.clear();
     state.state_changes.publish();
     Json(envelope(
         DemoResetResult {
@@ -2267,6 +2310,8 @@ async fn diagnostics(RequestState(state): RequestState, headers: HeaderMap) -> R
             last_error_code: inner.scanner.last_error_code.clone(),
             retry_count: inner.scanner.retry_count,
             error_count: inner.scanner.error_count,
+            last_adapter_recovered_at: inner.scanner.last_adapter_recovered_at,
+            adapter_recovery_count: inner.scanner.adapter_recovery_count,
             soma_advertisements_seen: inner.scanner.advertisements_seen,
             observations_stored: inner.scanner.observations_stored,
             malformed_payload_count: inner.scanner.malformed_payload_count,
@@ -2900,6 +2945,9 @@ struct ScannerDiagnostics {
     last_error_code: Option<String>,
     retry_count: u64,
     error_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_adapter_recovered_at: Option<DateTime<Utc>>,
+    adapter_recovery_count: u64,
     soma_advertisements_seen: u64,
     observations_stored: u64,
     malformed_payload_count: u64,
@@ -3096,6 +3144,13 @@ pub struct ManagedDevice {
     pub requested_position_closed_percent: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_command_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MotorSettingsData {
+    firmware_version: String,
+    motor_speed_percent: Option<u8>,
+    observed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4195,6 +4250,10 @@ fn ble_failure_code(failure: &BleFailure) -> &'static str {
         BleFailureStage::CommandPreempted => "preempted_by_stop",
         BleFailureStage::BatteryDiscovery => "ba71_unsupported",
         BleFailureStage::BatteryRead => "battery_read_failed",
+        BleFailureStage::FirmwareRead => "firmware_read_failed",
+        BleFailureStage::UnsupportedFirmware => "firmware_unsupported",
+        BleFailureStage::MotorSettingsDiscovery => "motor_settings_unsupported",
+        BleFailureStage::MotorSettingsRead => "motor_settings_read_failed",
     }
 }
 
@@ -4225,6 +4284,165 @@ async fn list_managed_devices(RequestState(state): RequestState, headers: Header
         devices.clone(),
         envelope(devices.clone(), Some(devices.len() as u64)),
     )
+}
+
+async fn get_motor_settings(
+    RequestState(state): RequestState,
+    RoutePath(managed_device_id): RoutePath<String>,
+) -> Response {
+    if !state.ble_enabled {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "physical_control_disabled",
+            "Bluetooth control is disabled.",
+        );
+    }
+    let (expected_name, peripheral_id) = {
+        let mut inner = state.inner.lock().await;
+        prune_registry(&mut inner, Utc::now());
+        let Some(enrollment) = inner.enrollments.get(&managed_device_id).cloned() else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "enrollment_not_found",
+                "Managed device was not found.",
+            );
+        };
+        if enrollment.is_simulated {
+            return error_response(
+                StatusCode::CONFLICT,
+                "physical_device_required",
+                "Motor settings are available only for physical BLE devices.",
+            );
+        }
+        let matches: Vec<_> = inner
+            .devices
+            .values()
+            .filter(|device| {
+                !device.is_simulated
+                    && device.logical_id.as_deref() == Some(enrollment.logical_id.as_str())
+                    && device.advertised_name == enrollment.advertised_name
+            })
+            .collect();
+        if matches.len() > 1 {
+            return error_response(
+                StatusCode::CONFLICT,
+                "device_identity_ambiguous",
+                "A unique fresh BLE observation is required to read motor settings.",
+            );
+        }
+        let Some(device) = matches.first().copied() else {
+            return error_response(
+                StatusCode::CONFLICT,
+                "device_not_ready",
+                "A fresh BLE observation is required to read motor settings.",
+            );
+        };
+        if device.freshness != Freshness::Fresh
+            || Utc::now().signed_duration_since(device.last_seen_at) > ChronoDuration::seconds(60)
+        {
+            return error_response(
+                StatusCode::CONFLICT,
+                "device_not_ready",
+                "A fresh BLE observation is required to read motor settings.",
+            );
+        }
+        (enrollment.advertised_name, device.adapter_device_id.clone())
+    };
+    let Some(adapter) = state.ble_adapter.read().await.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "adapter_unavailable",
+            "The Bluetooth adapter is unavailable.",
+        );
+    };
+
+    let control = BleCommandControl::new();
+    state
+        .register_background_read(&managed_device_id, &control)
+        .await;
+    let lock = {
+        let mut locks = state.device_locks.lock().await;
+        locks
+            .entry(managed_device_id.clone())
+            .or_insert_with(|| Arc::new(Semaphore::new(1)))
+            .clone()
+    };
+    let device_permit = tokio::select! {
+        biased;
+        _ = control.cancelled() => None,
+        permit = lock.acquire_owned() => permit.ok(),
+    };
+    let Some(_device_permit) = device_permit else {
+        state
+            .unregister_background_read(&managed_device_id, &control)
+            .await;
+        return error_response(
+            StatusCode::CONFLICT,
+            "preempted_by_stop",
+            "The motor settings read was preempted by Stop.",
+        );
+    };
+    let adapter_permit = tokio::select! {
+        biased;
+        _ = control.cancelled() => None,
+        permit = state.adapter_slots.clone().acquire_owned() => permit.ok(),
+    };
+    let Some(_adapter_permit) = adapter_permit else {
+        state
+            .unregister_background_read(&managed_device_id, &control)
+            .await;
+        return error_response(
+            StatusCode::CONFLICT,
+            "preempted_by_stop",
+            "The motor settings read was preempted by Stop.",
+        );
+    };
+    let response = tokio::time::timeout(
+        StdDuration::from_secs(30),
+        adapter.read_motor_settings(&peripheral_id, &expected_name, &control),
+    )
+    .await;
+    state
+        .unregister_background_read(&managed_device_id, &control)
+        .await;
+
+    match response {
+        Ok(Ok(settings)) => {
+            let result = MotorSettingsData {
+                firmware_version: settings.firmware_version,
+                motor_speed_percent: settings.motor_speed_percent,
+                observed_at: Utc::now(),
+            };
+            (StatusCode::OK, Json(envelope(result, None))).into_response()
+        }
+        Ok(Err(failure)) => {
+            let (status, code, message) = if failure.stage == BleFailureStage::UnsupportedFirmware {
+                (
+                    StatusCode::CONFLICT,
+                    "firmware_unsupported",
+                    "Motor-speed settings require SOMA firmware 2.2.0 or later.",
+                )
+            } else if failure.stage == BleFailureStage::CommandPreempted {
+                (
+                    StatusCode::CONFLICT,
+                    "preempted_by_stop",
+                    "The motor settings read was preempted by Stop.",
+                )
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ble_failure_code(&failure),
+                    "The motor settings could not be read from the blind.",
+                )
+            };
+            error_response(status, code, message)
+        }
+        Err(_) => error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "motor_settings_timeout",
+            "Timed out reading motor settings from the blind.",
+        ),
+    }
 }
 
 async fn enroll_device(
@@ -4773,7 +4991,9 @@ async fn queue_batch(
     }
     if batch.action == Action::Stop {
         for target in &batch.targets {
-            state.preempt_battery_read(&target.managed_device_id).await;
+            state
+                .preempt_background_read(&target.managed_device_id)
+                .await;
         }
     }
     tokio::spawn(process_batch(state, batch.id.clone()));
@@ -5247,7 +5467,7 @@ async fn submit_command(
         }
     }
     if action == Action::Stop {
-        state.preempt_battery_read(managed_device_id).await;
+        state.preempt_background_read(managed_device_id).await;
     }
     Ok((command, true))
 }
