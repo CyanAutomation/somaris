@@ -240,9 +240,13 @@ const CONTROL_STOP_CANCELLED: u8 = 1;
 const CONTROL_WRITE_STARTED: u8 = 2;
 const CONTROL_DEADLINE_BEFORE_WRITE: u8 = 3;
 const CONTROL_DEADLINE_AFTER_WRITE: u8 = 4;
+const CONTROL_READ_QUERY_WRITE_STARTED: u8 = 5;
+const CONTROL_STOP_PENDING_READ_QUERY: u8 = 6;
+const CONTROL_DEADLINE_PENDING_READ_QUERY: u8 = 7;
 
-/// Coordinates safe Stop preemption with the transition into a possibly-sent GATT write.
-/// Exactly one of `request_prewrite_cancel` and `begin_write` can win.
+/// Coordinates safe Stop preemption with movement writes and read-only GATT query writes.
+/// Stop can cancel before a write starts; during a query write it waits for the GATT response,
+/// then cancels the readback. Movement writes remain non-preemptible once started.
 #[derive(Clone, Default)]
 pub struct BleCommandControl {
     state: Arc<AtomicU8>,
@@ -299,19 +303,28 @@ impl BleCommandControl {
     }
 
     pub fn request_prewrite_cancel(&self) -> bool {
-        let cancelled = self
-            .state
-            .compare_exchange(
-                CONTROL_PRE_WRITE,
-                CONTROL_STOP_CANCELLED,
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let (next, notify, cancelled) = match current {
+                CONTROL_PRE_WRITE => (CONTROL_STOP_CANCELLED, true, true),
+                CONTROL_READ_QUERY_WRITE_STARTED => (CONTROL_STOP_PENDING_READ_QUERY, false, false),
+                _ => return false,
+            };
+            match self.state.compare_exchange_weak(
+                current,
+                next,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            )
-            .is_ok();
-        if cancelled {
-            self.cancelled.notify_waiters();
+            ) {
+                Ok(_) => {
+                    if notify {
+                        self.cancelled.notify_waiters();
+                    }
+                    return cancelled;
+                }
+                Err(observed) => current = observed,
+            }
         }
-        cancelled
     }
 
     pub fn begin_write(&self) -> bool {
@@ -323,6 +336,44 @@ impl BleCommandControl {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+
+    pub fn begin_read_query_write(&self) -> bool {
+        self.state
+            .compare_exchange(
+                CONTROL_PRE_WRITE,
+                CONTROL_READ_QUERY_WRITE_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Ends the non-moving query write. Returns true if a Stop or deadline arrived while it ran.
+    pub fn finish_read_query_write(&self) -> bool {
+        let mut current = self.state.load(Ordering::Acquire);
+        loop {
+            let (next, cancelled) = match current {
+                CONTROL_READ_QUERY_WRITE_STARTED => (CONTROL_PRE_WRITE, false),
+                CONTROL_STOP_PENDING_READ_QUERY => (CONTROL_STOP_CANCELLED, true),
+                CONTROL_DEADLINE_PENDING_READ_QUERY => (CONTROL_DEADLINE_BEFORE_WRITE, true),
+                _ => return false,
+            };
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if cancelled {
+                        self.cancelled.notify_waiters();
+                    }
+                    return cancelled;
+                }
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub fn write_started(&self) -> bool {
@@ -345,6 +396,7 @@ impl BleCommandControl {
             let next = match current {
                 CONTROL_PRE_WRITE => CONTROL_DEADLINE_BEFORE_WRITE,
                 CONTROL_WRITE_STARTED => CONTROL_DEADLINE_AFTER_WRITE,
+                CONTROL_READ_QUERY_WRITE_STARTED => CONTROL_DEADLINE_PENDING_READ_QUERY,
                 _ => return,
             };
             match self.state.compare_exchange_weak(
@@ -354,7 +406,9 @@ impl BleCommandControl {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.cancelled.notify_waiters();
+                    if next != CONTROL_DEADLINE_PENDING_READ_QUERY {
+                        self.cancelled.notify_waiters();
+                    }
                     return;
                 }
                 Err(observed) => current = observed,
@@ -1431,17 +1485,20 @@ impl BleAdapter for BtleplugAdapter {
             }
         }
         let request = encode_motor_speed_readback_query();
-        let write = tokio::select! {
-            biased;
-            _ = control.cancelled() => {
-                disconnect_guard.disconnect().await;
-                return Err(control.cancellation_failure());
-            }
-            result = tokio::time::timeout(
-                Duration::from_secs(5),
-                peripheral.write(characteristic, &request, WriteType::WithResponse),
-            ) => result,
-        };
+        if !control.begin_read_query_write() {
+            disconnect_guard.disconnect().await;
+            return Err(control.cancellation_failure());
+        }
+        let write = tokio::time::timeout(
+            Duration::from_secs(5),
+            peripheral.write(characteristic, &request, WriteType::WithResponse),
+        )
+        .await;
+        let stop_or_deadline_arrived = control.finish_read_query_write();
+        if stop_or_deadline_arrived || control.is_cancelled() {
+            disconnect_guard.disconnect().await;
+            return Err(control.cancellation_failure());
+        }
         match write {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -1555,6 +1612,48 @@ mod battery_tests {
         tokio::time::timeout(Duration::from_millis(20), control.cancelled())
             .await
             .expect("watch-based cancellation must not lose an early signal");
+        assert!(control.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_a_shade_config_query_write_then_cancels_readback() {
+        let control = BleCommandControl::new();
+        assert!(control.begin_read_query_write());
+        assert!(!control.request_prewrite_cancel());
+        assert!(!control.is_cancelled());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), control.cancelled())
+                .await
+                .is_err()
+        );
+
+        assert!(control.finish_read_query_write());
+        assert!(control.is_cancelled());
+        assert_eq!(
+            control.cancellation_failure().stage,
+            BleFailureStage::CommandPreempted
+        );
+        tokio::time::timeout(Duration::from_millis(10), control.cancelled())
+            .await
+            .expect("Stop should cancel the readback after its query write completes");
+    }
+
+    #[test]
+    fn stop_can_still_cancel_a_shade_config_readback_after_query_write_acknowledgement() {
+        let control = BleCommandControl::new();
+        assert!(control.begin_read_query_write());
+        assert!(!control.finish_read_query_write());
+
+        assert!(control.request_prewrite_cancel());
+        assert!(control.is_cancelled());
+    }
+
+    #[test]
+    fn stop_winning_before_a_shade_config_query_prevents_its_write() {
+        let control = BleCommandControl::new();
+        assert!(control.request_prewrite_cancel());
+
+        assert!(!control.begin_read_query_write());
         assert!(control.is_cancelled());
     }
 
