@@ -19,7 +19,7 @@ use somaris::{
     api::{AppState, QueueConfig, router},
     ble::{
         BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureCause,
-        BleFailureStage, BleObservation, BleScanControl,
+        BleFailureStage, BleObservation, BleScanControl, MotorSettingsReadback,
     },
     controller::ServiceAction,
 };
@@ -243,6 +243,30 @@ impl BleAdapter for FakeBleAdapter {
         self.scan_impl(observations, window, Some(control)).await
     }
 
+    async fn read_motor_settings(
+        &self,
+        _peripheral_id: &str,
+        _expected_name: &str,
+        control: &BleCommandControl,
+    ) -> Result<MotorSettingsReadback, BleFailure> {
+        let gate = self.battery_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            tokio::select! {
+                biased;
+                _ = control.cancelled() => return Err(control.cancellation_failure()),
+                _ = gate.release.notified() => {},
+            }
+        }
+        if control.is_cancelled() {
+            return Err(control.cancellation_failure());
+        }
+        Ok(MotorSettingsReadback {
+            firmware_version: "2.2.0".into(),
+            motor_speed_percent: Some(37),
+        })
+    }
+
     async fn write_action(
         &self,
         peripheral_id: &str,
@@ -308,6 +332,7 @@ impl BleAdapter for FakeBleAdapter {
             service_discovery_ms: Some(3),
             identity_verification_ms: Some(4),
             gatt_discovery_ms: Some(5),
+            firmware_check_ms: None,
             gatt_write_ms: Some(6),
             disconnect_ms: Some(7),
         });
@@ -391,6 +416,69 @@ async fn enrolled_blind_battery_is_polled_and_reported() {
     assert_eq!(battery["voltage_mv"], 3980);
     assert_eq!(battery["percent_estimate"], 76);
     assert_eq!(battery["source"], "gatt_ba71");
+}
+
+#[tokio::test]
+async fn stop_preempts_a_waiting_motor_settings_read() {
+    let gate = Arc::new(BatteryGate::default());
+    let adapter = Arc::new(FakeBleAdapter::with_battery_gate(
+        vec![closed_blind()],
+        gate.clone(),
+    ));
+    let app = app_with_adapter(adapter).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+    let settings_path = format!("/api/control/v1/devices/{managed_id}/motor-settings");
+    let read_app = app.clone();
+    let settings_request =
+        tokio::spawn(
+            async move { request(&read_app, Method::GET, &settings_path, &[], None).await },
+        );
+    tokio::time::timeout(Duration::from_secs(1), gate.entered.notified())
+        .await
+        .expect("motor settings read should start");
+
+    let stopped = submit(&app, &managed_id, "settings-read-stop", "stop").await;
+
+    assert_eq!(stopped["status"], "write_acknowledged");
+    let (status, response) = settings_request.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(response.unwrap()["error"]["code"], "preempted_by_stop");
+}
+
+#[tokio::test]
+async fn enrolled_blind_motor_settings_can_be_read_back_without_a_motor_command() {
+    let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+
+    let (status, response) = request(
+        &app,
+        Method::GET,
+        &format!("/api/control/v1/devices/{managed_id}/motor-settings"),
+        &[],
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let settings = response.unwrap()["data"].clone();
+    assert_eq!(settings["firmware_version"], "2.2.0");
+    assert_eq!(settings["motor_speed_percent"], 37);
+    assert!(settings["observed_at"].is_string());
+    assert!(adapter.actions.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn scanner_diagnostics_expose_adapter_recovery_history() {
+    let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
+    let app = app_with_adapter(adapter).await;
+
+    let (_, response) = request(&app, Method::GET, "/api/v1/diagnostics", &[], None).await;
+    let scanner = response.unwrap()["data"]["scanner"].clone();
+    assert_eq!(scanner["adapter_recovery_count"], 0);
+    assert!(scanner.get("last_adapter_recovered_at").is_none());
 }
 
 #[tokio::test]

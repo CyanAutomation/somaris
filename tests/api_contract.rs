@@ -1144,6 +1144,10 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         ("/api/control/v1/devices", &["get", "post", "options"]),
         ("/api/control/v1/devices/{id}", &["delete", "options"]),
         (
+            "/api/control/v1/devices/{id}/motor-settings",
+            &["get", "options"],
+        ),
+        (
             "/api/control/v1/devices/{id}/commands",
             &["post", "options"],
         ),
@@ -1192,6 +1196,7 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         "/api/v1/devices/{id}",
         "/api/dev/simulators/{id}/scenario",
         "/api/dev/simulators/{id}/reset",
+        "/api/control/v1/devices/{id}/motor-settings",
         "/api/control/v1/devices/{id}/commands",
         "/api/control/v1/batches/{id}",
     ] {
@@ -1239,6 +1244,25 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         contract["components"]["schemas"]["ManagedDevice"]["properties"]["calibration_mode_active"]
             ["type"],
         "boolean"
+    );
+    assert_eq!(
+        contract["paths"]["/api/control/v1/devices/{id}/motor-settings"]["get"]["operationId"],
+        "getMotorSettings"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["MotorSettingsData"]["properties"]["motor_speed_percent"]
+            ["maximum"],
+        100
+    );
+    assert!(
+        contract["components"]["schemas"]["ScannerDiagnostics"]["properties"]
+            .get("adapter_recovery_count")
+            .is_some()
+    );
+    assert!(
+        contract["components"]["schemas"]["BleAttemptTimings"]["properties"]
+            .get("firmware_check_ms")
+            .is_some()
     );
     let command_request = &contract["components"]["schemas"]["CommandRequest"];
     assert_eq!(
