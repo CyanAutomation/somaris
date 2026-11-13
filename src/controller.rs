@@ -85,6 +85,60 @@ pub fn encode_service_action(action: ServiceAction) -> Vec<u8> {
     }
 }
 
+/// Requests the motor-speed setting through SOMA's typed Shade Config protocol.
+pub fn encode_motor_speed_readback_query() -> [u8; 3] {
+    [0xff, 0x01, 0x01]
+}
+
+/// Extracts motor speed from a Shade Config response containing typed setting TLVs.
+pub fn parse_motor_speed_readback(response: &[u8]) -> Option<u8> {
+    if response.len() < 2 || response[0] != 0xff {
+        return None;
+    }
+    let mut offset = 2;
+    while offset < response.len() {
+        let setting = *response.get(offset)?;
+        let value_len = usize::from(*response.get(offset + 1)?);
+        let value_start = offset + 2;
+        let value_end = value_start.checked_add(value_len)?;
+        let value = response.get(value_start..value_end)?;
+        if setting == 0x01 {
+            return (value.len() == 1 && value[0] <= 100).then_some(value[0]);
+        }
+        offset = value_end;
+    }
+    None
+}
+
+/// Motor-speed writes are supported by SOMA firmware 2.2.0 and newer.
+pub fn firmware_supports_motor_speed(version: &str) -> bool {
+    let version = version.trim().trim_start_matches(['v', 'V']);
+    let mut components = version.split('.');
+    let Some(major) = components.next().and_then(|value| value.parse::<u8>().ok()) else {
+        return false;
+    };
+    let Some(minor) = components.next().and_then(|value| value.parse::<u8>().ok()) else {
+        return false;
+    };
+    let Some(patch_component) = components.next() else {
+        return false;
+    };
+    let patch_digits: String = patch_component
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let Some(patch) = patch_digits.parse::<u8>().ok() else {
+        return false;
+    };
+    if (major, minor, patch) == (2, 2, 0) {
+        let suffix = &patch_component[patch_digits.len()..];
+        if !suffix.is_empty() && !suffix.starts_with('+') {
+            return false;
+        }
+    }
+    (major, minor, patch) >= (2, 2, 0)
+}
+
 pub fn service_action_target(action: ServiceAction) -> (&'static str, &'static str) {
     match action {
         ServiceAction::Open | ServiceAction::Close => {
@@ -143,5 +197,44 @@ pub fn parse_notification(bytes: &[u8]) -> Option<Notification> {
             patch: *bytes.get(3)?,
         })),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod shade_config_tests {
+    use super::*;
+
+    #[test]
+    fn motor_speed_readback_uses_a_typed_shade_config_query() {
+        assert_eq!(encode_motor_speed_readback_query(), [0xff, 0x01, 0x01]);
+        assert_eq!(
+            parse_motor_speed_readback(&[0xff, 0x03, 0x01, 0x01, 37]),
+            Some(37)
+        );
+    }
+
+    #[test]
+    fn motor_speed_readback_skips_other_settings_and_rejects_malformed_values() {
+        assert_eq!(
+            parse_motor_speed_readback(&[0xff, 0x07, 0x02, 0x02, 0x10, 0x01, 0x01, 0x01, 42]),
+            Some(42)
+        );
+        assert_eq!(parse_motor_speed_readback(&[0xff, 0x02, 0x01]), None);
+        assert_eq!(
+            parse_motor_speed_readback(&[0xff, 0x03, 0x01, 0x01, 101]),
+            None
+        );
+        assert_eq!(parse_motor_speed_readback(&[0x01, 0x01, 0x01, 37]), None);
+    }
+
+    #[test]
+    fn motor_speed_firmware_gate_requires_version_2_2_0() {
+        assert!(!firmware_supports_motor_speed("2.1.9"));
+        assert!(firmware_supports_motor_speed("2.2.0"));
+        assert!(firmware_supports_motor_speed("v2.3.1-beta"));
+        assert!(!firmware_supports_motor_speed("2.2.0-beta"));
+        assert!(!firmware_supports_motor_speed("2.2.0rc1"));
+        assert!(!firmware_supports_motor_speed("unknown"));
+        assert!(!firmware_supports_motor_speed("2.2"));
     }
 }
