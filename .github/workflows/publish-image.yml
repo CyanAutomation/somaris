@@ -231,7 +231,6 @@ jobs:
           tags: somaris-scan:arm64
           cache-from: |
             type=gha
-            type=gha,scope=somaris-amd64
             type=gha,scope=somaris-arm64
           cache-to: type=gha,scope=somaris-arm64,mode=max
 
