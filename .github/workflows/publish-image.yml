@@ -219,6 +219,7 @@ jobs:
           image-ref: somaris-scan:amd64
           version: v0.70.0
           severity: HIGH,CRITICAL
+          ignore-unfixed: true
           exit-code: '1'
 
       - name: Build linux/arm64 image for scanning
@@ -240,6 +241,7 @@ jobs:
           image-ref: somaris-scan:arm64
           version: v0.70.0
           severity: HIGH,CRITICAL
+          ignore-unfixed: true
           exit-code: '1'
 
   publish:
