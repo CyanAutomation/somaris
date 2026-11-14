@@ -12,7 +12,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.0.0",
-    "linkedom": "^0.18.14",
+    "linkedom": "^0.18.15",
     "playwright": "^1.65.0",
     "typescript": "^7.0.2"
   }
