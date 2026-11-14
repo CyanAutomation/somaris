@@ -27,6 +27,7 @@ RUN touch src/lib.rs src/main.rs \
 FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 
 RUN apt-get update \
+    && apt-get upgrade --no-install-recommends --yes \
     && apt-get install --no-install-recommends -y ca-certificates curl libdbus-1-3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home somaris \
