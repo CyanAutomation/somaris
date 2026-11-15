@@ -544,6 +544,93 @@ async fn toggle_rejects_a_stale_expected_label_before_selecting_or_sending_a_com
 }
 
 #[tokio::test]
+async fn command_idempotency_replay_survives_enrollment_removal() {
+    let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll_with_label(&app, &blind, "Bedroom Right").await;
+    let path = format!("/api/control/v1/devices/{managed_id}/commands");
+    let key = "replay-command-after-removal";
+    let body = Some(json!({
+        "action": "stop",
+        "expected_label": "Bedroom Right"
+    }));
+
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &path,
+        &[("idempotency-key", key)],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&app, &command_id).await["status"],
+        "write_acknowledged"
+    );
+
+    let (status, _) = request(
+        &app,
+        Method::DELETE,
+        &format!("/api/control/v1/devices/{managed_id}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, response) =
+        request(&app, Method::POST, &path, &[("idempotency-key", key)], body).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(response.unwrap()["data"]["id"], command_id);
+    assert_eq!(adapter.actions().len(), 1);
+}
+
+#[tokio::test]
+async fn toggle_idempotency_replay_survives_enrollment_removal() {
+    let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
+    let app = app_with_adapter(adapter.clone()).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll_with_label(&app, &blind, "Bedroom Right").await;
+    let path = format!("/api/control/v1/devices/{managed_id}/toggle");
+    let key = "replay-toggle-after-removal";
+    let body = Some(json!({"expected_label": "Bedroom Right"}));
+
+    let (status, response) = request(
+        &app,
+        Method::POST,
+        &path,
+        &[("idempotency-key", key)],
+        body.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let command_id = response.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        wait_for_command(&app, &command_id).await["status"],
+        "write_acknowledged"
+    );
+
+    let (status, _) = request(
+        &app,
+        Method::DELETE,
+        &format!("/api/control/v1/devices/{managed_id}"),
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, response) =
+        request(&app, Method::POST, &path, &[("idempotency-key", key)], body).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(response.unwrap()["data"]["id"], command_id);
+    assert_eq!(adapter.actions().len(), 1);
+}
+
+#[tokio::test]
 async fn scanner_diagnostics_expose_adapter_recovery_history() {
     let adapter = Arc::new(FakeBleAdapter::with_observations(vec![closed_blind()]));
     let app = app_with_adapter(adapter).await;
