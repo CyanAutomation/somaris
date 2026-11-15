@@ -215,28 +215,7 @@ export interface ApiError extends Error {
 
 export type ApiRequest = (path: string, options?: RequestInit) => Promise<unknown>;
 
-export interface RefreshTarget {
-  demoMode?: boolean;
-  managed?: ManagedDevice[];
-  observations?: Observation[];
-  diagnostics?: Diagnostics | null;
-  activity?: ActivityEntry[];
-  commands?: Record<string, CommandRecord>;
-  batch?: BatchState | null;
-  serviceError?: string | null;
-  confirmingRemovalId?: string | null;
-  pendingRemovalFocusId?: string | null;
-  removingEnrollmentId?: string | null;
-  busy?: Set<string>;
-  reconciliationRequired?: Set<string>;
-  tokens?: Record<string, symbol>;
-  simulators?: Simulator[] | null;
-  notifications?: Notification[];
-  notify?: (item: Notification) => unknown;
-  dismissNotification?: (key: string) => unknown;
-}
-
-export interface DashboardState extends RefreshTarget {
+export interface DashboardData {
   demoMode: boolean;
   managed: ManagedDevice[];
   observations: Observation[];
@@ -252,6 +231,15 @@ export interface DashboardState extends RefreshTarget {
   reconciliationRequired: Set<string>;
   tokens: Record<string, symbol>;
   simulators: Simulator[] | null;
+  notifications?: Notification[];
+}
+
+export interface RefreshTarget extends Partial<DashboardData> {
+  notify?: (item: Notification) => unknown;
+  dismissNotification?: (key: string) => unknown;
+}
+
+export interface DashboardState extends DashboardData {
   notify: (item: Notification) => unknown;
   dismissNotification: (key: string) => unknown;
 }

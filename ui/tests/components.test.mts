@@ -327,6 +327,23 @@ test('batch feedback distinguishes progress, acknowledgements, failures, and ski
   assert.equal(renderBatchFeedback({action:'open',status:'failed',target_count:3,failed_count:3}), '');
 });
 
+test('batch feedback covers each active queue stage and escapes blind details', () => {
+  assert.match(renderBatchFeedback({action:'close',status:'submitting'}), /Sending close commands/);
+  assert.match(renderBatchFeedback({action:'close',status:'checking'}), /Checking the close batch/);
+  assert.match(renderBatchFeedback({action:'close',status:'queued',target_count:2}), /Close batch queued for 2 ready blinds/);
+
+  const running = renderBatchFeedback({
+    action:'close', status:'running', target_count:2, acknowledged_count:0,
+    failed_count:1, pending_count:1,
+    skipped:[{label:'<Kitchen>',availability:'stale'}],
+    targets:[{label:'<Bedroom>',status:'connection_failed'}],
+  });
+  assert.match(running, /1 failed, 1 pending/);
+  assert.match(running, /&lt;Kitchen&gt;/);
+  assert.match(running, /&lt;Bedroom&gt;/);
+  assert.doesNotMatch(running, /<Kitchen>|<Bedroom>/);
+});
+
 test('snackbar primitives escape content, announce by tone, and render an optional action', () => {
   const markup = renderSnackbar({
     id:'snack-1', message:'Could not add <Hallway>', tone:'error',
