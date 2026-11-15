@@ -15,9 +15,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{
     ble::{
-        BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureStage,
-        BleObservation, BleScanControl, BtleplugAdapter, SOMA_MANUFACTURER_ID, decode_ba71_voltage,
-        parse_soma_payload,
+        BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureCause,
+        BleFailureStage, BleObservation, BleScanControl, BtleplugAdapter, SOMA_MANUFACTURER_ID,
+        decode_ba71_voltage, parse_soma_payload,
     },
     controller::ServiceAction,
     integration::{DeviceCapabilities, StateChange, StateChangePublisher},
@@ -3150,6 +3150,10 @@ pub struct ManagedDevice {
 struct MotorSettingsData {
     firmware_version: String,
     motor_speed_percent: Option<u8>,
+    local_time_offset_minutes: Option<i16>,
+    boot_sequence: Option<u32>,
+    sunrise_epoch_seconds: Option<u32>,
+    sunset_epoch_seconds: Option<u32>,
     observed_at: DateTime<Utc>,
 }
 
@@ -3283,9 +3287,18 @@ impl Action {
 struct CommandRequest {
     action: Action,
     #[serde(default)]
+    expected_label: Option<String>,
+    #[serde(default)]
     position_closed_percent: Option<u8>,
     #[serde(default)]
     motor_speed_percent: Option<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToggleRequest {
+    #[serde(default)]
+    expected_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4411,6 +4424,10 @@ async fn get_motor_settings(
             let result = MotorSettingsData {
                 firmware_version: settings.firmware_version,
                 motor_speed_percent: settings.motor_speed_percent,
+                local_time_offset_minutes: settings.local_time_offset_minutes,
+                boot_sequence: settings.boot_sequence,
+                sunrise_epoch_seconds: settings.sunrise_epoch_seconds,
+                sunset_epoch_seconds: settings.sunset_epoch_seconds,
                 observed_at: Utc::now(),
             };
             (StatusCode::OK, Json(envelope(result, None))).into_response()
@@ -4652,6 +4669,17 @@ async fn queue_command(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    if request
+        .expected_label
+        .as_deref()
+        .is_some_and(|label| !valid_expected_label(label))
+    {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_expected_label",
+            "expected_label must match a current device label and contain 1 to 64 characters.",
+        );
+    }
     match request.action {
         Action::SetPosition => match request.position_closed_percent {
             Some(0..=100) if request.motor_speed_percent.is_none() => {}
@@ -4712,12 +4740,15 @@ async fn queue_command(
     };
     match submit_command(
         &state,
-        &id,
-        request.action,
-        request.position_closed_percent,
-        request.motor_speed_percent,
-        key,
-        None,
+        CommandSubmission {
+            managed_device_id: &id,
+            action: request.action,
+            target_closed_percent: request.position_closed_percent,
+            motor_speed_percent: request.motor_speed_percent,
+            expected_label: request.expected_label.as_deref(),
+            key,
+            toggle: None,
+        },
     )
     .await
     {
@@ -4738,7 +4769,9 @@ async fn toggle_device(
     RequestState(state): RequestState,
     RoutePath(id): RoutePath<String>,
     headers: HeaderMap,
+    payload: Option<Json<ToggleRequest>>,
 ) -> Response {
+    let expected_label = payload.and_then(|Json(request)| request.expected_label);
     let Some(key) = idempotency_key(&headers) else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -4763,6 +4796,35 @@ async fn toggle_device(
             .unwrap_or(command);
         return (StatusCode::ACCEPTED, Json(envelope(command, None))).into_response();
     }
+    if expected_label
+        .as_deref()
+        .is_some_and(|label| !valid_expected_label(label))
+    {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_expected_label",
+            "expected_label must match a current device label and contain 1 to 64 characters.",
+        );
+    }
+    if let Some(expected_label) = expected_label.as_deref() {
+        let inner = state.inner.lock().await;
+        let Some(enrollment) = inner.enrollments.get(&id) else {
+            return ApiFailure::new(
+                StatusCode::NOT_FOUND,
+                "enrollment_not_found",
+                "Managed-device enrollment was not found.",
+            )
+            .into_response();
+        };
+        if expected_label != enrollment.label {
+            return ApiFailure::new(
+                StatusCode::CONFLICT,
+                "device_label_mismatch",
+                "The managed-device label changed since the command target was selected. Refresh the device list and confirm the target.",
+            )
+            .into_response();
+        }
+    }
     let selected = {
         let inner = state.inner.lock().await;
         resolve_toggle(&inner, &id)
@@ -4773,12 +4835,15 @@ async fn toggle_device(
     };
     match submit_command(
         &state,
-        &id,
-        action,
-        None,
-        None,
-        key,
-        Some((basis, position, observed_at)),
+        CommandSubmission {
+            managed_device_id: &id,
+            action,
+            target_closed_percent: None,
+            motor_speed_percent: None,
+            expected_label: expected_label.as_deref(),
+            key,
+            toggle: Some((basis, position, observed_at)),
+        },
     )
     .await
     {
@@ -4793,6 +4858,10 @@ async fn toggle_device(
         }
         Err(error) => error.into_response(),
     }
+}
+
+fn valid_expected_label(label: &str) -> bool {
+    !label.is_empty() && label.trim() == label && label.chars().count() <= 64
 }
 
 async fn queue_batch(
@@ -5231,15 +5300,29 @@ fn prune_batch_journal(inner: &mut Inner, retained_limit: usize) {
         .retain(|_, batch_id| retained.contains(batch_id));
 }
 
-async fn submit_command(
-    state: &AppState,
-    managed_device_id: &str,
+struct CommandSubmission<'a> {
+    managed_device_id: &'a str,
     action: Action,
     target_closed_percent: Option<u8>,
     motor_speed_percent: Option<u8>,
+    expected_label: Option<&'a str>,
     key: String,
     toggle: Option<(String, ControlPosition, DateTime<Utc>)>,
+}
+
+async fn submit_command(
+    state: &AppState,
+    submission: CommandSubmission<'_>,
 ) -> Result<(Command, bool), ApiFailure> {
+    let CommandSubmission {
+        managed_device_id,
+        action,
+        target_closed_percent,
+        motor_speed_percent,
+        expected_label,
+        key,
+        toggle,
+    } = submission;
     let mut inner = state.inner.lock().await;
     let key_id = format!("command:{managed_device_id}:{key}");
     if let Some(command_id) = inner.command_idempotency.get(&key_id)
@@ -5257,6 +5340,20 @@ async fn submit_command(
             "Idempotency-Key was already used with a different action.",
         ));
     }
+    let Some(enrollment) = inner.enrollments.get(managed_device_id).cloned() else {
+        return Err(ApiFailure::new(
+            StatusCode::NOT_FOUND,
+            "enrollment_not_found",
+            "Managed-device enrollment was not found.",
+        ));
+    };
+    if expected_label.is_some_and(|expected| expected != enrollment.label) {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "device_label_mismatch",
+            "The managed-device label changed since the command target was selected. Refresh the device list and confirm the target.",
+        ));
+    }
     prune_journal(&mut inner, state.retained_command_limit);
     if inner.commands.len() >= state.retained_command_limit {
         return Err(ApiFailure::new(
@@ -5265,13 +5362,6 @@ async fn submit_command(
             "The command journal is at capacity.",
         ));
     }
-    let Some(enrollment) = inner.enrollments.get(managed_device_id).cloned() else {
-        return Err(ApiFailure::new(
-            StatusCode::NOT_FOUND,
-            "enrollment_not_found",
-            "Managed-device enrollment was not found.",
-        ));
-    };
     if enrollment.is_simulated && !inner.simulator_enabled {
         return Err(ApiFailure::new(
             StatusCode::CONFLICT,
@@ -6133,6 +6223,22 @@ fn retryable_prewrite_failure(failure: &BleFailure) -> bool {
         )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryRecoveryPolicy {
+    QuickReconnect,
+    RefreshScan,
+}
+
+fn retry_recovery_policy(failure: &BleFailure) -> RetryRecoveryPolicy {
+    if failure.stage == BleFailureStage::DeviceConnection
+        && failure.cause == Some(BleFailureCause::ConnectionAbortedByLocal)
+    {
+        RetryRecoveryPolicy::QuickReconnect
+    } else {
+        RetryRecoveryPolicy::RefreshScan
+    }
+}
+
 const PREWRITE_FAILURE_WINDOW: ChronoDuration = ChronoDuration::minutes(10);
 const COOLDOWN_FAILURE_THRESHOLD: usize = 4;
 
@@ -6492,19 +6598,33 @@ async fn process_physical_command(
             && retryable_prewrite_failure(failure)
         {
             let delay = retry_backoff(command_id, attempt, failure_streak);
-            let scan_refreshed =
-                match yield_adapter_for_retry_scan(state, &mut adapter_permit, &control, deadline)
+            let recovery = retry_recovery_policy(failure);
+            let scan_refreshed = match recovery {
+                RetryRecoveryPolicy::QuickReconnect => false,
+                RetryRecoveryPolicy::RefreshScan => {
+                    match yield_adapter_for_retry_scan(
+                        state,
+                        &mut adapter_permit,
+                        &control,
+                        deadline,
+                    )
                     .await
-                {
-                    Ok(refreshed) => refreshed,
-                    Err(cancelled) => break Err(cancelled),
-                };
+                    {
+                        Ok(refreshed) => refreshed,
+                        Err(cancelled) => break Err(cancelled),
+                    }
+                }
+            };
             tracing::warn!(
                 command_id,
                 attempt,
                 stage = failure.stage.as_str(),
                 retry_delay_ms = delay.as_millis() as u64,
                 scan_refreshed,
+                retry_recovery = match recovery {
+                    RetryRecoveryPolicy::QuickReconnect => "quick_reconnect",
+                    RetryRecoveryPolicy::RefreshScan => "scan_refresh",
+                },
                 "Retrying physical command after a confirmed pre-write BLE failure"
             );
             if tokio::time::Instant::now() + delay < deadline {
@@ -7426,6 +7546,39 @@ mod security_hardening_tests {
         assert_eq!(cooldown_duration_seconds(3), None);
         assert_eq!(cooldown_duration_seconds(4), Some(15));
         assert_eq!(cooldown_duration_seconds(20), Some(120));
+    }
+
+    #[test]
+    fn local_connection_aborts_take_a_short_reconnect_path_but_timeouts_refresh_scan() {
+        let local_abort = BleFailure {
+            stage: BleFailureStage::DeviceConnection,
+            cause: Some(BleFailureCause::ConnectionAbortedByLocal),
+            retryable_before_write: true,
+            write_may_have_been_sent: false,
+            outcome_unknown: false,
+        };
+        let timeout = BleFailure {
+            cause: Some(BleFailureCause::ConnectionTimeout),
+            ..local_abort.clone()
+        };
+        let service_resolution = BleFailure {
+            stage: BleFailureStage::ServiceResolution,
+            cause: None,
+            ..local_abort.clone()
+        };
+
+        assert_eq!(
+            retry_recovery_policy(&local_abort),
+            RetryRecoveryPolicy::QuickReconnect
+        );
+        assert_eq!(
+            retry_recovery_policy(&timeout),
+            RetryRecoveryPolicy::RefreshScan
+        );
+        assert_eq!(
+            retry_recovery_policy(&service_resolution),
+            RetryRecoveryPolicy::RefreshScan
+        );
     }
 
     #[test]
