@@ -1788,7 +1788,11 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/app.mjs", get(ui_app))
         .route("/ui/api-docs.mjs", get(ui_api_docs))
         .route("/ui/components.mjs", get(ui_components))
+        .route("/ui/escape.mjs", get(ui_escape))
+        .route("/ui/batch-feedback.mjs", get(ui_batch_feedback))
+        .route("/ui/page-components.mjs", get(ui_page_components))
         .route("/ui/snackbar.mjs", get(ui_snackbar))
+        .route("/ui/snackbar-components.mjs", get(ui_snackbar_components))
         .route("/ui/favicon.svg", get(ui_favicon_svg))
         .route("/ui/favicon-32x32.png", get(ui_favicon_png))
         .route("/ui/apple-touch-icon.png", get(ui_apple_touch_icon))
@@ -1926,10 +1930,38 @@ async fn ui_components() -> impl IntoResponse {
     )
 }
 
+async fn ui_escape() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/escape.mjs"),
+    )
+}
+
+async fn ui_batch_feedback() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/batch-feedback.mjs"),
+    )
+}
+
+async fn ui_page_components() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/page-components.mjs"),
+    )
+}
+
 async fn ui_snackbar() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../ui/snackbar.mjs"),
+    )
+}
+
+async fn ui_snackbar_components() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/snackbar-components.mjs"),
     )
 }
 
