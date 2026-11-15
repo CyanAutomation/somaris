@@ -90,32 +90,104 @@ pub fn encode_motor_speed_readback_query() -> [u8; 3] {
     [0xff, 0x01, 0x01]
 }
 
-/// Extracts motor speed from a Shade Config response containing typed setting TLVs.
-pub fn parse_motor_speed_readback(response: &[u8]) -> Option<u8> {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShadeConfigReadback {
+    pub motor_speed_percent: Option<u8>,
+    pub local_time_offset_minutes: Option<i16>,
+    pub boot_sequence: Option<u32>,
+    pub sunrise_epoch_seconds: Option<u32>,
+    pub sunset_epoch_seconds: Option<u32>,
+}
+
+/// Requests only settings whose response formats have explicit read-only schemas.
+/// The additional IDs are reverse-engineered and are not manufacturer specifications.
+pub fn encode_shade_config_readback_query(include_motor_speed: bool) -> Vec<u8> {
+    let mut settings = Vec::with_capacity(4);
+    if include_motor_speed {
+        settings.push(0x01);
+    }
+    settings.extend([0x06, 0x0c, 0x17]);
+    let mut query = Vec::with_capacity(settings.len() + 2);
+    query.push(0xff);
+    query.push(settings.len() as u8);
+    query.extend(settings);
+    query
+}
+
+/// Parses only known, read-only Shade Config response tuples.
+pub fn parse_shade_config_readback(response: &[u8]) -> Option<ShadeConfigReadback> {
     if response.len() < 2 || response[0] != 0xff {
         return None;
     }
-    // Byte 1 counts the TLV payload after the two-byte header.
     let payload_end = 2usize.checked_add(usize::from(response[1]))?;
     if response.len() < payload_end {
         return None;
     }
+    let mut settings = ShadeConfigReadback::default();
+    let mut seen = 0_u8;
     let mut offset = 2;
     while offset < payload_end {
         let setting = *response.get(offset)?;
         let value_len = usize::from(*response.get(offset + 1)?);
-        let value_start = offset + 2;
+        let value_start = offset.checked_add(2)?;
         let value_end = value_start.checked_add(value_len)?;
         if value_end > payload_end {
             return None;
         }
         let value = response.get(value_start..value_end)?;
-        if setting == 0x01 {
-            return (value.len() == 1 && value[0] <= 100).then_some(value[0]);
+        let (bit, valid) = match setting {
+            0x01 => {
+                if value.len() != 1 || value[0] > 100 {
+                    return None;
+                }
+                settings.motor_speed_percent = Some(value[0]);
+                (1, true)
+            }
+            0x06 => {
+                if value.len() != 1 {
+                    return None;
+                }
+                settings.local_time_offset_minutes =
+                    Some(-i16::from(i8::from_le_bytes([value[0]])) * 60);
+                (2, true)
+            }
+            0x0c => {
+                if value.len() != 4 {
+                    return None;
+                }
+                settings.boot_sequence = Some(u32::from_le_bytes(value.try_into().ok()?));
+                (4, true)
+            }
+            0x17 => {
+                if value.len() != 8 {
+                    return None;
+                }
+                settings.sunrise_epoch_seconds =
+                    Some(u32::from_le_bytes(value[..4].try_into().ok()?));
+                settings.sunset_epoch_seconds =
+                    Some(u32::from_le_bytes(value[4..].try_into().ok()?));
+                (8, true)
+            }
+            _ => (0, false),
+        };
+        if valid && seen & bit != 0 {
+            return None;
         }
+        seen |= bit;
         offset = value_end;
     }
-    None
+    (seen != 0).then_some(settings)
+}
+
+/// Parses the motor-settings query response only when its requested speed tuple is present.
+pub fn parse_motor_settings_readback(response: &[u8]) -> Option<ShadeConfigReadback> {
+    let settings = parse_shade_config_readback(response)?;
+    settings.motor_speed_percent.map(|_| settings)
+}
+
+/// Extracts motor speed from a Shade Config response containing typed setting TLVs.
+pub fn parse_motor_speed_readback(response: &[u8]) -> Option<u8> {
+    parse_shade_config_readback(response)?.motor_speed_percent
 }
 
 /// Motor-speed writes are supported by SOMA firmware 2.2.0 and newer.
@@ -289,6 +361,53 @@ mod shade_config_tests {
             parse_motor_speed_readback(&[0xff, 0x02, 0x01, 0x01, 42]),
             None
         );
+    }
+
+    #[test]
+    fn shade_config_readback_uses_only_the_typed_read_only_allowlist() {
+        assert_eq!(
+            encode_shade_config_readback_query(true),
+            [0xff, 0x04, 0x01, 0x06, 0x0c, 0x17]
+        );
+        assert_eq!(
+            encode_shade_config_readback_query(false),
+            [0xff, 0x03, 0x06, 0x0c, 0x17]
+        );
+
+        let settings = parse_shade_config_readback(&[
+            0xff, 0x16, 0x01, 0x01, 37, 0x06, 0x01, 0xfc, 0x0c, 0x04, 0x44, 0x33, 0x22, 0x11, 0x17,
+            0x08, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00, 0x66,
+        ])
+        .unwrap();
+        assert_eq!(settings.motor_speed_percent, Some(37));
+        assert_eq!(settings.local_time_offset_minutes, Some(240));
+        assert_eq!(settings.boot_sequence, Some(0x1122_3344));
+        assert_eq!(settings.sunrise_epoch_seconds, Some(0x6500_0000));
+        assert_eq!(settings.sunset_epoch_seconds, Some(0x6600_0000));
+    }
+
+    #[test]
+    fn shade_config_readback_ignores_unknown_ids_and_rejects_malformed_typed_values() {
+        let settings =
+            parse_shade_config_readback(&[0xff, 0x06, 0x02, 0x01, 0x55, 0x01, 0x01, 42]).unwrap();
+        assert_eq!(settings.motor_speed_percent, Some(42));
+        assert_eq!(settings.local_time_offset_minutes, None);
+
+        assert!(parse_shade_config_readback(&[0xff, 0x03, 0x06, 0x02, 0xfc]).is_none());
+        assert!(parse_shade_config_readback(&[0xff, 0x05, 0x0c, 0x03, 1, 2, 3]).is_none());
+        assert!(parse_shade_config_readback(&[0xff, 0x02, 0x17, 0x08]).is_none());
+    }
+
+    #[test]
+    fn motor_settings_readback_requires_the_requested_speed_tuple() {
+        let without_speed = [0xff, 0x03, 0x06, 0x01, 0xfc];
+        assert!(parse_shade_config_readback(&without_speed).is_some());
+        assert!(parse_motor_settings_readback(&without_speed).is_none());
+
+        let with_speed = [0xff, 0x06, 0x06, 0x01, 0xfc, 0x01, 0x01, 37];
+        let settings = parse_motor_settings_readback(&with_speed).unwrap();
+        assert_eq!(settings.motor_speed_percent, Some(37));
+        assert_eq!(settings.local_time_offset_minutes, Some(240));
     }
 
     #[test]

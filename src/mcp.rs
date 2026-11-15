@@ -120,6 +120,8 @@ struct CommandArgs {
     position_closed_percent: Option<u8>,
     /// Required when action is set_motor_speed; percentage from 0 to 100.
     motor_speed_percent: Option<u8>,
+    /// Optional label assertion copied from list_devices to guard against a stale target.
+    expected_label: Option<String>,
     /// Caller-supplied key. Reuse it only when retrying the same request.
     idempotency_key: String,
 }
@@ -128,6 +130,8 @@ struct CommandArgs {
 struct ToggleArgs {
     /// Managed-device enrollment ID.
     managed_device_id: String,
+    /// Optional label assertion copied from list_devices to guard against a stale target.
+    expected_label: Option<String>,
     /// Caller-supplied key. Reuse it only when retrying the same request.
     idempotency_key: String,
 }
@@ -376,6 +380,7 @@ impl SomarisMcp {
                 "action": args.action.as_str(),
                 "position_closed_percent": args.position_closed_percent,
                 "motor_speed_percent": args.motor_speed_percent,
+                "expected_label": args.expected_label,
             })),
             Some(&args.idempotency_key),
         )
@@ -397,7 +402,7 @@ impl SomarisMcp {
                 "toggle",
             ],
             &[],
-            None,
+            Some(json!({"expected_label": args.expected_label})),
             Some(&args.idempotency_key),
         )
         .await
