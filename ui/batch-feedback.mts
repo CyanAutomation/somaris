@@ -1,4 +1,4 @@
-import type {BatchAction, BatchResponse, BatchState} from './types.mjs';
+import type {BatchAction, BatchResponse} from './types.mjs';
 
 export interface BatchFeedbackView {
   id?: string | null;

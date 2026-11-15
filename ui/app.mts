@@ -1071,6 +1071,16 @@ function isBlindAction(action: string | undefined): action is import('./types.mj
  ].includes(action);
 }
 
+export function dispatchBlindCommand(
+ action: string,
+ encodedId: string,
+ send: (id: string, action: import('./types.mjs').BlindAction) => unknown = sendCommand,
+): boolean {
+ if(!encodedId || !isBlindAction(action))return false;
+ void send(decodeURIComponent(encodedId),action);
+ return true;
+}
+
 function changeDisplayMode(applyDisplayMode: () => boolean): void {
  displayPreference=nextDisplayPreference(displayPreference);
  try {
@@ -1125,11 +1135,7 @@ type ClickActionHandler = (
 const clickActionHandlers: Record<string, ClickActionHandler> = {
  'snackbar-dismiss':(_argument,_id,deviceId)=>{snackbarQueue.dismiss(deviceId);return true;},
  'display-mode':(_argument,_id,_deviceId,applyDisplayMode)=>{changeDisplayMode(applyDisplayMode);return true;},
- command:(argument,id)=>{
-  if(!id || !isBlindAction(argument))return false;
-  void sendCommand(id,argument);
-  return true;
- },
+ command:(argument,id)=>dispatchBlindCommand(argument,id),
  batch:argument=>handleBatchClick(argument),
  position:argument=>handlePositionClick(argument),
  details:argument=>{
