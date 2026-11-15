@@ -22,8 +22,8 @@ use tokio::sync::{Notify, mpsc, watch};
 use uuid::Uuid;
 
 use crate::controller::{
-    ServiceAction, encode_motor_speed_readback_query, encode_service_action,
-    firmware_supports_motor_speed, parse_motor_speed_readback, service_action_target,
+    ServiceAction, encode_service_action, encode_shade_config_readback_query,
+    firmware_supports_motor_speed, parse_motor_settings_readback, service_action_target,
 };
 
 use super::{BA71_CHARACTERISTIC_UUID, SOMA_MANUFACTURER_ID, parse_soma_payload};
@@ -525,6 +525,10 @@ pub trait BleAdapter: Send + Sync {
 pub struct MotorSettingsReadback {
     pub firmware_version: String,
     pub motor_speed_percent: Option<u8>,
+    pub local_time_offset_minutes: Option<i16>,
+    pub boot_sequence: Option<u32>,
+    pub sunrise_epoch_seconds: Option<u32>,
+    pub sunset_epoch_seconds: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -566,7 +570,7 @@ fn connect_timeout(purpose: ConnectionPurpose, attempt: u8) -> Duration {
     match (purpose, attempt) {
         (ConnectionPurpose::Stop, 1) => Duration::from_secs(4),
         (ConnectionPurpose::Stop, _) => Duration::from_secs(6),
-        (ConnectionPurpose::Command, 1) => Duration::from_secs(8),
+        (ConnectionPurpose::Command, 1) => Duration::from_secs(5),
         (ConnectionPurpose::ReadOnly, _) => Duration::from_secs(6),
         (ConnectionPurpose::Command, _) => Duration::from_secs(6),
     }
@@ -1409,6 +1413,10 @@ impl BleAdapter for BtleplugAdapter {
             return Ok(MotorSettingsReadback {
                 firmware_version,
                 motor_speed_percent: None,
+                local_time_offset_minutes: None,
+                boot_sequence: None,
+                sunrise_epoch_seconds: None,
+                sunset_epoch_seconds: None,
             });
         }
 
@@ -1484,7 +1492,7 @@ impl BleAdapter for BtleplugAdapter {
                 ));
             }
         }
-        let request = encode_motor_speed_readback_query();
+        let request = encode_shade_config_readback_query(true);
         if !control.begin_read_query_write() {
             disconnect_guard.disconnect().await;
             return Err(control.cancellation_failure());
@@ -1527,7 +1535,7 @@ impl BleAdapter for BtleplugAdapter {
                 while let Some(notification) = notifications.next().await {
                     if notification.service_uuid == service_uuid
                         && notification.uuid == characteristic_uuid
-                        && let Some(value) = parse_motor_speed_readback(&notification.value)
+                        && let Some(value) = parse_motor_settings_readback(&notification.value)
                     {
                         return Some(value);
                     }
@@ -1537,9 +1545,13 @@ impl BleAdapter for BtleplugAdapter {
         };
         disconnect_guard.disconnect().await;
         match readback {
-            Ok(Some(motor_speed_percent)) => Ok(MotorSettingsReadback {
+            Ok(Some(settings)) => Ok(MotorSettingsReadback {
                 firmware_version,
-                motor_speed_percent: Some(motor_speed_percent),
+                motor_speed_percent: settings.motor_speed_percent,
+                local_time_offset_minutes: settings.local_time_offset_minutes,
+                boot_sequence: settings.boot_sequence,
+                sunrise_epoch_seconds: settings.sunrise_epoch_seconds,
+                sunset_epoch_seconds: settings.sunset_epoch_seconds,
             }),
             Ok(None) | Err(_) => Err(BleFailure::before_write(
                 BleFailureStage::MotorSettingsRead,
@@ -1740,7 +1752,7 @@ mod battery_tests {
         );
         assert_eq!(
             connect_timeout(ConnectionPurpose::Command, 1),
-            Duration::from_secs(8)
+            Duration::from_secs(5)
         );
         assert_eq!(
             connect_timeout(ConnectionPurpose::Command, 2),

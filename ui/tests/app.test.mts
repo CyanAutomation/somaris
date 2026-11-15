@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, batchEligibleCount, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, resetDemo, resolveDisplayMode} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, resetDemo, resolveDisplayMode} from '../app.mjs';
 import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
 
 type CommandTarget = RefreshTarget & {
@@ -171,6 +171,14 @@ test('command messages distinguish acknowledgement and uncertain outcomes',()=>{
  assert.match(commandMessage({status:'connection_failed',retryable:true})[0],/no command was sent/i);
  assert.match(commandMessage({status:'connection_failed',failure_stage:'command_validation'})[0],/no bluetooth write was attempted/i);
  assert.match(commandMessage({status:'deferred'})[0],/cooldown/i);
+});
+
+test('physical command payloads carry the label from the current managed-device snapshot',()=>{
+ const device={enrollment:{id:'blind-1',label:'Hallway Blinds'}} as ManagedDevice;
+ assert.deepEqual(buildCommandRequestBody(device,'open'),{action:'open',expected_label:'Hallway Blinds'});
+ assert.deepEqual(buildCommandRequestBody(device,'set_position',2),{action:'set_position',expected_label:'Hallway Blinds',position_closed_percent:2});
+ assert.deepEqual(buildCommandRequestBody(device,'set_motor_speed',undefined,37),{action:'set_motor_speed',expected_label:'Hallway Blinds',motor_speed_percent:37});
+ assert.throws(()=>buildCommandRequestBody({enrollment:{id:'blind-1'}} as ManagedDevice,'close'),/Refresh the device list/);
 });
 test('command poll failure refreshes position before movement controls unlock', async()=>{
  const id='blind-1';
