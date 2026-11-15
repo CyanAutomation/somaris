@@ -4,6 +4,7 @@ html[data-display-mode="panel"] {
   --panel-card-padding: 14px;
   --panel-card-min-size: 180px;
   --panel-action-size: 60px;
+  --panel-target-size: 44px;
 }
 
 html[data-display-mode="panel"],
@@ -132,7 +133,7 @@ html[data-display-mode="panel"] .all-blinds-actions .button {
 }
 
 html[data-display-mode="panel"] .panel-target {
-  min-height: 44px;
+  min-height: var(--panel-target-size);
 }
 
 html[data-display-mode="panel"] .all-blinds-actions .ui-icon {
@@ -298,17 +299,17 @@ html[data-display-mode="panel"] #app > .subtle {
   }
 
   html[data-display-mode="panel"] .icon-button {
-    width: 34px;
-    min-width: 34px;
-    height: 34px;
-    min-height: 34px;
+    width: var(--panel-target-size);
+    min-width: var(--panel-target-size);
+    height: var(--panel-target-size);
+    min-height: var(--panel-target-size);
   }
 
   html[data-display-mode="panel"] .topbar-add {
-    width: 36px;
-    min-width: 36px;
-    height: 36px;
-    min-height: 36px;
+    width: var(--panel-target-size);
+    min-width: var(--panel-target-size);
+    height: var(--panel-target-size);
+    min-height: var(--panel-target-size);
   }
 
   html[data-display-mode="panel"] #app {
