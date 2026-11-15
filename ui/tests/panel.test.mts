@@ -7,6 +7,7 @@ import {
   renderBlindActions,
   renderBlindCard,
   renderDeviceList,
+  renderPanelNotice,
   renderTopbarActions,
 } from '../components.mjs';
 
@@ -26,10 +27,10 @@ after(async () => {
   await browser?.close();
 });
 
-function panelMarkup(): string {
+function panelMarkup({longLabels = false, notices = false}: {longLabels?: boolean; notices?: boolean} = {}): string {
   const cards = Array.from({length:4}, (_, index) => {
     const id = `blind-${index + 1}`;
-    const label = `Bedroom ${index + 1}`;
+    const label = longLabels ? `Bedroom window with long label ${index + 1}` : `Bedroom ${index + 1}`;
     const controls = renderBlindActions({deviceId:id, blindLabel:label, panelMode:true});
     return renderBlindCard({
       id,
@@ -39,6 +40,11 @@ function panelMarkup(): string {
       positionPercent:50,
       movementStatus:'at_target',
       controlsMarkup:controls,
+      messageMarkup:notices ? renderPanelNotice({
+        label:'Movement paused',
+        details:['Repeated Bluetooth connection failures. Open and Close are paused until the cooldown ends; Stop remains available.'],
+        tone:'warn',
+      }) : '',
       panelMode:true,
     });
   }).join('');
@@ -49,9 +55,9 @@ function panelMarkup(): string {
   return `<!doctype html><html lang="en" data-display-mode="panel"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><a class="brand" href="#home">somaris.</a><div class="top-actions">${topbar}</div></header><main id="app">${devices}</main></div></body></html>`;
 }
 
-async function openPanel(width: number, height: number): Promise<Page> {
+async function openPanel(width: number, height: number, options: {longLabels?: boolean; notices?: boolean} = {}): Promise<Page> {
   const page = await browser.newPage({viewport:{width, height}});
-  await page.setContent(panelMarkup());
+  await page.setContent(panelMarkup(options));
   return page;
 }
 
@@ -79,6 +85,88 @@ test('panel view lays out blind cards in two columns at 480px with usable contro
     assert.ok(layout.buttons.every(height => height >= 44));
     assert.ok(layout.batchButtons.every(height => height >= 44));
     assert.ok(layout.scrollWidth <= 480);
+  } finally {
+    await page.close();
+  }
+});
+
+test('square desk panel keeps all blind cards and controls visible at 480px', async () => {
+  // Contract: UI-PANEL-04 in docs/test-contracts.md.
+  const page = await openPanel(480, 480);
+  try {
+    const layout = await page.evaluate(() => {
+      const app = document.querySelector('#app')!;
+      const appRect = app.getBoundingClientRect();
+      const cards = [...document.querySelectorAll('.device-list--panel .grid > article')]
+        .map(card => {
+          const rect = card.getBoundingClientRect();
+          return {top:rect.top, bottom:rect.bottom};
+        });
+      const controls = [...document.querySelectorAll('.card--panel .controls button, .all-blinds-actions button')]
+        .map(button => {
+          const rect = button.getBoundingClientRect();
+          return {top:rect.top, bottom:rect.bottom, height:rect.height};
+        });
+      return {
+        appTop:appRect.top,
+        appBottom:appRect.bottom,
+        appCanScroll:app.scrollHeight > app.clientHeight,
+        cards,
+        controls,
+        documentCanScroll:document.documentElement.scrollHeight > window.innerHeight,
+      };
+    });
+
+    assert.equal(layout.cards.length, 4);
+    assert.ok(layout.cards.every(card => card.top >= layout.appTop && card.bottom <= layout.appBottom));
+    assert.ok(layout.controls.every(control => control.top >= layout.appTop && control.bottom <= layout.appBottom));
+    assert.ok(layout.controls.every(control => control.height >= 44));
+    assert.equal(layout.appCanScroll, false);
+    assert.equal(layout.documentCanScroll, false);
+  } finally {
+    await page.close();
+  }
+});
+
+test('square desk panel contains long labels and compact notices without hiding detail from assistive technology', async () => {
+  // Contract: UI-PANEL-04 in docs/test-contracts.md.
+  const page = await openPanel(480, 480, {longLabels:true, notices:true});
+  try {
+    const layout = await page.evaluate(() => {
+      const app = document.querySelector('#app')!;
+      const appRect = app.getBoundingClientRect();
+      const cards = [...document.querySelectorAll('.device-list--panel .grid > article')]
+        .map(card => {
+          const rect = card.getBoundingClientRect();
+          return {top:rect.top, bottom:rect.bottom};
+        });
+      const labels = [...document.querySelectorAll('.card-title')]
+        .map(label => ({client:label.clientWidth, scroll:label.scrollWidth}));
+      const notices = [...document.querySelectorAll('.panel-notice')]
+        .map(notice => ({
+          label:notice.querySelector('.panel-notice__label')?.textContent,
+          description:notice.getAttribute('aria-label'),
+          title:notice.getAttribute('title'),
+          bottom:notice.getBoundingClientRect().bottom,
+        }));
+      return {
+        appTop:appRect.top,
+        appBottom:appRect.bottom,
+        appCanScroll:app.scrollHeight > app.clientHeight,
+        cards,
+        labels,
+        notices,
+      };
+    });
+
+    assert.ok(layout.cards.every(card => card.top >= layout.appTop && card.bottom <= layout.appBottom));
+    assert.equal(layout.appCanScroll, false);
+    assert.ok(layout.labels.every(label => label.scroll > label.client));
+    assert.equal(layout.notices.length, 4);
+    assert.ok(layout.notices.every(notice => notice.label === 'Movement paused'));
+    assert.ok(layout.notices.every(notice => notice.description?.includes('Stop remains available')));
+    assert.ok(layout.notices.every(notice => notice.title === notice.description));
+    assert.ok(layout.notices.every(notice => notice.bottom <= layout.appBottom));
   } finally {
     await page.close();
   }
