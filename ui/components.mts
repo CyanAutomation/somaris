@@ -46,6 +46,12 @@ interface BlindStatusOptions {
   panelMode?: boolean;
 }
 
+interface PanelNoticeOptions {
+  label: string;
+  details: string[];
+  tone?: VisualTone;
+}
+
 type MovementStatus = 'opening' | 'closing' | 'at_target' | 'unavailable';
 
 interface BadgeOptions {
@@ -200,6 +206,12 @@ export function renderBlindStatus({positionPercent, movementStatus, compact = fa
   return `<div class="blind-state${variants ? ` ${variants}` : ''}"><strong class="blind-state__label">${escapeHtml(label)}</strong>${percentClosed === null ? '' : `<span class="blind-state__percent">${percentClosed}% closed</span>`}</div>`;
 }
 
+export function renderPanelNotice({label, details, tone = 'warn'}: PanelNoticeOptions): string {
+  const safeTone = tone === 'bad' || tone === 'error' ? 'bad' : tone === 'good' || tone === 'success' ? 'good' : 'warn';
+  const description = [label, ...details].filter(Boolean).join('. ');
+  return `<p class="panel-notice panel-notice--${safeTone}" role="status" aria-label="${escapeHtml(description)}" title="${escapeHtml(description)}"><span class="panel-notice__marker" aria-hidden="true">!</span><span class="panel-notice__label">${escapeHtml(label)}</span></p>`;
+}
+
 export function renderBadge({label, tone = ''}: BadgeOptions): string {
   const variant = tone ? ` ${escapeHtml(tone)}` : '';
   return `<span class="badge${variant}">${escapeHtml(label)}</span>`;
@@ -346,7 +358,7 @@ export function renderBlindActions({deviceId, blindLabel, panelMode = false, dis
       label,
       accessibleLabel,
       action:`command:${action}:${deviceId}`,
-      variant,
+      variant:[variant, panelMode ? 'panel-target' : ''].filter(Boolean).join(' '),
       disabled:disabled || (movementDisabled && action !== 'stop') || (busy && action !== 'stop'),
       icon:action,
       iconOnly:panelMode,
@@ -437,7 +449,7 @@ export function renderBatchControls({blindCount = 0, eligibleCount = 0, disabled
       : 'No enrolled blinds are currently ready to move.';
   const panelVariant = panelMode ? ' all-blinds-controls--panel' : '';
   const controls = blindCount > 0
-    ? `<section class="all-blinds-controls${panelVariant}" aria-label="All blinds controls"${busy ? ' aria-busy="true"' : ''}><div class="all-blinds-copy"><h2>All blinds</h2><p>${escapeHtml(description)}</p></div><div class="all-blinds-actions">${renderButton({label:'Open all', accessibleLabel:'Open all blinds', action:'batch:open', icon:'open', disabled:unavailable})}${renderButton({label:'Close all', accessibleLabel:'Close all blinds', action:'batch:close', icon:'close', variant:'secondary', disabled:unavailable})}</div>${renderBatchFeedback(batch)}</section>`
+    ? `<section class="all-blinds-controls${panelVariant}" aria-label="All blinds controls"${busy ? ' aria-busy="true"' : ''}><div class="all-blinds-copy"><h2>All blinds</h2><p>${escapeHtml(description)}</p></div><div class="all-blinds-actions">${renderButton({label:'Open all', accessibleLabel:'Open all blinds', action:'batch:open', icon:'open', variant:panelMode ? 'panel-target' : '', disabled:unavailable})}${renderButton({label:'Close all', accessibleLabel:'Close all blinds', action:'batch:close', icon:'close', variant:panelMode ? 'secondary panel-target' : 'secondary', disabled:unavailable})}</div>${renderBatchFeedback(batch)}</section>`
     : '';
   return `${controls}${blindCount < 1 ? renderBatchFeedback(batch) : ''}`;
 }

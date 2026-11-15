@@ -8,6 +8,7 @@ import {
   renderBlindCard,
   renderCalibrationControls,
   renderBlindStatus,
+  renderPanelNotice,
   renderMotorSpeedControl,
   renderBadge,
   renderStatusIndicator,
@@ -223,6 +224,17 @@ test('availability is a compact reusable icon indicator with an accessible statu
   assert.equal(stale.querySelector('[role="img"]')?.getAttribute('aria-label'), 'Stale');
 });
 
+test('compact panel notice shows a short label and retains full accessible detail', () => {
+  const detail = 'Repeated Bluetooth connection failures. Open and Close are paused until the cooldown ends; Stop remains available.';
+  const notice = parseMarkup(renderPanelNotice({label:'Movement paused', details:[detail], tone:'warn'}))
+    .querySelector('.panel-notice');
+  assert.equal(notice?.querySelector('.panel-notice__label')?.textContent, 'Movement paused');
+  assert.match(notice?.getAttribute('aria-label') || '', /Movement paused/);
+  assert.match(notice?.getAttribute('aria-label') || '', /Stop remains available/);
+  assert.equal(notice?.getAttribute('title'), notice?.getAttribute('aria-label'));
+  assert.equal(notice?.getAttribute('role'), 'status');
+});
+
 test('add-blind action is a plus-only button with an accessible name and tooltip', () => {
   const markup = renderAddBlindButton({variant:'secondary panel-add'});
   assert.match(markup, /aria-label="Add a blind"/);
@@ -251,6 +263,8 @@ test('device cards expose blind identity, reported status, and named actions in 
     assert.deepEqual([...card.querySelectorAll('.controls button')]
       .map(button => button.getAttribute('aria-label')),
     ['Open Bedroom Left', 'Stop Bedroom Left', 'Close Bedroom Left']);
+    assert.ok([...card.querySelectorAll('.controls button')]
+      .every(button => button.classList.contains('panel-target') === panelMode));
   }
 });
 
@@ -282,6 +296,8 @@ test('all-blinds batch controls are reusable, accessible, and disabled while una
   const busy = renderBatchControls({blindCount:3, eligibleCount:2, busy:true, panelMode:true});
   assert.match(busy, /all-blinds-controls--panel/);
   assert.match(busy, /data-action="batch:open"[^>]*disabled/);
+  const panelControls = parseMarkup(renderBatchControls({blindCount:3, eligibleCount:2, panelMode:true}));
+  assert.equal(panelControls.querySelectorAll('.all-blinds-actions .panel-target').length, 2);
   assert.match(renderBatchControls({blindCount:1, eligibleCount:1}), /the available blind/);
 
   const panelList = renderDeviceList({count:3, panelMode:true, toolbarMarkup:controls, cardsMarkup:'<article>Blind</article>'});
