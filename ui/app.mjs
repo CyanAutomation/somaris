@@ -1,4 +1,4 @@
-import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderInfoGrid, renderMotorSpeedControl, renderCalibrationControls, movementStatusFromPositions, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
+import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderMotorSpeedControl, renderCalibrationControls, movementStatusFromPositions, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
 import { SnackbarQueue } from './snackbar.mjs';
 export { escapeHtml };
 const displayModes = new Set(DISPLAY_MODE_OPTIONS.map(([value]) => value));
@@ -413,17 +413,22 @@ function card(device) {
         supportsPosition: device.capabilities?.set_position === true,
         positionClosedPercent: targetPercent,
     });
-    const messageMarkup = message ? `<p class="message ${msgTone}" role="status">${esc(message)}</p>` : '';
-    const availabilityMessage = device.availability !== 'ready' ? '<p class="message warn">Controls are unavailable until this blind is uniquely observed again.</p>' : '';
-    const cooldownMessage = movementCooldown ? `<p class="message warn">Repeated Bluetooth connection failures. Open and Close are paused until ${esc(dateTimeLabel(cooldownUntil, 'the cooldown ends'))}; Stop remains available.</p>` : '';
-    const calibrationMessage = device.calibration_mode_active ? '<p class="message warn">Endpoint calibration is active. Normal movement is paused until calibration ends.</p>' : '';
+    const availabilityDetail = device.availability !== 'ready' ? 'Controls are unavailable until this blind is uniquely observed again.' : '';
+    const cooldownDetail = movementCooldown ? `Repeated Bluetooth connection failures. Open and Close are paused until ${dateTimeLabel(cooldownUntil, 'the cooldown ends')}; Stop remains available.` : '';
+    const calibrationDetail = device.calibration_mode_active ? 'Endpoint calibration is active. Normal movement is paused until calibration ends.' : '';
+    const panelDetails = [message, availabilityDetail, cooldownDetail, calibrationDetail].filter(Boolean);
+    const panelNoticeLabel = movementCooldown ? 'Movement paused' : device.calibration_mode_active ? 'Calibration active' : availabilityDetail ? 'Blind unavailable' : message ? 'Command update' : '';
+    const panelNoticeTone = msgTone || (availabilityDetail || cooldownDetail || calibrationDetail ? 'warn' : 'good');
+    const messageMarkup = panelMode
+        ? panelDetails.length ? renderPanelNotice({ label: panelNoticeLabel, details: panelDetails, tone: panelNoticeTone }) : ''
+        : `${message ? `<p class="message ${msgTone}" role="status">${esc(message)}</p>` : ''}${availabilityDetail ? `<p class="message warn">${esc(availabilityDetail)}</p>` : ''}${cooldownDetail ? `<p class="message warn">${esc(cooldownDetail)}</p>` : ''}${calibrationDetail ? `<p class="message warn">${esc(calibrationDetail)}</p>` : ''}`;
     const footerMarkup = `${batteryDisplay(o?.battery)}<button type="button" class="text-button" data-action="details:${esc(e.id)}">View details &nbsp; ↗</button>`;
     return renderBlindCard({
         id: e.id, label: blindLabel, isSimulated: e.is_simulated, room: e.room, lastSeen: relative(device.last_seen_at),
         availabilityLabel: label, availabilityTone: tone,
         availabilityStatus: device.availability,
         positionPercent: p, movementStatus: o?.movement_status ?? 'unavailable', blindLines: lines,
-        controlsMarkup, messageMarkup: `${messageMarkup}${availabilityMessage}${cooldownMessage}${calibrationMessage}`, footerMarkup, panelMode,
+        controlsMarkup, messageMarkup, footerMarkup, panelMode,
     });
 }
 function activityPanel() {
