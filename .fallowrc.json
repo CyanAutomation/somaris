@@ -1,0 +1,11 @@
+{
+  "entry": [
+    "ui/app.mts",
+    "ui/api-docs.mts"
+  ],
+  "ignorePatterns": [
+    "ui/*.mjs",
+    "ui/*.css",
+    "ui/*.html"
+  ]
+}

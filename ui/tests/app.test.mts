@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, resetDemo, resolveDisplayMode} from '../app.mjs';
-import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
+import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, DashboardState, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
 
 type CommandTarget = RefreshTarget & {
   commands: Record<string, CommandRecord>;
@@ -128,6 +128,154 @@ test('batch progress stays contextual while a terminal batch result becomes a sn
  assert.equal(notifications.length,1);
  assert.equal(notifications[0].tone,'success');
  assert.match(notifications[0].message,/3 of 3/);
+});
+
+test('batch result notifications preserve failure details and surface rejected batches', async () => {
+ const {submitBlindBatch} = await import('../app.mjs');
+ const cases = [
+  {
+   result:{id:'batch-skipped',action:'close',status:'completed',target_count:2,acknowledged_count:2,failed_count:0,pending_count:0,skipped_count:1,skipped:[{label:'Office',availability:'stale'}],targets:[]},
+   tone:'warning',
+   message:/2 of 2.*1 unavailable/,
+   detail:/Office.*stale/,
+  },
+  {
+   result:{id:'batch-failed',action:'open',status:'failed',target_count:2,acknowledged_count:0,failed_count:2,pending_count:0,skipped_count:0,skipped:[],targets:[{label:'Kitchen',status:'connection_failed'},{label:'Bedroom',status:'outcome_unknown'}]},
+   tone:'error',
+   message:/No open commands were acknowledged; 2 failed/,
+   detail:/Kitchen.*connection failed.*Bedroom.*outcome unknown/,
+  },
+  {
+   result:{id:'batch-rejected',action:'close',status:'rejected',error:'The request was rejected.',target_count:0,acknowledged_count:0,failed_count:0,pending_count:0,skipped_count:0,skipped:[],targets:[]},
+   tone:'error',
+   message:/Could not start the close batch: The request was rejected\./,
+   detail:null,
+  },
+ ] as const;
+
+ for (const {result, tone, message, detail} of cases) {
+  const notifications: Notification[] = [];
+  const state: RefreshTarget & {batch:BatchState|null; notifications:Notification[]} = {
+   batch:null,
+   notifications,
+   notify:item=>notifications.push(item),
+  };
+  assert.equal(await submitBlindBatch(state, async () => result, result.action), true);
+  assert.equal(notifications[0]?.tone, tone);
+  assert.match(notifications[0]?.message ?? '', message);
+  if (detail) assert.match(notifications[0]?.details?.join(' ') ?? '', detail);
+ }
+});
+
+test('action data parsing preserves encoded identifiers and ignores extra segments', async () => {
+ const {parseActionValue} = await import('../app.mjs');
+ assert.deepEqual(parseActionValue('command:open:blind%3Aleft'), ['command','open','blind%3Aleft']);
+ assert.deepEqual(parseActionValue('details:blind%3Aleft'), ['details','blind%3Aleft','']);
+ assert.deepEqual(parseActionValue(undefined), ['','','']);
+ assert.deepEqual(parseActionValue('remove:blind-1:ignored'), ['remove','blind-1','ignored']);
+});
+
+test('command dispatch decodes the device ID before sending the command', async () => {
+ const {dispatchBlindCommand} = await import('../app.mjs');
+ const calls: Array<[string,string]> = [];
+ assert.equal(dispatchBlindCommand('open','blind%3Aleft',(id,action)=>calls.push([id,action])),true);
+ assert.deepEqual(calls,[['blind:left','open']]);
+});
+
+test('card notices retain full accessible details and escape regular-view text', async () => {
+ const {cardMessageMarkup} = await import('../app.mjs');
+ assert.equal(cardMessageMarkup(true,'','','','',''), '');
+
+ const panel = cardMessageMarkup(
+  true,
+  'Command uncertain',
+  'warn',
+  'Controls unavailable',
+  'Stop remains available until the cooldown ends',
+  'Calibration is active',
+ );
+ assert.match(panel, /panel-notice__label">Movement paused/);
+ assert.match(panel, /aria-label="Movement paused\. Command uncertain\. Controls unavailable\. Stop remains available until the cooldown ends\. Calibration is active/);
+
+ const regular = cardMessageMarkup(false,'Could not display <Blind>','bad','','','');
+ assert.match(regular, /&lt;Blind&gt;/);
+ assert.doesNotMatch(regular, /<Blind>/);
+});
+
+test('device detail fields retain cached telemetry and only show active cooldowns', async () => {
+ const {deviceDetailFields} = await import('../app.mjs');
+ const now = Date.parse('2026-11-15T17:00:00Z');
+ const device: ManagedDevice = {
+  enrollment:{id:'blind-1',label:'Office',room:'Study',is_simulated:true},
+  availability:'ready',
+  position:{current_closed_percent:42,target_closed_percent:60},
+  last_seen_at:'2026-11-15T16:59:00Z',
+  advertisement_age_ms:9500,
+  motion_feedback:{status:'progress_observed',estimated_travel_rate_percent_per_second:0.75},
+  gatt_readiness:{
+   status:'connection_failed',transport_evidence:'prewrite_failure',
+   last_attempt_at:'2026-11-15T16:58:00Z',last_write_acknowledged_at:null,
+   cooldown_until:'2026-11-15T17:01:00Z',error_code:'connection_timeout',failure_stage:'connect',
+  },
+ };
+ const observation = {
+  movement_status:'closing' as const,
+  rssi_dbm:-65,
+  battery:{voltage_mv:4000,status:'cached'},
+ };
+ const fields = deviceDetailFields(device,observation,now);
+ assert.deepEqual(fields.map(field=>field.label),[
+  'Availability','Position','Last observation','Advertisement age','Reported target','Movement feedback',
+  'Learned travel rate','Signal','Battery voltage','Source','Room','Last GATT command',
+  'Transport evidence','Last command attempt','Last acknowledged GATT write','Movement cooldown until','Latest failure',
+ ]);
+ assert.equal(fields.find(field=>field.label==='Battery voltage')?.value,'4000 mV (cached)');
+ assert.equal(fields.find(field=>field.label==='Learned travel rate')?.value,'0.75% per second');
+ assert.equal(fields.find(field=>field.label==='Movement cooldown until')?.value,new Date('2026-11-15T17:01:00Z').toLocaleString());
+
+ const expired = deviceDetailFields({
+  ...device,
+  gatt_readiness:{...device.gatt_readiness,cooldown_until:'2026-11-15T16:59:00Z'},
+ },observation,now);
+ assert.equal(expired.some(field=>field.label==='Movement cooldown until'),false);
+});
+
+test('managed device cards preserve targets, status details, and panel safety states', async () => {
+ const {renderManagedDeviceCard} = await import('../app.mjs');
+ const now=Date.parse('2026-11-15T17:00:00Z');
+ const dashboard: DashboardState = {
+  demoMode:false,managed:[],observations:[],diagnostics:null,activity:[],commands:{},batch:null,
+  serviceError:null,confirmingRemovalId:null,pendingRemovalFocusId:null,removingEnrollmentId:null,
+  busy:new Set(),reconciliationRequired:new Set(),tokens:{},simulators:null,
+  notify:()=>{},dismissNotification:()=>{},
+ };
+ const device: ManagedDevice = {
+  enrollment:{id:'blind-1',logical_id:'logical-1',advertised_name:'Study shade',label:'Study shade',room:'Study',is_simulated:true},
+  availability:'ready',position:{current_closed_percent:42,target_closed_percent:60},
+  last_seen_at:'2026-11-15T16:59:00Z',capabilities:{set_position:true},
+ };
+ dashboard.observations=[{
+  id:'observation-1',logical_id:'logical-1',advertised_name:'Study shade',is_simulated:true,
+  movement_status:'closing',battery:{percent_estimate:80,voltage_mv:4000,status:'observed'},
+ }];
+ const regular=renderManagedDeviceCard(device,dashboard,false,now);
+ assert.match(regular,/Study shade/);
+ assert.match(regular,/blind-state__label">Closing/);
+ assert.match(regular,/data-action="position:blind-1"/);
+ assert.match(regular,/Battery ~80%/);
+ assert.match(regular,/Seen 1 min ago/);
+
+ dashboard.commands['blind-1']={status:'outcome_unknown'};
+ const panel=renderManagedDeviceCard({
+  ...device,availability:'stale',calibration_mode_active:true,
+  gatt_readiness:{cooldown_until:'2026-11-15T17:01:00Z'},
+ },dashboard,true,now);
+ assert.match(panel,/panel-notice__label">Movement paused/);
+ assert.match(panel,/aria-label="Movement paused\. The outcome is uncertain/);
+ assert.match(panel,/Controls are unavailable until this blind is uniquely observed again/);
+ assert.match(panel,/Endpoint calibration is active/);
+ assert.doesNotMatch(panel,/position-control/);
+ assert.match(panel,/data-action="command:open:blind-1"[^>]*disabled/);
 });
 
 test('display preference query pins a mode and otherwise uses the saved choice',()=>{

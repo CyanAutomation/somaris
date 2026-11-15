@@ -7,7 +7,7 @@ function isOperation(value) {
         && (value.summary === undefined || typeof value.summary === 'string')
         && (value.description === undefined || typeof value.description === 'string');
 }
-export function parseOpenApiDocument(value) {
+function parseOpenApiDocument(value) {
     if (!isRecord(value) || !isRecord(value.info) || typeof value.info.title !== 'string' || !isRecord(value.paths)) {
         throw new Error('The OpenAPI document has an unexpected format.');
     }
