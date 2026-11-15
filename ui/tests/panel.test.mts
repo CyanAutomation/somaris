@@ -97,6 +97,7 @@ test('square desk panel keeps all blind cards and controls visible at 480px', as
     const layout = await page.evaluate(() => {
       const app = document.querySelector('#app')!;
       const appRect = app.getBoundingClientRect();
+      const topbarRect = document.querySelector('.topbar')!.getBoundingClientRect();
       const cards = [...document.querySelectorAll('.device-list--panel .grid > article')]
         .map(card => {
           const rect = card.getBoundingClientRect();
@@ -105,14 +106,24 @@ test('square desk panel keeps all blind cards and controls visible at 480px', as
       const controls = [...document.querySelectorAll('.card--panel .controls button, .all-blinds-actions button')]
         .map(button => {
           const rect = button.getBoundingClientRect();
-          return {top:rect.top, bottom:rect.bottom, height:rect.height};
+          return {left:rect.left, right:rect.right, top:rect.top, bottom:rect.bottom, width:rect.width, height:rect.height};
+        });
+      const topbarControls = [...document.querySelectorAll('.top-actions button')]
+        .map(button => {
+          const rect = button.getBoundingClientRect();
+          return {left:rect.left, right:rect.right, top:rect.top, bottom:rect.bottom, width:rect.width, height:rect.height};
         });
       return {
         appTop:appRect.top,
         appBottom:appRect.bottom,
+        topbarTop:topbarRect.top,
+        topbarBottom:topbarRect.bottom,
+        topbarLeft:topbarRect.left,
+        topbarRight:topbarRect.right,
         appCanScroll:app.scrollHeight > app.clientHeight,
         cards,
         controls,
+        topbarControls,
         documentCanScroll:document.documentElement.scrollHeight > window.innerHeight,
       };
     });
@@ -120,7 +131,11 @@ test('square desk panel keeps all blind cards and controls visible at 480px', as
     assert.equal(layout.cards.length, 4);
     assert.ok(layout.cards.every(card => card.top >= layout.appTop && card.bottom <= layout.appBottom));
     assert.ok(layout.controls.every(control => control.top >= layout.appTop && control.bottom <= layout.appBottom));
-    assert.ok(layout.controls.every(control => control.height >= 44));
+    assert.ok(layout.controls.every(control => control.width >= 44 && control.height >= 44));
+    assert.equal(layout.topbarControls.length, 3);
+    assert.ok(layout.topbarControls.every(control => control.left >= layout.topbarLeft && control.right <= layout.topbarRight));
+    assert.ok(layout.topbarControls.every(control => control.top >= layout.topbarTop && control.bottom <= layout.topbarBottom));
+    assert.ok(layout.topbarControls.every(control => control.width >= 44 && control.height >= 44));
     assert.equal(layout.appCanScroll, false);
     assert.equal(layout.documentCanScroll, false);
   } finally {
