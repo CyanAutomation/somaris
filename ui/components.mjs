@@ -1,6 +1,8 @@
-export const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, character => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-}[character] ?? character));
+import { escapeHtml } from './escape.mjs';
+import { renderBatchFeedbackMarkup } from './batch-feedback.mjs';
+export { escapeHtml };
+export { renderDeviceList, renderHomeSupportingSections, renderInfoGrid } from './page-components.mjs';
+export { renderSnackbar, renderSnackbarRegion } from './snackbar-components.mjs';
 const icons = {
     add: '<path d="M12 5v14M5 12h14"/>',
     display: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/>',
@@ -22,7 +24,7 @@ export const DISPLAY_MODE_OPTIONS = [
     ['panel', 'Panel'],
     ['desktop', 'Desktop'],
 ];
-export function iconMarkup(name) {
+function iconMarkup(name) {
     if (!name)
         return '';
     const paths = icons[name];
@@ -78,7 +80,7 @@ export function renderStatusIndicator({ label, tone = '', status = 'unavailable'
     const name = escapeHtml(label || 'Availability unavailable');
     return `<span class="status-indicator${toneClass}" role="img" aria-label="${name}" title="${name}">${iconMarkup(icon)}</span>`;
 }
-export function renderDisplayModeToggle({ displayPreference = 'auto' } = {}) {
+function renderDisplayModeToggle({ displayPreference = 'auto' } = {}) {
     const selectedIndex = DISPLAY_MODE_OPTIONS.findIndex(([value]) => value === displayPreference);
     const safeIndex = selectedIndex < 0 ? 0 : selectedIndex;
     const [, currentLabel] = DISPLAY_MODE_OPTIONS[safeIndex] ?? DISPLAY_MODE_OPTIONS[0];
@@ -188,79 +190,8 @@ export function renderBlindActions({ deviceId, blindLabel, panelMode = false, di
         });
     }).join('')}${supportsPosition && !panelMode ? `<div class="position-control"><label for="position-${escapeHtml(deviceId)}">Target position <output data-position-output="${escapeHtml(deviceId)}">${escapeHtml(positionClosedPercent)}%</output> closed</label><input id="position-${escapeHtml(deviceId)}" type="range" min="0" max="100" step="1" value="${escapeHtml(positionClosedPercent)}" data-position-input="${escapeHtml(deviceId)}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent closed"${disabled || movementDisabled || busy ? ' disabled' : ''}><button type="button" class="button secondary position-submit" data-action="position:${escapeHtml(deviceId)}"${disabled || movementDisabled || busy ? ' disabled' : ''}>Move to position</button></div>` : ''}</div>`;
 }
-const batchFailureStatuses = new Set(['connection_failed', 'deferred', 'write_failed', 'outcome_unknown', 'expired', 'cancelled']);
-const batchSkipLabels = {
-    not_seen: 'not seen recently',
-    stale: 'stale observation',
-    ambiguous: 'ambiguous device',
-    cooldown: 'movement cooldown',
-    calibration_active: 'calibration active',
-};
 export function renderBatchFeedback(batch) {
-    if (!batch)
-        return '';
-    const data = batch.data || batch;
-    const action = batch.action || data.action;
-    const actionLabel = action === 'close' ? 'Close' : 'Open';
-    const status = batch.status || data.status;
-    if (status && ['completed', 'partial', 'failed', 'rejected'].includes(status))
-        return '';
-    let message = '';
-    let tone = '';
-    if (status === 'submitting')
-        message = `Sending ${actionLabel.toLowerCase()} commands to ready blinds…`;
-    else if (status === 'checking')
-        message = `Checking the ${actionLabel.toLowerCase()} batch…`;
-    else if (status === 'outcome_unknown') {
-        message = `The ${actionLabel.toLowerCase()} batch result is unknown. Check its status before starting another batch.`;
-        tone = 'warn';
-    }
-    else if (status === 'queued') {
-        message = `${actionLabel} batch queued for ${data.target_count || 0} ready blinds.`;
-    }
-    else if (status === 'running') {
-        const acknowledged = data.acknowledged_count || 0;
-        const total = data.target_count || 0;
-        const failedCount = data.failed_count || 0;
-        const pending = data.pending_count || 0;
-        const movement = action === 'close' ? 'Closing' : 'Opening';
-        const failed = failedCount ? `${failedCount} failed, ` : '';
-        message = `${movement} blinds: commands acknowledged for ${acknowledged} of ${total} ready blinds; ${failed}${pending} pending.`;
-    }
-    else {
-        return '';
-    }
-    const skippedItems = data.skipped || [];
-    const skipped = skippedItems.length
-        ? `<div class="batch-skipped"><span>Skipped blinds</span><ul>${skippedItems.map(item => `<li>${escapeHtml(item.label)} · ${escapeHtml(batchSkipLabels[item.availability ?? ''] || item.availability || 'unavailable')}</li>`).join('')}</ul></div>`
-        : '';
-    const failures = (data.targets || []).filter((target) => batchFailureStatuses.has(target.status));
-    const failed = failures.length
-        ? `<div class="batch-failures"><span>Unsuccessful blinds</span><ul>${failures.map(item => `<li>${escapeHtml(item.label)} · ${escapeHtml(item.status.replaceAll('_', ' '))}</li>`).join('')}</ul></div>`
-        : '';
-    const retry = status === 'outcome_unknown'
-        ? renderButton({ label: batch.id ? 'Check batch status' : 'Retry original request', action: 'batch:check', variant: 'secondary' })
-        : '';
-    const errorDetail = status === 'outcome_unknown' && batch.error
-        ? `<span class="subtle">${escapeHtml(batch.error)}</span>`
-        : '';
-    return `<div class="batch-feedback${tone ? ` batch-feedback--${tone}` : ''}" role="status" aria-live="polite"><p>${escapeHtml(message)}</p>${errorDetail}${skipped}${failed}${retry}</div>`;
-}
-export function renderSnackbar({ id, message, tone = 'info', action = null, details = [] } = {}) {
-    if (typeof message !== 'string' || !message.trim())
-        return '';
-    const safeTone = ['info', 'success', 'warning', 'error'].includes(tone ?? '') ? tone ?? 'info' : 'info';
-    const isError = safeTone === 'error';
-    const actionMarkup = action && typeof action.label === 'string' && typeof action.action === 'string'
-        ? `<button type="button" class="snackbar-action" data-snackbar-control="action" data-action="${escapeHtml(action.action)}">${escapeHtml(action.label)}</button>`
-        : '';
-    const detailItems = Array.isArray(details) && details.length
-        ? `<ul class="snackbar-details">${details.map(detail => `<li>${escapeHtml(detail)}</li>`).join('')}</ul>`
-        : '';
-    return `<article class="snackbar snackbar--${safeTone}" data-snackbar-id="${escapeHtml(id || '')}" role="${isError ? 'alert' : 'status'}" aria-live="${isError ? 'assertive' : 'polite'}" aria-atomic="true"><span class="snackbar-message">${escapeHtml(message)}</span>${detailItems}${actionMarkup}<button type="button" class="snackbar-dismiss" data-snackbar-control="dismiss" data-action="snackbar-dismiss:${escapeHtml(id || '')}" aria-label="Dismiss notification" title="Dismiss">×</button></article>`;
-}
-export function renderSnackbarRegion(items = []) {
-    return `<div id="snackbar-region" class="snackbar-region" role="region" aria-label="Notifications">${(items || []).map(renderSnackbar).join('')}</div>`;
+    return renderBatchFeedbackMarkup(batch, escapeHtml, renderButton);
 }
 export function renderBatchControls({ blindCount = 0, eligibleCount = 0, disabled = false, busy = false, panelMode = false, batch = null } = {}) {
     if (blindCount < 1 && !batch)
@@ -284,21 +215,4 @@ export function renderBlindCard({ id, label, isSimulated, room, lastSeen, availa
     const header = renderDeviceCardHeader({ id, label, availabilityLabel, availabilityTone, availabilityStatus, isSimulated, room, lastSeen });
     const status = renderBlindStatus({ positionPercent, movementStatus, panelMode });
     return `<article class="card${cardVariant}">${header}<div class="blind-display${displayVariant}">${status}<div class="blind-art" aria-hidden="true">${slats}</div></div>${controlsMarkup}${messageMarkup}<div class="card-foot">${footerMarkup}</div></article>`;
-}
-export function renderDeviceList({ count, panelMode = false, cardsMarkup = '', emptyMarkup = '', toolbarMarkup = '', title = 'Your blinds' }) {
-    const titleContent = panelMode ? '' : `<h2>${escapeHtml(title)}</h2>`;
-    const countLabel = panelMode ? '' : `<span class="count">${count} ${count === 1 ? 'blind' : 'blinds'}</span>`;
-    const content = cardsMarkup ? `<div class="grid">${cardsMarkup}</div>` : emptyMarkup;
-    const heading = panelMode ? '' : `<div class="section-heading device-list-heading">${titleContent}${countLabel}</div>`;
-    return `<section class="device-list${panelMode ? ' device-list--panel' : ''}" aria-label="${escapeHtml(title)}">${heading}${toolbarMarkup}${content}</section>`;
-}
-export function renderHomeSupportingSections({ panelMode = false, activityMarkup = '', serviceMarkup = '' }) {
-    return panelMode ? '' : `${activityMarkup}${serviceMarkup}`;
-}
-export function renderInfoItem({ label, value, contentMarkup }) {
-    const content = contentMarkup === undefined ? `<strong>${escapeHtml(value)}</strong>` : contentMarkup;
-    return `<div class="info-item"><span class="meta-label subtle">${escapeHtml(label)}</span>${content}</div>`;
-}
-export function renderInfoGrid(items) {
-    return `<div class="info-grid">${items.map(renderInfoItem).join('')}</div>`;
 }

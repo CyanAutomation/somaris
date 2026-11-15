@@ -100,12 +100,21 @@ const state = { demoMode: false, managed: [], observations: [], diagnostics: nul
 let demoSessionRecovery = null;
 let displayPreference = storedDisplayPreference();
 const esc = escapeHtml;
-const relative = (date) => { if (!date)
-    return 'Never seen'; const seconds = Math.max(0, Math.floor((Date.now() - new Date(date).getTime()) / 1000)); if (!Number.isFinite(seconds))
-    return 'Time unavailable'; if (seconds < 60)
-    return 'Seen just now'; if (seconds < 3600)
-    return `Seen ${Math.floor(seconds / 60)} min ago`; if (seconds < 86400)
-    return `Seen ${Math.floor(seconds / 3600)} hr ago`; return `Seen ${Math.floor(seconds / 86400)} days ago`; };
+function relativeAt(date, now) {
+    if (!date)
+        return 'Never seen';
+    const seconds = Math.max(0, Math.floor((now - new Date(date).getTime()) / 1000));
+    if (!Number.isFinite(seconds))
+        return 'Time unavailable';
+    if (seconds < 60)
+        return 'Seen just now';
+    if (seconds < 3600)
+        return `Seen ${Math.floor(seconds / 60)} min ago`;
+    if (seconds < 86400)
+        return `Seen ${Math.floor(seconds / 3600)} hr ago`;
+    return `Seen ${Math.floor(seconds / 86400)} days ago`;
+}
+const relative = (date) => relativeAt(date, Date.now());
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -217,7 +226,7 @@ export function availability(value) {
     return value ? availabilityLabels[value] : availabilityLabels.unavailable;
 }
 const terminalBatchStatuses = new Set(['completed', 'partial', 'failed', 'rejected']);
-export function blindBatchIsLocked(batch) {
+function blindBatchIsLocked(batch) {
     return !!batch && !terminalBatchStatuses.has(batch.status);
 }
 export function batchEligibleCount(managed, now = Date.now()) {
@@ -238,45 +247,45 @@ function batchRequestOptions(batch) {
         body: JSON.stringify({ action: batch.action }),
     };
 }
+const batchFailureStatuses = new Set(['connection_failed', 'deferred', 'write_failed', 'outcome_unknown', 'expired', 'cancelled']);
+function batchNotificationCopy(label, status, acknowledged, total, failed, skipped, error) {
+    const unavailable = skipped ? `; ${skipped} unavailable` : '';
+    switch (status) {
+        case 'completed':
+            return {
+                message: `${label} commands acknowledged for ${acknowledged} of ${total} ready blinds${unavailable}. Acknowledgement does not confirm movement.`,
+                tone: skipped ? 'warning' : 'success',
+            };
+        case 'partial':
+            return { message: `${label} commands acknowledged for ${acknowledged} of ${total} ready blinds; ${failed} failed${unavailable}.`, tone: 'warning' };
+        case 'failed':
+            return { message: `No ${label.toLowerCase()} commands were acknowledged; ${failed} failed${unavailable}.`, tone: 'error' };
+        case 'rejected':
+            return { message: `Could not start the ${label.toLowerCase()} batch: ${error || 'The request was rejected.'}`, tone: 'error' };
+        default:
+            return null;
+    }
+}
+function batchNotificationDetails(data) {
+    const skipped = (data.skipped || []).map(item => `Skipped ${item.label || 'blind'} · ${(item.availability || 'unavailable').replaceAll('_', ' ')}`);
+    const failures = (data.targets || [])
+        .filter(target => batchFailureStatuses.has(target.status))
+        .map(target => `${target.label || 'Blind'} · ${target.status.replaceAll('_', ' ')}`);
+    return [...skipped, ...failures];
+}
 function batchResultNotification(batch) {
     const data = batch.data || batch;
-    const action = batch.action || data.action;
-    const label = action === 'close' ? 'Close' : 'Open';
+    const label = (batch.action || data.action) === 'close' ? 'Close' : 'Open';
     const status = batch.status || data.status;
-    const acknowledged = data.acknowledged_count || 0;
-    const total = data.target_count || 0;
-    const failed = data.failed_count || 0;
-    const skippedItems = data.skipped || [];
-    const skipped = skippedItems.length;
-    const failureStatuses = new Set(['connection_failed', 'deferred', 'write_failed', 'outcome_unknown', 'expired', 'cancelled']);
-    const failedItems = (data.targets || []).filter(target => failureStatuses.has(target.status));
-    const details = [
-        ...skippedItems.map(item => `Skipped ${item.label || 'blind'} · ${(item.availability || 'unavailable').replaceAll('_', ' ')}`),
-        ...failedItems.map(item => `${item.label || 'Blind'} · ${item.status.replaceAll('_', ' ')}`),
-    ];
-    let message = '';
-    let tone = 'success';
-    if (status === 'completed') {
-        message = `${label} commands acknowledged for ${acknowledged} of ${total} ready blinds${skipped ? `; ${skipped} unavailable` : ''}. Acknowledgement does not confirm movement.`;
-        if (skipped)
-            tone = 'warning';
-    }
-    else if (status === 'partial') {
-        message = `${label} commands acknowledged for ${acknowledged} of ${total} ready blinds; ${failed} failed${skipped ? `; ${skipped} unavailable` : ''}.`;
-        tone = 'warning';
-    }
-    else if (status === 'failed') {
-        message = `No ${label.toLowerCase()} commands were acknowledged; ${failed} failed${skipped ? `; ${skipped} unavailable` : ''}.`;
-        tone = 'error';
-    }
-    else if (status === 'rejected') {
-        message = `Could not start the ${label.toLowerCase()} batch: ${batch.error || data.error || 'The request was rejected.'}`;
-        tone = 'error';
-    }
+    const skipped = data.skipped?.length ?? 0;
+    const copy = batchNotificationCopy(label, status, data.acknowledged_count || 0, data.target_count || 0, data.failed_count || 0, skipped, batch.error || data.error);
+    if (!copy)
+        return null;
+    const details = batchNotificationDetails(data);
     const visibleDetails = details.slice(0, 4);
     if (details.length > visibleDetails.length)
         visibleDetails.push(`${details.length - visibleDetails.length} more details`);
-    return message ? { key: `batch:${batch.id || batch.idempotencyKey || 'current'}:result`, message, tone, details: visibleDetails } : null;
+    return { key: `batch:${batch.id || batch.idempotencyKey || 'current'}:result`, ...copy, details: visibleDetails };
 }
 function applyBatchResult(target, batch, result, onChange) {
     if (target.batch !== batch)
@@ -393,43 +402,93 @@ function dateTimeLabel(value, fallback) {
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? 'Time unavailable' : date.toLocaleString();
 }
-function card(device) {
-    const e = device.enrollment, o = observationFor(device, state.observations), [label, tone] = availability(device.availability), p = device.position?.current_closed_percent;
+function cardCommandMessage(command) {
+    if (!command)
+        return ['', ''];
+    const contextual = !terminal.has(command.status)
+        || ['outcome_unknown', 'write_failed', 'deferred'].includes(command.status);
+    return contextual ? commandMessage(command) : ['', ''];
+}
+function cardAvailabilityDetail(device) {
+    return device.availability === 'ready'
+        ? ''
+        : 'Controls are unavailable until this blind is uniquely observed again.';
+}
+function cardCooldownDetail(cooldownUntil, now) {
+    if (!cooldownUntil || !(new Date(cooldownUntil).getTime() > now))
+        return '';
+    return `Repeated Bluetooth connection failures. Open and Close are paused until ${dateTimeLabel(cooldownUntil, 'the cooldown ends')}; Stop remains available.`;
+}
+function cardCalibrationDetail(device) {
+    return device.calibration_mode_active
+        ? 'Endpoint calibration is active. Normal movement is paused until calibration ends.'
+        : '';
+}
+export function cardMessageMarkup(panelMode, message, tone, availabilityDetail, cooldownDetail, calibrationDetail) {
+    if (!panelMode)
+        return regularCardMessageMarkup(message, tone, availabilityDetail, cooldownDetail, calibrationDetail);
+    const details = [message, availabilityDetail, cooldownDetail, calibrationDetail].filter(Boolean);
+    if (!details.length)
+        return '';
+    return renderPanelNotice({
+        label: panelCardNoticeLabel(message, availabilityDetail, cooldownDetail, calibrationDetail),
+        details,
+        tone: panelCardNoticeTone(tone, availabilityDetail, cooldownDetail, calibrationDetail),
+    });
+}
+function panelCardNoticeLabel(message, availability, cooldown, calibration) {
+    if (cooldown)
+        return 'Movement paused';
+    if (calibration)
+        return 'Calibration active';
+    if (availability)
+        return 'Blind unavailable';
+    return message ? 'Command update' : '';
+}
+function panelCardNoticeTone(tone, availability, cooldown, calibration) {
+    if (tone)
+        return tone;
+    return availability || cooldown || calibration ? 'warn' : 'good';
+}
+function regularCardMessageMarkup(message, tone, availability, cooldown, calibration) {
+    return [
+        message ? `<p class="message ${tone}" role="status">${esc(message)}</p>` : '',
+        availability ? `<p class="message warn">${esc(availability)}</p>` : '',
+        cooldown ? `<p class="message warn">${esc(cooldown)}</p>` : '',
+        calibration ? `<p class="message warn">${esc(calibration)}</p>` : '',
+    ].join('');
+}
+export function renderManagedDeviceCard(device, dashboard, panelMode, now = Date.now()) {
+    const e = device.enrollment, o = observationFor(device, dashboard.observations), [label, tone] = availability(device.availability), p = device.position?.current_closed_percent;
     const blindLabel = e.label ?? 'Blind';
-    const panelMode = document.documentElement.dataset.displayMode === 'panel';
     const cooldownUntil = device.gatt_readiness?.cooldown_until;
-    const movementCooldown = !!cooldownUntil && new Date(cooldownUntil).getTime() > Date.now();
-    const command = state.commands[e.id];
-    const contextualCommand = command && (!terminal.has(command.status) || ['outcome_unknown', 'write_failed', 'deferred'].includes(command.status));
-    const [message, msgTone] = contextualCommand ? commandMessage(command) : ['', ''];
+    const cooldownDetail = cardCooldownDetail(cooldownUntil, now);
+    const [message, msgTone] = cardCommandMessage(dashboard.commands[e.id]);
     const targetPercent = device.position?.target_closed_percent ?? p ?? 100;
     const lines = typeof p === 'number' && Number.isInteger(p) ? Math.max(1, Math.round(p / 100 * 11)) : 0;
-    const disabled = !!state.serviceError || device.availability !== 'ready';
+    const disabled = !!dashboard.serviceError || device.availability !== 'ready';
+    const availabilityDetail = cardAvailabilityDetail(device);
+    const calibrationDetail = cardCalibrationDetail(device);
     const controlsMarkup = renderBlindActions({
         deviceId: e.id, blindLabel,
         panelMode,
-        disabled, busy: state.busy.has(e.id),
-        movementDisabled: movementCooldown || device.calibration_mode_active === true || blindBatchIsLocked(state.batch),
+        disabled, busy: dashboard.busy.has(e.id),
+        movementDisabled: !!cooldownDetail || device.calibration_mode_active === true || blindBatchIsLocked(dashboard.batch),
         supportsPosition: device.capabilities?.set_position === true,
         positionClosedPercent: targetPercent,
     });
-    const availabilityDetail = device.availability !== 'ready' ? 'Controls are unavailable until this blind is uniquely observed again.' : '';
-    const cooldownDetail = movementCooldown ? `Repeated Bluetooth connection failures. Open and Close are paused until ${dateTimeLabel(cooldownUntil, 'the cooldown ends')}; Stop remains available.` : '';
-    const calibrationDetail = device.calibration_mode_active ? 'Endpoint calibration is active. Normal movement is paused until calibration ends.' : '';
-    const panelDetails = [message, availabilityDetail, cooldownDetail, calibrationDetail].filter(Boolean);
-    const panelNoticeLabel = movementCooldown ? 'Movement paused' : device.calibration_mode_active ? 'Calibration active' : availabilityDetail ? 'Blind unavailable' : message ? 'Command update' : '';
-    const panelNoticeTone = msgTone || (availabilityDetail || cooldownDetail || calibrationDetail ? 'warn' : 'good');
-    const messageMarkup = panelMode
-        ? panelDetails.length ? renderPanelNotice({ label: panelNoticeLabel, details: panelDetails, tone: panelNoticeTone }) : ''
-        : `${message ? `<p class="message ${msgTone}" role="status">${esc(message)}</p>` : ''}${availabilityDetail ? `<p class="message warn">${esc(availabilityDetail)}</p>` : ''}${cooldownDetail ? `<p class="message warn">${esc(cooldownDetail)}</p>` : ''}${calibrationDetail ? `<p class="message warn">${esc(calibrationDetail)}</p>` : ''}`;
+    const messageMarkup = cardMessageMarkup(panelMode, message, msgTone, availabilityDetail, cooldownDetail, calibrationDetail);
     const footerMarkup = `${batteryDisplay(o?.battery)}<button type="button" class="text-button" data-action="details:${esc(e.id)}">View details &nbsp; ↗</button>`;
     return renderBlindCard({
-        id: e.id, label: blindLabel, isSimulated: e.is_simulated, room: e.room, lastSeen: relative(device.last_seen_at),
+        id: e.id, label: blindLabel, isSimulated: e.is_simulated, room: e.room, lastSeen: relativeAt(device.last_seen_at, now),
         availabilityLabel: label, availabilityTone: tone,
         availabilityStatus: device.availability,
         positionPercent: p, movementStatus: o?.movement_status ?? 'unavailable', blindLines: lines,
         controlsMarkup, messageMarkup, footerMarkup, panelMode,
     });
+}
+function card(device) {
+    return renderManagedDeviceCard(device, state, document.documentElement.dataset.displayMode === 'panel');
 }
 function activityPanel() {
     const entries = state.activity || [];
@@ -473,47 +532,74 @@ function scannerSummary() { const s = state.diagnostics?.scanner; if (state.demo
     return 'Service status unavailable'; return s.adapter_available ? (s.scan_active ? 'Bluetooth adapter available · scanning' : 'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
 function back() { return '<button class="text-button back" data-action="home">← &nbsp; Back to your blinds</button>'; }
 function addPage() { const available = state.observations.filter(o => !state.managed.some(m => m.enrollment.logical_id === o.logical_id && !!m.enrollment.is_simulated === !!o.is_simulated)); return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p><div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length ? `<div class="stack">${available.map(o => `<form class="panel device-row" data-enroll="${esc(o.id)}"><div><h3>${esc(o.advertised_name || o.device_name || 'Unnamed blind')}</h3><p class="subtle">${o.is_simulated ? 'Simulator · ' : ''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field">Display name<input name="label" maxlength="64" required value="${esc(o.advertised_name || o.device_name || 'Blind')}"></label></div><button class="button" ${o.freshness !== 'fresh' ? 'disabled' : ''}>Add blind</button></form>`).join('')}</div>` : `<div class="panel empty"><div class="empty-icon">⌁</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available ? 'Keep your blind nearby and refresh in a moment.' : 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${button('Refresh devices', 'refresh', 'secondary')}</div>`}`; }
-function detailPage(id) {
-    const d = state.managed.find(x => x.enrollment.id === id);
-    if (!d)
-        return `${back()}<div class="notice">This blind is no longer enrolled.</div>`;
-    const o = observationFor(d, state.observations);
-    const encodedId = encodeURIComponent(id);
+export function deviceDetailFields(device, observation, now = Date.now()) {
     const fields = [
-        { label: 'Availability', value: availability(d.availability)[0] },
-        { label: 'Position', contentMarkup: renderBlindStatus({ positionPercent: d.position?.current_closed_percent, movementStatus: o?.movement_status ?? 'unavailable', compact: true }) },
-        { label: 'Last observation', value: d.last_seen_at ? new Date(d.last_seen_at).toLocaleString() : 'Never' },
-        { label: 'Advertisement age', value: typeof d.advertisement_age_ms === 'number' && Number.isFinite(d.advertisement_age_ms) ? `${Math.floor(d.advertisement_age_ms / 1000)} seconds` : 'Unavailable' },
-        { label: 'Reported target', value: d.position ? `${d.position.target_closed_percent}% closed` : 'Unavailable' },
-        { label: 'Movement feedback', value: motionFeedbackLabel(d.motion_feedback) },
-        ...(typeof d.motion_feedback?.estimated_travel_rate_percent_per_second === 'number' && Number.isFinite(d.motion_feedback.estimated_travel_rate_percent_per_second) ? [{ label: 'Learned travel rate', value: `${d.motion_feedback.estimated_travel_rate_percent_per_second.toFixed(2)}% per second` }] : []),
-        { label: 'Signal', value: o?.rssi_dbm != null ? `${o.rssi_dbm} dBm` : 'Unavailable' },
-        { label: 'Battery voltage', value: o?.battery?.voltage_mv != null ? `${o.battery.voltage_mv} mV${o.battery.status !== 'observed' ? ' (cached)' : ''}` : 'Unavailable' },
-        { label: 'Source', value: d.enrollment.is_simulated ? 'Simulator' : 'Bluetooth' },
-        ...(d.enrollment.room ? [{ label: 'Room', value: d.enrollment.room }] : []),
-        ...(d.gatt_readiness ? [
-            { label: 'Last GATT command', value: gattReadinessLabel(d.gatt_readiness) },
-            { label: 'Transport evidence', value: gattTransportEvidenceLabel(d.gatt_readiness.transport_evidence) },
-            { label: 'Last command attempt', value: dateTimeLabel(d.gatt_readiness.last_attempt_at, 'Not attempted yet') },
-            { label: 'Last acknowledged GATT write', value: dateTimeLabel(d.gatt_readiness.last_write_acknowledged_at, 'None recorded') },
-            ...(d.gatt_readiness.cooldown_until && new Date(d.gatt_readiness.cooldown_until).getTime() > Date.now() ? [{ label: 'Movement cooldown until', value: dateTimeLabel(d.gatt_readiness.cooldown_until, 'None') }] : []),
-            { label: 'Latest failure', value: d.gatt_readiness.error_code ? `${d.gatt_readiness.error_code} · ${d.gatt_readiness.failure_stage || 'unknown phase'}` : 'None recorded' },
-        ] : []),
+        { label: 'Availability', value: availability(device.availability)[0] },
+        { label: 'Position', contentMarkup: renderBlindStatus({ positionPercent: device.position?.current_closed_percent, movementStatus: observation?.movement_status ?? 'unavailable', compact: true }) },
+        { label: 'Last observation', value: device.last_seen_at ? new Date(device.last_seen_at).toLocaleString() : 'Never' },
+        { label: 'Advertisement age', value: typeof device.advertisement_age_ms === 'number' && Number.isFinite(device.advertisement_age_ms) ? `${Math.floor(device.advertisement_age_ms / 1000)} seconds` : 'Unavailable' },
+        { label: 'Reported target', value: device.position ? `${device.position.target_closed_percent}% closed` : 'Unavailable' },
+        { label: 'Movement feedback', value: motionFeedbackLabel(device.motion_feedback) },
     ];
-    const confirmationMarkup = state.confirmingRemovalId === id
-        ? renderConfirmationPanel({
-            title: `Remove ${d.enrollment.label ?? 'Blind'}?`,
-            message: 'This removes the enrollment from Somaris. It does not reset or change the physical blind, and the blind can be added again when it is nearby. Removal is blocked while a command is queued or running.',
-            confirmLabel: 'Remove blind',
-            confirmAction: `remove-confirm:${encodedId}`,
-            cancelAction: `remove-cancel:${encodedId}`,
-            disabled: state.removingEnrollmentId === id,
-        })
-        : renderDestructiveButton({ label: 'Remove blind', action: `remove:${encodedId}` });
+    const travelRate = device.motion_feedback?.estimated_travel_rate_percent_per_second;
+    if (typeof travelRate === 'number' && Number.isFinite(travelRate)) {
+        fields.push({ label: 'Learned travel rate', value: `${travelRate.toFixed(2)}% per second` });
+    }
+    fields.push({ label: 'Signal', value: observation?.rssi_dbm != null ? `${observation.rssi_dbm} dBm` : 'Unavailable' }, { label: 'Battery voltage', value: observation?.battery?.voltage_mv != null ? `${observation.battery.voltage_mv} mV${observation.battery.status !== 'observed' ? ' (cached)' : ''}` : 'Unavailable' }, { label: 'Source', value: device.enrollment.is_simulated ? 'Simulator' : 'Bluetooth' });
+    if (device.enrollment.room)
+        fields.push({ label: 'Room', value: device.enrollment.room });
+    if (device.gatt_readiness)
+        fields.push(...gattDetailFields(device.gatt_readiness, now));
+    return fields;
+}
+function gattDetailFields(readiness, now) {
+    const fields = [
+        { label: 'Last GATT command', value: gattReadinessLabel(readiness) },
+        { label: 'Transport evidence', value: gattTransportEvidenceLabel(readiness.transport_evidence) },
+        { label: 'Last command attempt', value: dateTimeLabel(readiness.last_attempt_at, 'Not attempted yet') },
+        { label: 'Last acknowledged GATT write', value: dateTimeLabel(readiness.last_write_acknowledged_at, 'None recorded') },
+    ];
+    if (readiness.cooldown_until && new Date(readiness.cooldown_until).getTime() > now) {
+        fields.push({ label: 'Movement cooldown until', value: dateTimeLabel(readiness.cooldown_until, 'None') });
+    }
+    fields.push({ label: 'Latest failure', value: readiness.error_code ? `${readiness.error_code} · ${readiness.failure_stage || 'unknown phase'}` : 'None recorded' });
+    return fields;
+}
+function enrollmentConfirmation(id, device) {
+    const encodedId = encodeURIComponent(id);
+    if (state.confirmingRemovalId !== id) {
+        return renderDestructiveButton({ label: 'Remove blind', action: `remove:${encodedId}` });
+    }
+    return renderConfirmationPanel({
+        title: `Remove ${device.enrollment.label ?? 'Blind'}?`,
+        message: 'This removes the enrollment from Somaris. It does not reset or change the physical blind, and the blind can be added again when it is nearby. Removal is blocked while a command is queued or running.',
+        confirmLabel: 'Remove blind',
+        confirmAction: `remove-confirm:${encodedId}`,
+        cancelAction: `remove-cancel:${encodedId}`,
+        disabled: state.removingEnrollmentId === id,
+    });
+}
+function calibrationSection(id, device, busy) {
+    if (!device.capabilities?.calibrate_endpoints)
+        return '';
+    const warning = device.calibration_mode_active
+        ? '<p class="message warn" role="status">Calibration mode is active. Watch the blind while nudging it, then mark each endpoint.</p>'
+        : '';
+    return `<section class="panel device-settings"><h2>Endpoint calibration</h2><p>Calibration changes the blind’s stored open and closed limits. Stay with the blind while adjusting it. Use the small nudges to reach each endpoint, mark both limits, then end calibration.</p>${warning}${renderCalibrationControls({ deviceId: id, active: device.calibration_mode_active === true, busy })}</section>`;
+}
+function detailPage(id) {
+    const device = state.managed.find(item => item.enrollment.id === id);
+    if (!device)
+        return `${back()}<div class="notice">This blind is no longer enrolled.</div>`;
+    const observation = observationFor(device, state.observations);
     const busy = state.busy.has(id);
-    const motorSettings = d.capabilities?.set_motor_speed ? renderMotorSpeedControl({ deviceId: id, busy, calibrationActive: d.calibration_mode_active === true }) : '';
-    const calibrationSettings = d.capabilities?.calibrate_endpoints ? `<section class="panel device-settings"><h2>Endpoint calibration</h2><p>Calibration changes the blind’s stored open and closed limits. Stay with the blind while adjusting it. Use the small nudges to reach each endpoint, mark both limits, then end calibration.</p>${d.calibration_mode_active ? '<p class="message warn" role="status">Calibration mode is active. Watch the blind while nudging it, then mark each endpoint.</p>' : ''}${renderCalibrationControls({ deviceId: id, active: d.calibration_mode_active === true, busy })}</section>` : '';
-    return `${back()}<h1 class="page-title">${esc(d.enrollment.label ?? 'Blind')}</h1><p class="page-intro">The latest observations reported by your blind.</p>${renderInfoGrid(fields)}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>${motorSettings}${calibrationSettings}<section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${confirmationMarkup}</section>`;
+    const fields = renderInfoGrid(deviceDetailFields(device, observation));
+    const motorSettings = device.capabilities?.set_motor_speed
+        ? renderMotorSpeedControl({ deviceId: id, busy, calibrationActive: device.calibration_mode_active === true })
+        : '';
+    const calibration = calibrationSection(id, device, busy);
+    const enrollment = enrollmentConfirmation(id, device);
+    return `${back()}<h1 class="page-title">${esc(device.enrollment.label ?? 'Blind')}</h1><p class="page-intro">The latest observations reported by your blind.</p>${fields}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>${motorSettings}${calibration}<section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${enrollment}</section>`;
 }
 function simulatorControls() {
     if (!state.simulators?.length)
@@ -529,64 +615,122 @@ function simulatorControls() {
     }).join('');
     return `<section class="panel" style="margin-top:28px"><p class="eyebrow">Development</p><h2>Simulator controls</h2><p class="subtle">Settings and resets apply only to the selected simulator.</p>${instances}</section>`;
 }
-function servicePage() {
+function serviceStatusFields() {
     const scanner = state.diagnostics?.scanner;
-    const fields = [
-        { label: 'Service', value: state.serviceError ? 'Connection problem' : state.demoMode ? (state.diagnostics?.simulator_ready ? 'Demo ready · Simulated devices' : 'Simulator unavailable') : 'Connected' },
-        { label: 'Bluetooth adapter', value: state.demoMode ? 'Not used in demo' : scanner?.adapter_available ? 'Available' : 'Unavailable' },
-        { label: 'Scanner', value: state.demoMode ? 'Disabled in demo' : scanner?.status || 'Unavailable' },
-        { label: 'Advertisements seen', value: state.demoMode ? 'Not collected' : scanner?.soma_advertisements_seen ?? '—' },
-        { label: 'Last scanner error', value: state.demoMode ? 'Not applicable' : scanner?.last_error_code || 'None reported' },
+    return [
+        { label: 'Service', value: serviceConnectionLabel() },
+        { label: 'Bluetooth adapter', value: serviceBooleanLabel(state.demoMode, 'Not used in demo', scanner?.adapter_available, 'Available', 'Unavailable') },
+        { label: 'Scanner', value: serviceTextLabel(state.demoMode, 'Disabled in demo', scanner?.status, 'Unavailable') },
+        { label: 'Advertisements seen', value: serviceDataLabel(state.demoMode, 'Not collected', scanner?.soma_advertisements_seen, '—') },
+        { label: 'Last scanner error', value: serviceTextLabel(state.demoMode, 'Not applicable', scanner?.last_error_code, 'None reported') },
         { label: 'Telemetry history', value: state.diagnostics?.history_enabled ? 'Enabled' : 'Not enabled' },
         { label: 'Simulators', value: state.simulators?.length ?? 'Unavailable or disabled' },
     ];
-    return `${back()}<h1 class="page-title">Service status</h1><p class="page-intro">A closer look at the Somaris service and ${state.demoMode ? 'simulated devices. The Bluetooth scanner is disabled for this demo.' : 'Bluetooth scanner.'}</p>${renderInfoGrid(fields)}${state.demoMode ? '' : simulatorControls()}`;
+}
+function serviceBooleanLabel(demoMode, demoLabel, value, active, inactive) {
+    if (demoMode)
+        return demoLabel;
+    return value ? active : inactive;
+}
+function serviceTextLabel(demoMode, demoLabel, value, fallback) {
+    if (demoMode)
+        return demoLabel;
+    return value || fallback;
+}
+function serviceDataLabel(demoMode, demoLabel, value, fallback) {
+    if (demoMode)
+        return demoLabel;
+    return value ?? fallback;
+}
+function serviceConnectionLabel() {
+    if (state.serviceError)
+        return 'Connection problem';
+    if (!state.demoMode)
+        return 'Connected';
+    return state.diagnostics?.simulator_ready ? 'Demo ready · Simulated devices' : 'Simulator unavailable';
+}
+function servicePage() {
+    const intro = servicePageIntro();
+    const simulatorSection = simulatorControlsForMode();
+    return `${back()}<h1 class="page-title">Service status</h1><p class="page-intro">${intro}</p>${renderInfoGrid(serviceStatusFields())}${simulatorSection}`;
+}
+function servicePageIntro() {
+    if (state.demoMode)
+        return 'A closer look at the Somaris service and simulated devices. The Bluetooth scanner is disabled for this demo.';
+    return 'A closer look at the Somaris service and Bluetooth scanner.';
+}
+function simulatorControlsForMode() {
+    return state.demoMode ? '' : simulatorControls();
 }
 function demoBanner() {
     return `<section class="demo-banner" aria-label="Somaris demonstration"><div><p class="eyebrow">Somaris Demo</p><p>Explore a simulated smart home. Your changes only affect this demonstration.</p></div><button type="button" class="button secondary" data-action="demo-reset">Reset demo</button></section>`;
 }
 function page() { return location.hash.slice(1) || 'home'; }
-function render() {
-    if (!app)
+function pageContent(route) {
+    if (route === 'add')
+        return addPage();
+    if (route === 'service')
+        return servicePage();
+    if (route.startsWith('details/'))
+        return detailPage(decodeURIComponent(route.slice(8)));
+    return home();
+}
+function topbarStatus() {
+    const diagnostics = state.diagnostics;
+    if (state.serviceError)
+        return { serviceLabel: 'Disconnected', serviceTone: 'bad' };
+    if (!diagnostics)
+        return { serviceLabel: 'Connecting', serviceTone: '' };
+    if (diagnostics.demo_mode && diagnostics.simulator_ready) {
+        return { serviceLabel: 'Demo ready · Simulated devices', serviceTone: 'good' };
+    }
+    if (diagnostics.scanner?.adapter_available)
+        return { serviceLabel: 'Connected', serviceTone: 'good' };
+    return { serviceLabel: 'Service degraded', serviceTone: '' };
+}
+function updateTopbar() {
+    const topActions = document.querySelector('#top-actions');
+    if (!topActions)
         return;
     const activeElement = document.activeElement;
-    const focused = activeElement instanceof HTMLElement && app.contains(activeElement) ? activeElement.dataset.action ?? null : null;
-    const p = page();
-    const content = p === 'add' ? addPage() : p === 'service' ? servicePage() : p.startsWith('details/') ? detailPage(decodeURIComponent(p.slice(8))) : home();
-    app.innerHTML = `${state.demoMode ? demoBanner() : ''}${content}`;
-    const topActions = document.querySelector('#top-actions');
-    if (topActions) {
-        const activeElement = document.activeElement;
-        const active = activeElement instanceof HTMLElement && topActions.contains(activeElement) ? activeElement : null;
-        const focusId = active?.id || '';
-        const focusLabel = active?.getAttribute('aria-label') || '';
-        topActions.innerHTML = renderTopbarActions({
-            blindCount: state.managed.length,
-            panelMode: document.documentElement.dataset.displayMode === 'panel',
-            displayPreference,
-            serviceLabel: state.serviceError ? 'Disconnected' : !state.diagnostics ? 'Connecting' : state.diagnostics.demo_mode && state.diagnostics.simulator_ready ? 'Demo ready · Simulated devices' : state.diagnostics.scanner?.adapter_available ? 'Connected' : 'Service degraded',
-            serviceTone: state.serviceError ? 'bad' : state.diagnostics?.demo_mode && state.diagnostics.simulator_ready ? 'good' : state.diagnostics?.scanner?.adapter_available ? 'good' : '',
-        });
-        const replacement = focusId ? document.getElementById(focusId) : focusLabel ? [...topActions.querySelectorAll('[aria-label]')].find(el => el.getAttribute('aria-label') === focusLabel) : null;
-        replacement?.focus({ preventScroll: true });
-    }
-    const actionTargets = [...app.querySelectorAll('[data-action]')];
-    const focusAction = (action) => {
-        const target = actionTargets.find(el => el.dataset.action === action);
-        if (!target)
-            return false;
-        target.focus({ preventScroll: true });
-        return true;
-    };
+    const active = activeElement instanceof HTMLElement && topActions.contains(activeElement) ? activeElement : null;
+    const focusId = active?.id || '';
+    const focusLabel = active?.getAttribute('aria-label') || '';
+    topActions.innerHTML = renderTopbarActions({
+        blindCount: state.managed.length,
+        panelMode: document.documentElement.dataset.displayMode === 'panel',
+        displayPreference,
+        ...topbarStatus(),
+    });
+    const replacement = focusId ? document.getElementById(focusId)
+        : focusLabel ? [...topActions.querySelectorAll('[aria-label]')].find(el => el.getAttribute('aria-label') === focusLabel)
+            : null;
+    replacement?.focus({ preventScroll: true });
+}
+function restoreAppFocus(appRoot, focusedAction) {
+    const actionTargets = [...appRoot.querySelectorAll('[data-action]')];
     const preferredAction = resolveActionFocus({
-        focusedAction: focused,
+        focusedAction,
         pendingConfirmationId: state.pendingRemovalFocusId,
         confirmingRemovalId: state.confirmingRemovalId,
         availableActions: actionTargets.map(el => el.dataset.action ?? ''),
     });
     state.pendingRemovalFocusId = null;
-    if (preferredAction)
-        focusAction(preferredAction);
+    if (!preferredAction)
+        return;
+    actionTargets.find(element => element.dataset.action === preferredAction)?.focus({ preventScroll: true });
+}
+function render() {
+    if (!app)
+        return;
+    const activeElement = document.activeElement;
+    const focusedAction = activeElement instanceof HTMLElement && app.contains(activeElement)
+        ? activeElement.dataset.action ?? null
+        : null;
+    const content = pageContent(page());
+    app.innerHTML = `${state.demoMode ? demoBanner() : ''}${content}`;
+    updateTopbar();
+    restoreAppFocus(app, focusedAction);
 }
 export async function refreshService(target, request) {
     try {
@@ -643,7 +787,7 @@ function hasPostCommandFreshPosition(command, device) {
         && Number.isFinite(observedAt)
         && observedAt >= acceptedAt;
 }
-export function releaseReconciledCommandLocks(target) {
+function releaseReconciledCommandLocks(target) {
     const required = target.reconciliationRequired;
     if (!(required instanceof Set))
         return false;
@@ -920,12 +1064,155 @@ function closestHtmlElement(target, selector) {
 function containsRelatedTarget(element, target) {
     return target instanceof Node && element.contains(target);
 }
+export function parseActionValue(value) {
+    const [action = '', argument = '', id = ''] = value?.split(':') ?? [];
+    return [action, argument, id];
+}
 function isBlindAction(action) {
     return action !== undefined && [
         'open', 'close', 'stop', 'toggle', 'set_position', 'set_motor_speed',
         'calibration_start', 'calibration_nudge_open', 'calibration_set_open_limit',
         'calibration_nudge_closed', 'calibration_set_closed_limit', 'calibration_stop',
     ].includes(action);
+}
+function changeDisplayMode(applyDisplayMode) {
+    displayPreference = nextDisplayPreference(displayPreference);
+    try {
+        globalThis.localStorage?.setItem('somaris-display-mode', displayPreference);
+    }
+    catch { /* The current selection still applies until the page reloads. */ }
+    applyDisplayMode();
+    render();
+    const label = DISPLAY_MODE_OPTIONS.find(([value]) => value === displayPreference)?.[1] || 'Auto';
+    snackbarQueue.push({ message: `View changed to ${label}.`, tone: 'info' });
+}
+function handleBatchClick(argument) {
+    if (argument === 'check')
+        void retryBlindBatchCheck();
+    else if (argument === 'open' || argument === 'close')
+        void startBlindBatch(argument);
+    return true;
+}
+function handlePositionClick(argument) {
+    if (document.documentElement.dataset.displayMode === 'panel')
+        return false;
+    const input = app?.querySelector(`[data-position-input="${CSS.escape(argument)}"]`);
+    const position = Number(input?.value);
+    if (Number.isInteger(position) && position >= 0 && position <= 100)
+        void sendCommand(argument, 'set_position', position);
+    return true;
+}
+function handleRemovalClick(action, deviceId) {
+    if (action === 'remove') {
+        state.confirmingRemovalId = deviceId;
+        state.pendingRemovalFocusId = deviceId;
+        render();
+        return true;
+    }
+    if (action === 'remove-confirm') {
+        void confirmEnrollmentRemoval(deviceId);
+        return true;
+    }
+    if (action === 'remove-cancel' && state.removingEnrollmentId !== deviceId) {
+        state.confirmingRemovalId = null;
+        state.pendingRemovalFocusId = null;
+        render();
+    }
+    return true;
+}
+const clickActionHandlers = {
+    'snackbar-dismiss': (_argument, _id, deviceId) => { snackbarQueue.dismiss(deviceId); return true; },
+    'display-mode': (_argument, _id, _deviceId, applyDisplayMode) => { changeDisplayMode(applyDisplayMode); return true; },
+    command: (argument, id) => {
+        if (!id || !isBlindAction(argument))
+            return false;
+        void sendCommand(id, argument);
+        return true;
+    },
+    batch: argument => handleBatchClick(argument),
+    position: argument => handlePositionClick(argument),
+    details: argument => {
+        if (!argument)
+            return false;
+        location.hash = `details/${encodeURIComponent(argument)}`;
+        return true;
+    },
+    refresh: () => { void refresh(); return true; },
+    'sim-reset': argument => {
+        if (!argument)
+            return false;
+        void simulatorReset(argument);
+        return true;
+    },
+    'demo-reset': () => {
+        void resetDemo(state, api, () => refreshService(state, api), () => globalThis.confirm('Reset your demo? This restores all four blinds and clears this session’s activity.')).then(() => render());
+        return true;
+    },
+    remove: (_argument, _id, deviceId) => handleRemovalClick('remove', deviceId),
+    'remove-confirm': (_argument, _id, deviceId) => handleRemovalClick('remove-confirm', deviceId),
+    'remove-cancel': (_argument, _id, deviceId) => handleRemovalClick('remove-cancel', deviceId),
+};
+function dispatchClickAction(action, argument, id, applyDisplayMode) {
+    const deviceId = argument ? decodeURIComponent(argument) : '';
+    const handler = clickActionHandlers[action];
+    if (!handler || !handler(argument, id, deviceId, applyDisplayMode))
+        location.hash = action;
+}
+async function saveSimulatorSettings(form) {
+    const id = form.dataset.simulator;
+    if (!id)
+        return;
+    const values = Object.fromEntries(new FormData(form).entries());
+    try {
+        await api(`/api/dev/simulators/${encodeURIComponent(id)}/scenario`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(values) });
+        await refresh();
+        snackbarQueue.push({ message: 'Simulator settings saved.', tone: 'success' });
+    }
+    catch (error) {
+        snackbarQueue.push({ message: `Simulator settings could not be saved: ${errorMessage(error)}`, tone: 'error' });
+        render();
+    }
+}
+function submitMotorSpeed(form) {
+    const id = form.dataset.motorSpeed;
+    if (!id)
+        return;
+    const speed = Number(new FormData(form).get('motor_speed_percent'));
+    if (Number.isInteger(speed) && speed >= 0 && speed <= 100)
+        void sendCommand(id, 'set_motor_speed', undefined, speed);
+}
+async function submitEnrollmentForm(form) {
+    const button = form.querySelector('button');
+    if (button)
+        button.disabled = true;
+    const id = form.dataset.enroll;
+    const labelValue = new FormData(form).get('label');
+    const label = typeof labelValue === 'string' ? labelValue.trim() : '';
+    if (!id || !label)
+        return;
+    const added = await enrollBlind(state, api, () => refreshService(state, api), id, label);
+    if (added)
+        location.hash = 'home';
+    render();
+}
+async function handleFormSubmit(event) {
+    const form = event.target instanceof HTMLFormElement ? event.target : null;
+    if (!form)
+        return;
+    if (form.matches('[data-simulator]')) {
+        event.preventDefault();
+        await saveSimulatorSettings(form);
+        return;
+    }
+    if (form.matches('[data-motor-speed]')) {
+        event.preventDefault();
+        submitMotorSpeed(form);
+        return;
+    }
+    if (!form.matches('[data-enroll]'))
+        return;
+    event.preventDefault();
+    await submitEnrollmentForm(form);
 }
 if (app) {
     const actionRoot = document.querySelector('.app-shell');
@@ -945,62 +1232,8 @@ if (app) {
             const target = closestHtmlElement(event.target, '[data-action]');
             if (!target)
                 return;
-            const [action = '', arg = '', id = ''] = target.dataset.action?.split(':') ?? [];
-            const managedDeviceId = arg ? decodeURIComponent(arg) : '';
-            if (action === 'snackbar-dismiss') {
-                snackbarQueue.dismiss(managedDeviceId);
-                return;
-            }
-            if (action === 'display-mode') {
-                displayPreference = nextDisplayPreference(displayPreference);
-                try {
-                    globalThis.localStorage?.setItem('somaris-display-mode', displayPreference);
-                }
-                catch { /* The current selection still applies until the page reloads. */ }
-                applyDisplayMode();
-                render();
-                const label = DISPLAY_MODE_OPTIONS.find(([value]) => value === displayPreference)?.[1] || 'Auto';
-                snackbarQueue.push({ message: `View changed to ${label}.`, tone: 'info' });
-                return;
-            }
-            if (action === 'command' && id && isBlindAction(arg))
-                void sendCommand(id, arg);
-            else if (action === 'batch') {
-                if (arg === 'check')
-                    void retryBlindBatchCheck();
-                else if (arg === 'open' || arg === 'close')
-                    void startBlindBatch(arg);
-            }
-            else if (action === 'position' && document.documentElement.dataset.displayMode !== 'panel') {
-                const input = app.querySelector(`[data-position-input="${CSS.escape(arg)}"]`);
-                const position = Number(input?.value);
-                if (Number.isInteger(position) && position >= 0 && position <= 100)
-                    void sendCommand(arg, 'set_position', position);
-            }
-            else if (action === 'details' && arg)
-                location.hash = `details/${encodeURIComponent(arg)}`;
-            else if (action === 'refresh')
-                void refresh();
-            else if (action === 'sim-reset' && arg)
-                void simulatorReset(arg);
-            else if (action === 'demo-reset')
-                void resetDemo(state, api, () => refreshService(state, api), () => globalThis.confirm('Reset your demo? This restores all four blinds and clears this session’s activity.')).then(() => render());
-            else if (action === 'remove') {
-                state.confirmingRemovalId = managedDeviceId;
-                state.pendingRemovalFocusId = managedDeviceId;
-                render();
-            }
-            else if (action === 'remove-confirm')
-                void confirmEnrollmentRemoval(managedDeviceId);
-            else if (action === 'remove-cancel') {
-                if (state.removingEnrollmentId !== managedDeviceId) {
-                    state.confirmingRemovalId = null;
-                    state.pendingRemovalFocusId = null;
-                    render();
-                }
-            }
-            else
-                location.hash = action;
+            const [action, argument, id] = parseActionValue(target.dataset.action);
+            dispatchClickAction(action, argument, id, applyDisplayMode);
         });
         snackbarRoot?.addEventListener('pointerover', (event) => {
             const item = closestHtmlElement(event.target, '[data-snackbar-id]');
@@ -1033,53 +1266,7 @@ if (app) {
             if (output)
                 output.value = `${range.value}%`;
         });
-        app.addEventListener('submit', async (event) => {
-            const form = event.target instanceof HTMLFormElement ? event.target : null;
-            if (!form)
-                return;
-            if (form.matches('[data-simulator]')) {
-                event.preventDefault();
-                const id = form.dataset.simulator;
-                if (!id)
-                    return;
-                const values = Object.fromEntries(new FormData(form).entries());
-                try {
-                    await api(`/api/dev/simulators/${encodeURIComponent(id)}/scenario`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(values) });
-                    await refresh();
-                    snackbarQueue.push({ message: 'Simulator settings saved.', tone: 'success' });
-                }
-                catch (error) {
-                    snackbarQueue.push({ message: `Simulator settings could not be saved: ${errorMessage(error)}`, tone: 'error' });
-                    render();
-                }
-                return;
-            }
-            if (form.matches('[data-motor-speed]')) {
-                event.preventDefault();
-                const id = form.dataset.motorSpeed;
-                if (!id)
-                    return;
-                const speed = Number(new FormData(form).get('motor_speed_percent'));
-                if (Number.isInteger(speed) && speed >= 0 && speed <= 100)
-                    void sendCommand(id, 'set_motor_speed', undefined, speed);
-                return;
-            }
-            if (!form.matches('[data-enroll]'))
-                return;
-            event.preventDefault();
-            const button = form.querySelector('button');
-            if (button)
-                button.disabled = true;
-            const id = form.dataset.enroll;
-            const labelValue = new FormData(form).get('label');
-            const label = typeof labelValue === 'string' ? labelValue.trim() : '';
-            if (!id || !label)
-                return;
-            const added = await enrollBlind(state, api, () => refreshService(state, api), id, label);
-            if (added)
-                location.hash = 'home';
-            render();
-        });
+        app.addEventListener('submit', (event) => void handleFormSubmit(event));
         const initializeDashboard = async () => {
             try {
                 const mode = await api('/api/v1/demo');

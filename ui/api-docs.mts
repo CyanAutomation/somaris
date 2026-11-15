@@ -7,7 +7,7 @@ interface OpenApiOperation {
 
 type OpenApiPathItem = Partial<Record<HttpMethod, OpenApiOperation>>;
 
-export interface OpenApiDocument {
+interface OpenApiDocument {
   info: {title: string};
   paths: Record<string, OpenApiPathItem>;
 }
@@ -24,7 +24,7 @@ function isOperation(value: unknown): value is OpenApiOperation {
     && (value.description === undefined || typeof value.description === 'string');
 }
 
-export function parseOpenApiDocument(value: unknown): OpenApiDocument {
+function parseOpenApiDocument(value: unknown): OpenApiDocument {
   if (!isRecord(value) || !isRecord(value.info) || typeof value.info.title !== 'string' || !isRecord(value.paths)) {
     throw new Error('The OpenAPI document has an unexpected format.');
   }
