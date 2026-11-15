@@ -4740,13 +4740,15 @@ async fn queue_command(
     };
     match submit_command(
         &state,
-        &id,
-        request.action,
-        request.position_closed_percent,
-        request.motor_speed_percent,
-        request.expected_label.as_deref(),
-        key,
-        None,
+        CommandSubmission {
+            managed_device_id: &id,
+            action: request.action,
+            target_closed_percent: request.position_closed_percent,
+            motor_speed_percent: request.motor_speed_percent,
+            expected_label: request.expected_label.as_deref(),
+            key,
+            toggle: None,
+        },
     )
     .await
     {
@@ -4770,6 +4772,30 @@ async fn toggle_device(
     payload: Option<Json<ToggleRequest>>,
 ) -> Response {
     let expected_label = payload.and_then(|Json(request)| request.expected_label);
+    let Some(key) = idempotency_key(&headers) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "idempotency_key_required",
+            "Idempotency-Key must contain 1 to 128 characters.",
+        );
+    };
+    let idempotency_id = format!("command:{id}:{key}");
+    let existing = {
+        let inner = state.inner.lock().await;
+        if let Some(command_id) = inner.command_idempotency.get(&idempotency_id)
+            && let Some(command) = inner.commands.get(command_id)
+        {
+            Some(command.clone())
+        } else {
+            None
+        }
+    };
+    if let Some(command) = existing {
+        let command = command_snapshot(&state, &command.id)
+            .await
+            .unwrap_or(command);
+        return (StatusCode::ACCEPTED, Json(envelope(command, None))).into_response();
+    }
     if expected_label
         .as_deref()
         .is_some_and(|label| !valid_expected_label(label))
@@ -4799,30 +4825,6 @@ async fn toggle_device(
             .into_response();
         }
     }
-    let Some(key) = idempotency_key(&headers) else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "idempotency_key_required",
-            "Idempotency-Key must contain 1 to 128 characters.",
-        );
-    };
-    let idempotency_id = format!("command:{id}:{key}");
-    let existing = {
-        let inner = state.inner.lock().await;
-        if let Some(command_id) = inner.command_idempotency.get(&idempotency_id)
-            && let Some(command) = inner.commands.get(command_id)
-        {
-            Some(command.clone())
-        } else {
-            None
-        }
-    };
-    if let Some(command) = existing {
-        let command = command_snapshot(&state, &command.id)
-            .await
-            .unwrap_or(command);
-        return (StatusCode::ACCEPTED, Json(envelope(command, None))).into_response();
-    }
     let selected = {
         let inner = state.inner.lock().await;
         resolve_toggle(&inner, &id)
@@ -4833,13 +4835,15 @@ async fn toggle_device(
     };
     match submit_command(
         &state,
-        &id,
-        action,
-        None,
-        None,
-        expected_label.as_deref(),
-        key,
-        Some((basis, position, observed_at)),
+        CommandSubmission {
+            managed_device_id: &id,
+            action,
+            target_closed_percent: None,
+            motor_speed_percent: None,
+            expected_label: expected_label.as_deref(),
+            key,
+            toggle: Some((basis, position, observed_at)),
+        },
     )
     .await
     {
@@ -5296,31 +5300,30 @@ fn prune_batch_journal(inner: &mut Inner, retained_limit: usize) {
         .retain(|_, batch_id| retained.contains(batch_id));
 }
 
-async fn submit_command(
-    state: &AppState,
-    managed_device_id: &str,
+struct CommandSubmission<'a> {
+    managed_device_id: &'a str,
     action: Action,
     target_closed_percent: Option<u8>,
     motor_speed_percent: Option<u8>,
-    expected_label: Option<&str>,
+    expected_label: Option<&'a str>,
     key: String,
     toggle: Option<(String, ControlPosition, DateTime<Utc>)>,
+}
+
+async fn submit_command(
+    state: &AppState,
+    submission: CommandSubmission<'_>,
 ) -> Result<(Command, bool), ApiFailure> {
+    let CommandSubmission {
+        managed_device_id,
+        action,
+        target_closed_percent,
+        motor_speed_percent,
+        expected_label,
+        key,
+        toggle,
+    } = submission;
     let mut inner = state.inner.lock().await;
-    let Some(enrollment) = inner.enrollments.get(managed_device_id).cloned() else {
-        return Err(ApiFailure::new(
-            StatusCode::NOT_FOUND,
-            "enrollment_not_found",
-            "Managed-device enrollment was not found.",
-        ));
-    };
-    if expected_label.is_some_and(|expected| expected != enrollment.label) {
-        return Err(ApiFailure::new(
-            StatusCode::CONFLICT,
-            "device_label_mismatch",
-            "The managed-device label changed since the command target was selected. Refresh the device list and confirm the target.",
-        ));
-    }
     let key_id = format!("command:{managed_device_id}:{key}");
     if let Some(command_id) = inner.command_idempotency.get(&key_id)
         && let Some(command) = inner.commands.get(command_id)
@@ -5335,6 +5338,20 @@ async fn submit_command(
             StatusCode::CONFLICT,
             "idempotency_conflict",
             "Idempotency-Key was already used with a different action.",
+        ));
+    }
+    let Some(enrollment) = inner.enrollments.get(managed_device_id).cloned() else {
+        return Err(ApiFailure::new(
+            StatusCode::NOT_FOUND,
+            "enrollment_not_found",
+            "Managed-device enrollment was not found.",
+        ));
+    };
+    if expected_label.is_some_and(|expected| expected != enrollment.label) {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "device_label_mismatch",
+            "The managed-device label changed since the command target was selected. Refresh the device list and confirm the target.",
         ));
     }
     prune_journal(&mut inner, state.retained_command_limit);
