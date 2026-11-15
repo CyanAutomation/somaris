@@ -786,8 +786,23 @@ function notifyCommandResult(id: string, command: CommandRecord): void {
  if(['outcome_unknown','write_failed'].includes(command.status))notification.action={label:'Refresh position',action:'refresh'};
  snackbarQueue.push(notification);
 }
+export function buildCommandRequestBody(
+ device: ManagedDevice,
+ action: import('./types.mjs').BlindAction,
+ positionClosedPercent?: number,
+ motorSpeedPercent?: number,
+): Record<string, unknown> {
+ const expectedLabel=device.enrollment.label;
+ if(typeof expectedLabel!=='string'||!expectedLabel.trim()||expectedLabel.length>64)throw new Error('Refresh the device list before sending a command.');
+ const body:Record<string,unknown>={action,expected_label:expectedLabel};
+ if(action==='set_position')body.position_closed_percent=positionClosedPercent;
+ if(action==='set_motor_speed')body.motor_speed_percent=motorSpeedPercent;
+ return body;
+}
 async function sendCommand(id: string, action: import('./types.mjs').BlindAction, positionClosedPercent?: number, motorSpeedPercent?: number): Promise<void> {
  if((state.busy.has(id)||state.reconciliationRequired.has(id)||blindBatchIsLocked(state.batch)) && action!=='stop')return;
+ const target=state.managed.find(device=>device.enrollment.id===id);
+ if(!target?.enrollment.label){snackbarQueue.push({key:`command-target:${id}`,message:'Refresh the blind list before sending a command.',tone:'warning'});render();return;}
  const token=Symbol();
  state.busy.add(id);
  state.tokens[id]=token;
@@ -795,7 +810,7 @@ async function sendCommand(id: string, action: import('./types.mjs').BlindAction
  render();
  try{
   const key=globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const body=action==='set_position'?{action,position_closed_percent:positionClosedPercent}:action==='set_motor_speed'?{action,motor_speed_percent:motorSpeedPercent}:{action};
+  const body=buildCommandRequestBody(target,action,positionClosedPercent,motorSpeedPercent);
   const command=await api<CommandRecord>(`/api/control/v1/devices/${encodeURIComponent(id)}/commands`,{method:'POST',headers:{'Content-Type':'application/json','Idempotency-Key':key},body:JSON.stringify(body)});
   if(!command.id)throw new Error('The service returned a command without an ID.');
   if(state.tokens[id]!==token)return;
