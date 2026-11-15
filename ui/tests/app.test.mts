@@ -175,6 +175,13 @@ test('action data parsing preserves encoded identifiers and ignores extra segmen
  assert.deepEqual(parseActionValue('remove:blind-1:ignored'), ['remove','blind-1','ignored']);
 });
 
+test('command dispatch decodes the device ID before sending the command', async () => {
+ const {dispatchBlindCommand} = await import('../app.mjs');
+ const calls: Array<[string,string]> = [];
+ assert.equal(dispatchBlindCommand('open','blind%3Aleft',(id,action)=>calls.push([id,action])),true);
+ assert.deepEqual(calls,[['blind:left','open']]);
+});
+
 test('card notices retain full accessible details and escape regular-view text', async () => {
  const {cardMessageMarkup} = await import('../app.mjs');
  assert.equal(cardMessageMarkup(true,'','','','',''), '');

@@ -1075,6 +1075,12 @@ function isBlindAction(action) {
         'calibration_nudge_closed', 'calibration_set_closed_limit', 'calibration_stop',
     ].includes(action);
 }
+export function dispatchBlindCommand(action, encodedId, send = sendCommand) {
+    if (!encodedId || !isBlindAction(action))
+        return false;
+    void send(decodeURIComponent(encodedId), action);
+    return true;
+}
 function changeDisplayMode(applyDisplayMode) {
     displayPreference = nextDisplayPreference(displayPreference);
     try {
@@ -1123,12 +1129,7 @@ function handleRemovalClick(action, deviceId) {
 const clickActionHandlers = {
     'snackbar-dismiss': (_argument, _id, deviceId) => { snackbarQueue.dismiss(deviceId); return true; },
     'display-mode': (_argument, _id, _deviceId, applyDisplayMode) => { changeDisplayMode(applyDisplayMode); return true; },
-    command: (argument, id) => {
-        if (!id || !isBlindAction(argument))
-            return false;
-        void sendCommand(id, argument);
-        return true;
-    },
+    command: (argument, id) => dispatchBlindCommand(argument, id),
     batch: argument => handleBatchClick(argument),
     position: argument => handlePositionClick(argument),
     details: argument => {
