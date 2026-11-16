@@ -162,6 +162,10 @@ test('shared button primitive escapes user text and supports icon-only accessibl
   assert.equal(submit?.getAttribute('type'), 'submit');
   assert.equal(submit?.getAttribute('aria-label'), 'Add Bedroom Left');
   assert.equal(submit?.getAttribute('data-action'), null);
+
+  const unsafeType = 'button" onclick="alert(1)' as unknown as 'button';
+  const escapedType = parseMarkup(renderButton({label:'Unsafe type', type:unsafeType})).querySelector('button');
+  assert.equal(escapedType?.getAttribute('onclick'), null);
 });
 
 test('icon-only actions expose an accessible name and an actionable enabled state', () => {
