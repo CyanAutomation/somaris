@@ -1,4 +1,4 @@
-import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderMotorSpeedControl, renderCalibrationControls, movementStatusFromPositions, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
+import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderButton, renderIconButton, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderMotorSpeedControl, renderCalibrationControls, movementStatusFromPositions, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
 import { SnackbarQueue } from './snackbar.mjs';
 export { escapeHtml };
 const displayModes = new Set(DISPLAY_MODE_OPTIONS.map(([value]) => value));
@@ -156,9 +156,6 @@ async function api(path, options = {}, recoverExpiredSession = true) {
         throw error;
     }
     return envelope.data;
-}
-function button(label, action, extra = '', disabled = false, icon = null) {
-    return renderButton({ label, action, variant: extra, disabled, icon });
 }
 function notifyTarget(target, notification) {
     if (typeof target?.notify === 'function')
@@ -478,7 +475,7 @@ export function renderManagedDeviceCard(device, dashboard, panelMode, now = Date
         positionClosedPercent: targetPercent,
     });
     const messageMarkup = cardMessageMarkup(panelMode, message, msgTone, availabilityDetail, cooldownDetail, calibrationDetail);
-    const footerMarkup = `${batteryDisplay(o?.battery)}<button type="button" class="text-button" data-action="details:${esc(e.id)}">View details &nbsp; ↗</button>`;
+    const footerMarkup = `${batteryDisplay(o?.battery)}${renderIconLinkButton({ label: `View details for ${blindLabel}`, action: `details:${e.id}`, icon: 'info' })}`;
     return renderBlindCard({
         id: e.id, label: blindLabel, isSimulated: e.is_simulated, room: e.room, lastSeen: relativeAt(device.last_seen_at, now),
         availabilityLabel: label, availabilityTone: tone,
@@ -530,8 +527,8 @@ function home() {
 function scannerSummary() { const s = state.diagnostics?.scanner; if (state.demoMode)
     return state.diagnostics?.simulator_ready ? 'Demo ready · Simulated devices' : 'Demo simulator unavailable'; if (!s)
     return 'Service status unavailable'; return s.adapter_available ? (s.scan_active ? 'Bluetooth adapter available · scanning' : 'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
-function back() { return '<button class="text-button back" data-action="home">← &nbsp; Back to your blinds</button>'; }
-function addPage() { const available = state.observations.filter(o => !state.managed.some(m => m.enrollment.logical_id === o.logical_id && !!m.enrollment.is_simulated === !!o.is_simulated)); return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p><div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length ? `<div class="stack">${available.map(o => `<form class="panel device-row" data-enroll="${esc(o.id)}"><div><h3>${esc(o.advertised_name || o.device_name || 'Unnamed blind')}</h3><p class="subtle">${o.is_simulated ? 'Simulator · ' : ''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field">Display name<input name="label" maxlength="64" required value="${esc(o.advertised_name || o.device_name || 'Blind')}"></label></div><button class="button" ${o.freshness !== 'fresh' ? 'disabled' : ''}>Add blind</button></form>`).join('')}</div>` : `<div class="panel empty"><div class="empty-icon">⌁</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available ? 'Keep your blind nearby and refresh in a moment.' : 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${button('Refresh devices', 'refresh', 'secondary')}</div>`}`; }
+function back() { return `<div class="back-navigation">${renderIconLinkButton({ label: 'Back to your blinds', action: 'home', icon: 'back' })}</div>`; }
+function addPage() { const available = state.observations.filter(o => !state.managed.some(m => m.enrollment.logical_id === o.logical_id && !!m.enrollment.is_simulated === !!o.is_simulated)); return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p><div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length ? `<div class="stack">${available.map(o => { const deviceName = o.advertised_name || o.device_name || 'Unnamed blind'; return `<form class="panel device-row" data-enroll="${esc(o.id)}"><div><h3>${esc(deviceName)}</h3><p class="subtle">${o.is_simulated ? 'Simulator · ' : ''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field">Display name<input name="label" maxlength="64" required value="${esc(o.advertised_name || o.device_name || 'Blind')}"></label></div>${renderButton({ label: 'Add blind', accessibleLabel: `Add ${deviceName}`, title: `Add ${deviceName}`, type: 'submit', icon: 'add', iconOnly: true, variant: 'secondary', disabled: o.freshness !== 'fresh' })}</form>`; }).join('')}</div>` : `<div class="panel empty"><div class="empty-icon">⌁</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available ? 'Keep your blind nearby and refresh in a moment.' : 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${renderIconButton({ label: 'Refresh devices', action: 'refresh', icon: 'refresh', variant: 'secondary' })}</div>`}`; }
 export function deviceDetailFields(device, observation, now = Date.now()) {
     const fields = [
         { label: 'Availability', value: availability(device.availability)[0] },

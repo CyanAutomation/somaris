@@ -6,6 +6,10 @@
 .topbar-icon-button{display:grid;place-items:center;width:42px;min-width:42px;height:42px;min-height:42px;padding:0;border:1px solid var(--color-border);border-radius:50%;background:transparent;color:var(--color-text);flex:none}
 .topbar-icon-button:hover{background:var(--color-raised)}
 .topbar-icon-button .ui-icon{width:21px;height:21px}
+.button.icon-link-button{display:grid;place-items:center;width:36px;min-width:36px;height:36px;min-height:36px;padding:4px;border:0;border-radius:8px;background:transparent;color:#fcb36d}
+.button.icon-link-button:hover{background:var(--color-raised);color:var(--color-text)}
+.button.icon-link-button .ui-icon{width:21px;height:21px}
+.back-navigation .icon-link-button{margin-top:36px}
 .topbar-device-count{color:var(--color-muted);font-size:13px;font-weight:700;white-space:nowrap}
 .controls .button{display:flex;align-items:center;justify-content:center;gap:8px}
 .position-control{display:grid;grid-template-columns:1fr auto;align-items:center;gap:8px 12px;width:100%;margin-top:8px;padding-top:10px;border-top:1px solid var(--color-border)}
@@ -13,6 +17,8 @@
 .position-control output{font-variant-numeric:tabular-nums;color:var(--color-text);font-weight:600}
 .position-control input[type=range]{grid-column:1/-1;width:100%;accent-color:var(--color-accent)}
 .position-control .position-submit{grid-column:1/-1;justify-self:start}
+.position-control .position-submit.icon-action{display:grid;place-items:center;width:48px;min-width:48px;height:48px;min-height:48px;padding:12px}
+.position-control .position-submit.icon-action .ui-icon{width:22px;height:22px}
 .all-blinds-controls{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:14px 20px;margin:0 0 16px;padding:18px 20px;border:1px solid var(--color-border);border-radius:20px;background:var(--color-surface)}
 .all-blinds-copy h2{margin:0 0 5px;font-size:17px;letter-spacing:-.02em}
 .all-blinds-copy p{margin:0;color:var(--color-muted);font-size:13px;line-height:1.4}
