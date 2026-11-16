@@ -308,7 +308,7 @@ test('mobile cards and topbar fit at 360px and 390px with direct-position preset
       });
       assert.ok(layout.document <= layout.viewport);
       assert.ok(layout.topbarRight <= layout.viewport);
-      assert.ok(layout.actionsRight <= layout.shellContentRight);
+      assert.ok(layout.actionsRight <= layout.shellContentRight, `${width}px topbar actions end at ${layout.actionsRight}px, beyond shell content at ${layout.shellContentRight}px`);
       assert.ok(layout.presetsWidth > layout.cardWidth / 2);
       assert.ok(layout.heroDismissWidth <= 56);
       assert.ok(layout.demoResetWidth <= 56);
