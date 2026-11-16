@@ -15,6 +15,7 @@ import {
   renderDeviceCardHeader,
   renderButton,
   renderIconButton,
+  renderIconLinkButton,
   renderAddBlindButton,
   renderConfirmationPanel,
   renderDeviceList,
@@ -91,6 +92,10 @@ test('percentage-position control reflects the observed target and has an access
   assert.match(controls, /aria-label="Target position for Hallway in percent closed"/);
   assert.match(controls, /data-position-output="blind-1">47%/);
   assert.match(controls, /data-action="position:blind-1"/);
+  assert.match(controls, /data-action="position:blind-1"[^>]*aria-label="Move to selected position for Hallway"/);
+  assert.match(controls, /data-action="position:blind-1"[^>]*title="Move to selected position for Hallway"/);
+  assert.match(controls, /data-icon="target"/);
+  assert.doesNotMatch(controls, /<span class="button-label">Move to position<\/span>/);
 
   const disabled = renderBlindActions({
     deviceId:'blind-1', blindLabel:'Hallway', supportsPosition:true,
@@ -150,6 +155,17 @@ test('shared button primitive escapes user text and supports icon-only accessibl
   assert.match(markup, /data-action="command:open:&lt;id&gt;"/);
   assert.match(markup, /aria-hidden="true"/);
   assert.doesNotMatch(markup, /<span class="button-label">Open<\/span>/);
+
+  const submit = parseMarkup(renderButton({
+    label:'Add blind', accessibleLabel:'Add Bedroom Left', type:'submit', icon:'add', iconOnly:true,
+  })).querySelector('button');
+  assert.equal(submit?.getAttribute('type'), 'submit');
+  assert.equal(submit?.getAttribute('aria-label'), 'Add Bedroom Left');
+  assert.equal(submit?.getAttribute('data-action'), null);
+
+  const unsafeType = 'button" onclick="alert(1)' as unknown as 'button';
+  const escapedType = parseMarkup(renderButton({label:'Unsafe type', type:unsafeType})).querySelector('button');
+  assert.equal(escapedType?.getAttribute('onclick'), null);
 });
 
 test('icon-only actions expose an accessible name and an actionable enabled state', () => {
@@ -165,6 +181,19 @@ test('icon-only actions expose an accessible name and an actionable enabled stat
 
   const disabled = parseMarkup(renderIconButton({label:'Refresh', action:'refresh', icon:'refresh', disabled:true}));
   assert.notEqual(disabled.querySelector('button')?.getAttribute('disabled'), null);
+});
+
+test('icon link buttons keep a descriptive accessible name without visible label text', () => {
+  const root = parseMarkup(renderIconLinkButton({
+    label:'View details for Bedroom Left', action:'details:blind-1', icon:'info',
+  }));
+  const button = root.querySelector('button');
+  assert.equal(button?.getAttribute('aria-label'), 'View details for Bedroom Left');
+  assert.equal(button?.getAttribute('title'), 'View details for Bedroom Left');
+  assert.ok(button?.classList.contains('icon-link-button'));
+  assert.equal(button?.getAttribute('data-action'), 'details:blind-1');
+  assert.equal(button?.querySelector('svg')?.getAttribute('data-icon'), 'info');
+  assert.equal(button?.textContent, '');
 });
 
 test('confirmation panel exposes an escaped destructive choice with cancellation', () => {
@@ -298,6 +327,11 @@ test('all-blinds batch controls are reusable, accessible, and disabled while una
   assert.match(busy, /data-action="batch:open"[^>]*disabled/);
   const panelControls = parseMarkup(renderBatchControls({blindCount:3, eligibleCount:2, panelMode:true}));
   assert.equal(panelControls.querySelectorAll('.all-blinds-actions .panel-target').length, 2);
+  assert.deepEqual([...panelControls.querySelectorAll('.all-blinds-actions button')].map(button => button.textContent), ['', '']);
+  assert.deepEqual([...panelControls.querySelectorAll('.all-blinds-actions button')].map(button => button.getAttribute('title')),
+    ['Open all blinds', 'Close all blinds']);
+  const regularControls = parseMarkup(renderBatchControls({blindCount:3, eligibleCount:2}));
+  assert.deepEqual([...regularControls.querySelectorAll('.all-blinds-actions button')].map(button => button.textContent), ['Open all', 'Close all']);
   assert.match(renderBatchControls({blindCount:1, eligibleCount:1}), /the available blind/);
 
   const panelList = renderDeviceList({count:3, panelMode:true, toolbarMarkup:controls, cardsMarkup:'<article>Blind</article>'});
