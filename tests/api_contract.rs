@@ -1288,6 +1288,23 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
             .get("phase_timings")
             .is_some()
     );
+    let simulator_profile = &contract["components"]["schemas"]["SimulatorStatus"]["properties"]["wireless_profile"]
+        ["enum"];
+    assert!(
+        simulator_profile
+            .as_array()
+            .unwrap()
+            .contains(&json!("agentlab_realistic"))
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["SimulatorStatus"]["properties"]["connection_delay_ms"]["maximum"],
+        5_240
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["SimulatorStatus"]["properties"]["write_response_delay_ms"]
+            ["maximum"],
+        699
+    );
     let command_request = &contract["components"]["schemas"]["CommandRequest"];
     assert_eq!(
         command_request["properties"]["action"]["enum"],
