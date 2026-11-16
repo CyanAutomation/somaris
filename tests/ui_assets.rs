@@ -10,6 +10,12 @@ use tower::ServiceExt;
 async fn dashboard_and_assets_are_served_with_correct_content_types() {
     for (path, content_type, marker) in [
         ("/", "text/html", "rel=\"apple-touch-icon\""),
+        (
+            "/manifest.webmanifest",
+            "application/manifest+json",
+            "\"display\": \"standalone\"",
+        ),
+        ("/sw.js", "text/javascript", "precache-manifest"),
         ("/ui/app.mjs", "text/javascript", "resolveDisplayMode"),
         (
             "/ui/api-docs.mjs",
@@ -24,6 +30,9 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
         ("/ui/favicon.svg", "image/svg+xml", "#ff9638"),
         ("/ui/favicon-32x32.png", "image/png", "IHDR"),
         ("/ui/apple-touch-icon.png", "image/png", "IHDR"),
+        ("/ui/pwa-192.png", "image/png", "IHDR"),
+        ("/ui/pwa-512.png", "image/png", "IHDR"),
+        ("/ui/pwa-maskable-512.png", "image/png", "IHDR"),
     ] {
         let response = router(AppState::new())
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -42,6 +51,25 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
             "{path} did not contain expected marker {marker}"
         );
     }
+}
+
+#[tokio::test]
+async fn service_worker_is_allowed_to_control_the_root_scope_and_skips_api_responses() {
+    let response = router(AppState::new())
+        .oneshot(
+            Request::builder()
+                .uri("/sw.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["service-worker-allowed"], "/");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let worker = String::from_utf8_lossy(&body);
+    assert!(worker.contains("url.pathname.startsWith('/api/')"));
+    assert!(worker.contains("precache-manifest"));
 }
 
 #[tokio::test]

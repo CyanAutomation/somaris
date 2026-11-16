@@ -3,6 +3,7 @@ import {
   renderBlindActions,
   renderBlindCard,
   renderBlindStatus,
+  renderIcon,
   renderButton,
   renderIconButton,
   renderIconLinkButton,
@@ -18,6 +19,7 @@ import {
   renderMotorSpeedControl,
   renderCalibrationControls,
   movementStatusFromPositions,
+  renderMobileTabs,
   renderSnackbar,
   renderSnackbarRegion,
 } from './components.mjs';
@@ -133,13 +135,15 @@ export function observationFor(
   const matches = observations.filter(o => o.logical_id === e.logical_id && o.advertised_name === e.advertised_name && !!o.is_simulated === !!e.is_simulated);
   return matches.length === 1 ? matches[0] ?? null : null;
 }
-export function batteryDisplay(battery: ManagedDevice['battery']): string {
+export function batteryDisplay(battery: ManagedDevice['battery'], deviceId = 'blind'): string {
   const percentage = battery?.percent_estimate;
   if (!battery || typeof percentage !== 'number' || !Number.isInteger(percentage) || percentage < 0 || percentage > 100) return '<span class="subtle">Battery unavailable</span>';
   const cached = battery.status !== 'observed' ? ' · cached' : '';
   const voltageMv = battery.voltage_mv;
   const voltage = typeof voltageMv === 'number' && Number.isInteger(voltageMv) && voltageMv > 0 ? `Battery voltage: ${voltageMv} mV. ` : '';
-  return `<div class="battery-reading subtle">Battery ~${percentage}%${cached}<details class="battery-info"><summary aria-label="Battery information">i</summary><span class="battery-tooltip">${voltage}Percentage is an estimate based on voltage.</span></details></div>`;
+  const popoverId=`battery-info-${encodeURIComponent(deviceId)}`;
+  const trigger=renderIconButton({label:'Battery information',action:`battery-info:${encodeURIComponent(deviceId)}`,icon:'info',variant:'battery-info-button'}).replace('<button ',`<button aria-haspopup="dialog" aria-expanded="false" aria-controls="${esc(popoverId)}" `);
+  return `<div class="battery-reading subtle">Battery ~${percentage}%${cached}${trigger}<div class="battery-popover" id="${esc(popoverId)}" popover role="dialog" aria-label="Battery information">${voltage}Percentage is an estimate based on voltage.</div></div>`;
 }
 const terminal = new Set<CommandRecord['status']>(['write_acknowledged','connection_failed','write_failed','outcome_unknown','expired','cancelled','deferred']);
 const app = typeof document === 'undefined' ? null : document.querySelector<HTMLElement>('#app');
@@ -149,15 +153,33 @@ const snackbarQueue = new SnackbarQueue({onChange:items => renderSnackbars(items
 const state: DashboardState = {demoMode:false, managed:[], observations:[], diagnostics:null, activity:[], commands:{}, batch:null, serviceError:null, confirmingRemovalId:null, pendingRemovalFocusId:null, removingEnrollmentId:null, busy:new Set(), reconciliationRequired:new Set(), tokens:{}, simulators:null, notify:item=>snackbarQueue.push(item), dismissNotification:key=>snackbarQueue.dismissByKey(key)};
 let demoSessionRecovery: Promise<void> | null = null;
 let displayPreference = storedDisplayPreference();
+function storedPreference(key: string, fallback: string): string {
+ try { return globalThis.localStorage?.getItem(key) || fallback; } catch { return fallback; }
+}
+function storedFlag(key: string): boolean {
+ try { return globalThis.localStorage?.getItem(key) === 'true'; } catch { return false; }
+}
+let themePreference = storedPreference('somaris-theme','auto');
+let heroDismissed = storedFlag('somaris-hero-dismissed');
+let hintDismissed = storedFlag('somaris-demo-hint-dismissed');
+let activityCollapsedByUser: boolean | null = null;
+let positionInteraction = false;
+const positionStartValues = new Map<string,number>();
+let positionInteractionId: string | null = null;
+const lastPositionCommit = new Map<string,{value:number;at:number}>();
+let positionUndo: {id:string; previous:number; commandToken:symbol; expires:number} | null = null;
+let batchUndo: {id:string; previous:Map<string,number>; expires:number} | null = null;
+let lastRenderedRoute = typeof location === 'undefined' ? 'home' : location.hash.slice(1)||'home';
+const routeScrollPositions = new Map<string,number>();
 const esc = escapeHtml;
-function relativeAt(date: string | null | undefined, now: number): string {
- if(!date)return 'Never seen';
+export function relativeAt(date: string | null | undefined, now: number): string {
+ if(!date)return 'Never heard from';
  const seconds=Math.max(0,Math.floor((now-new Date(date).getTime())/1000));
  if(!Number.isFinite(seconds))return 'Time unavailable';
- if(seconds<60)return 'Seen just now';
- if(seconds<3600)return `Seen ${Math.floor(seconds/60)} min ago`;
- if(seconds<86400)return `Seen ${Math.floor(seconds/3600)} hr ago`;
- return `Seen ${Math.floor(seconds/86400)} days ago`;
+ if(seconds<60)return 'Last heard from just now';
+ if(seconds<3600)return `Last heard from ${Math.floor(seconds/60)} min ago`;
+ if(seconds<86400)return `Last heard from ${Math.floor(seconds/3600)} hr ago`;
+ return `Last heard from ${Math.floor(seconds/86400)} days ago`;
 }
 const relative = (date: string | null | undefined): string => relativeAt(date,Date.now());
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -243,11 +265,22 @@ renderSnackbars = (items: SnackbarItem[]): void => {
 };
 if(snackbarRoot) renderSnackbars(snackbarQueue.visibleItems);
 const availabilityLabels: Record<AvailabilityStatus, [string, VisualTone]> = {
- ready:['Observed recently',''], stale:['Stale','warn'], not_seen:['Not seen','warn'],
- ambiguous:['Ambiguous','bad'], unavailable:['Unavailable','warn'],
+ ready:['Online',''], stale:['Not responding','warn'], not_seen:['Not found','warn'],
+ ambiguous:['Needs attention','bad'], unavailable:['Unavailable','warn'],
 };
 export function availability(value: AvailabilityStatus | undefined): [string, VisualTone] {
  return value ? availabilityLabels[value] : availabilityLabels.unavailable;
+}
+
+export function shouldPauseRefresh({dragging = false, focusedTag = '', confirmationOpen = false}: {dragging?: boolean; focusedTag?: string; confirmationOpen?: boolean} = {}): boolean {
+ return dragging || confirmationOpen || ['INPUT','SELECT','TEXTAREA'].includes(focusedTag.toUpperCase());
+}
+
+export function validateDisplayName(value: string): string {
+ const label=value.trim();
+ if(!label)return 'Enter a name for this blind.';
+ if(label.length>64)return 'Use 64 characters or fewer.';
+ return '';
 }
 const terminalBatchStatuses = new Set(['completed', 'partial', 'failed', 'rejected']);
 function blindBatchIsLocked(batch: BatchState | null | undefined): boolean {
@@ -370,7 +403,7 @@ export async function submitBlindBatch(
    const notification=batchResultNotification(batch);
    if(notification)notifyTarget(target,notification);
   } else {
-   notifyTarget(target,{key:`batch:${batch.id||batch.idempotencyKey}:unknown`,message:`The ${action} batch result is unknown. Check its status before starting another batch.`,tone:'warning',action:{label:'Check status',action:'batch:check'}});
+   notifyTarget(target,{key:`batch:${batch.id||batch.idempotencyKey}:unknown`,message:`The ${action} batch result is unknown. Check its status before starting another batch.`,tone:'warning',action:{label:'Check status',action:'batch:check',icon:'refresh'}});
   }
   onChange();
   return false;
@@ -396,7 +429,7 @@ export async function checkBlindBatch(
   if(target.batch!==batch) return false;
   batch.status='outcome_unknown';
   batch.error=errorMessage(error);
-  if(previousStatus!=='outcome_unknown')notifyTarget(target,{key:`batch:${batch.id||batch.idempotencyKey}:unknown`,message:`The ${batch.action} batch result is unknown. Check its status before starting another batch.`,tone:'warning',action:{label:'Check status',action:'batch:check'}});
+  if(previousStatus!=='outcome_unknown')notifyTarget(target,{key:`batch:${batch.id||batch.idempotencyKey}:unknown`,message:`The ${batch.action} batch result is unknown. Check its status before starting another batch.`,tone:'warning',action:{label:'Check status',action:'batch:check',icon:'refresh'}});
   onChange();
   return false;
  }
@@ -519,8 +552,8 @@ export function renderManagedDeviceCard(
  const cooldownDetail=cardCooldownDetail(cooldownUntil,now);
  const [message,msgTone]=cardCommandMessage(dashboard.commands[e.id]);
  const targetPercent=device.position?.target_closed_percent ?? p ?? 100;
- const lines=typeof p === 'number' && Number.isInteger(p) ? Math.max(1, Math.round(p/100*11)) : 0;
- const disabled=!!dashboard.serviceError||device.availability!=='ready';
+ const lines=typeof p === 'number' && Number.isInteger(p) ? 11 : 0;
+ const disabled=!!dashboard.serviceError||globalThis.navigator?.onLine===false||device.availability!=='ready';
  const availabilityDetail=cardAvailabilityDetail(device);
  const calibrationDetail=cardCalibrationDetail(device);
  const controlsMarkup=renderBlindActions({
@@ -531,14 +564,32 @@ export function renderManagedDeviceCard(
   supportsPosition:device.capabilities?.set_position === true,
   positionClosedPercent:targetPercent,
  });
- const messageMarkup=cardMessageMarkup(panelMode,message,msgTone,availabilityDetail,cooldownDetail,calibrationDetail);
- const footerMarkup=`${batteryDisplay(o?.battery)}${renderIconLinkButton({label:`View details for ${blindLabel}`,action:`details:${e.id}`,icon:'info'})}`;
+ let messageMarkup=cardMessageMarkup(panelMode,message,msgTone,availabilityDetail,cooldownDetail,calibrationDetail);
+ const footerMarkup=`${batteryDisplay(o?.battery,e.id)}${renderIconLinkButton({label:`View details for ${blindLabel}`,action:`details:${e.id}`,icon:'info'})}`;
+ const feedback=device.motion_feedback?.status;
+ const progressStatus=dashboard.commands[e.id]?.status;
+ let progressCopy='';
+ let progressIcon='spinner';
+ let progressPercent=28;
+ let progressTone='';
+ if(progressStatus==='queued'){progressCopy='Command queued. Waiting for the blind.';progressPercent=20;}
+ else if(progressStatus==='connecting'){progressCopy='Sending command to the blind.';progressPercent=55;}
+ else if(progressStatus==='write_acknowledged'){progressCopy='Command acknowledged. Movement is shown when reported by the blind.';progressIcon='check';progressPercent=70;}
+ else if(['outcome_unknown','write_failed'].includes(progressStatus||'')){progressCopy=commandMessage(dashboard.commands[e.id]!)[0];progressIcon='warning';progressTone='warn';progressPercent=38;}
+ else if(feedback==='awaiting_progress'){progressCopy=motionFeedbackLabel(device.motion_feedback);progressPercent=35;}
+ else if(feedback==='progress_observed'){progressCopy=motionFeedbackLabel(device.motion_feedback);progressIcon='check';progressPercent=72;}
+ else if(feedback==='stalled'){progressCopy=motionFeedbackLabel(device.motion_feedback);progressIcon='warning';progressTone='warn';progressPercent=48;}
+ else if(feedback==='target_reached'){progressCopy=motionFeedbackLabel(device.motion_feedback);progressIcon='check';progressPercent=100;}
+ const progressMarkup=progressCopy?`<div class="command-progress command-progress--${progressTone||'active'}" data-command-progress="${esc(e.id)}" role="status" aria-label="${esc(progressCopy)}" title="${esc(progressCopy)}"><span class="command-progress__icon" role="img" aria-label="${esc(progressCopy)}">${renderIcon(progressIcon)}</span><span class="command-progress__track" aria-hidden="true"><i style="--progress:${progressPercent}%"></i></span><span class="sr-only" aria-live="polite">${esc(progressCopy)}</span></div>`:'';
+ if(progressCopy&&!panelMode)messageMarkup=regularCardMessageMarkup('',msgTone,availabilityDetail,cooldownDetail,calibrationDetail);
  return renderBlindCard({
   id:e.id, label:blindLabel, isSimulated:e.is_simulated, room:e.room, lastSeen:relativeAt(device.last_seen_at,now),
   availabilityLabel:label, availabilityTone:tone,
   availabilityStatus:device.availability,
   positionPercent:p, movementStatus:o?.movement_status ?? 'unavailable', blindLines:lines,
   controlsMarkup, messageMarkup, footerMarkup, panelMode,
+  supportsPosition:device.capabilities?.set_position===true,
+  progressMarkup,
  });
 }
 function card(device: ManagedDevice): string {
@@ -553,38 +604,51 @@ function activityPanel() {
    return `<li class="activity-item"><span class="activity-copy">${esc(activityMessage(entry))}${entry.detail&&entry.kind!=='simulator_settings_changed'&&entry.kind!=='simulator_reset'?`<span class="subtle">${esc(entry.detail)}</span>`:''}</span><time datetime="${esc(occurredAt ?? '')}">${esc(occurredLabel)}</time></li>`;
   }).join('')}</ol>`
   : '<div class="panel activity-empty"><p>No changes recorded yet.</p></div>';
- return `<section class="activity-section"><div class="section-heading"><h2>Recent activity</h2><span class="count">${entries.length} of 30 changes</span></div>${list}</section>`;
+ const expanded=activityCollapsedByUser??document.documentElement.dataset.displayMode!=='mobile';
+ const collapsed=!expanded;
+ return `<section class="activity-section" id="activity"><div class="section-heading"><h2>Recent activity</h2><div class="activity-actions"><span class="count">${entries.length} of 30 changes</span>${renderButton({label:'Toggle recent activity',accessibleLabel:'Toggle recent activity',title:'Toggle recent activity',action:'activity-toggle',icon:'chevron',iconOnly:true,variant:`activity-toggle${collapsed?' is-collapsed':''}`}).replace(' aria-label=',` aria-expanded="${!collapsed}" aria-controls="activity-list" aria-label=`)}</div></div><div id="activity-list"${collapsed?' hidden':''}>${list}</div></section>`;
 }
 function home() {
  const panelMode = document.documentElement.dataset.displayMode === 'panel';
- const hero = panelMode ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>${state.demoMode?'Explore a simulated home.':'Your space, your way.'}</h1><p>${state.demoMode?'Control four simulated blinds. Your changes only affect this demonstration.':'A quieter way to keep your blinds just where you like them.'}</p></div></section>`;
+ const hero = panelMode || heroDismissed ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${renderIconButton({label:'Dismiss introduction',action:'hero-dismiss',icon:'close_small',variant:'hero-dismiss'})}</section>`;
  const empty = panelMode
   ? `<div class="panel empty"><h3>No blinds yet</h3><p>Add a nearby blind to see its status and controls here.</p></div>`
-  : `<div class="panel empty"><div class="empty-icon">☼</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p></div>`;
+  : `<div class="panel empty"><div class="empty-icon empty-illustration">${renderIcon('home')}</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p>${renderIconButton({label:'Add a blind',action:'add',icon:'add'})}</div>`;
  const batchControls=renderBatchControls({
   blindCount:state.managed.length,
   eligibleCount:batchEligibleCount(state.managed),
-  disabled:!!state.serviceError||state.busy.size>0,
+  disabled:!!state.serviceError||globalThis.navigator?.onLine===false||state.busy.size>0,
   busy:blindBatchIsLocked(state.batch),
   panelMode,
   batch:state.batch,
  });
+ const loadingError=state.serviceError&&!state.managed.length?`<div class="panel error-state" role="alert"><span class="error-state__icon" role="img" aria-label="Connection problem">${renderIcon('warning')}</span><h3>Somaris is disconnected</h3><p>${esc(globalThis.navigator?.onLine===false?'You are offline. Reconnect and try again.':'Could not load your blinds. Check the connection and try again.')}</p>${renderIconButton({label:'Retry loading blinds',action:'refresh',icon:'refresh',variant:'secondary'})}</div>`:'';
  const listMarkup=renderDeviceList({
   count:state.managed.length, panelMode,
-  cardsMarkup:state.managed.map(card).join(''), emptyMarkup:empty, toolbarMarkup:batchControls,
+  cardsMarkup:state.managed.map(card).join(''), emptyMarkup:loadingError||empty, toolbarMarkup:batchControls,
+  groupsMarkup:!panelMode&&state.managed.some(device=>device.enrollment.room)?[...new Set(state.managed.map(device=>device.enrollment.room||'Other'))].map(room=>`<section class="room-group"><h3 class="room-heading">${esc(room)}</h3><div class="grid">${state.managed.filter(device=>(device.enrollment.room||'Other')===room).map(card).join('')}</div></section>`).join(''):'' ,
  });
- const serviceMarkup=`<div class="section-heading" style="margin-top:35px"><h2>Somaris service</h2><button type="button" class="text-button" data-action="service">View service status &nbsp; ↗</button></div><p class="subtle">${esc(scannerSummary())}</p>`;
+ const serviceMarkup=`<div class="section-heading service-summary"><h2>Somaris service</h2>${renderIconButton({label:'View service status',action:'service',icon:'service'})}</div><p class="subtle">${esc(scannerSummary())}</p>`;
+ const demoHint=state.demoMode&&!hintDismissed&&!panelMode?`<aside class="demo-hint"><span>${renderIcon('open')}${renderIcon('stop')}${renderIcon('close')} Try the blind controls to explore the demo.</span>${renderIconButton({label:'Dismiss demo hint',action:'demo-hint-dismiss',icon:'close_small'})}</aside>`:'';
  const supportingSections=renderHomeSupportingSections({
   panelMode,
   activityMarkup:panelMode?'':activityPanel(),
   serviceMarkup:panelMode?'':serviceMarkup,
  });
- return `${hero}${listMarkup}${supportingSections}`;
+ return `${hero}${demoHint}${listMarkup}${supportingSections}`;
 }
 function scannerSummary(){ const s=state.diagnostics?.scanner; if(state.demoMode)return state.diagnostics?.simulator_ready?'Demo ready · Simulated devices':'Demo simulator unavailable'; if(!s) return 'Service status unavailable'; return s.adapter_available ? (s.scan_active?'Bluetooth adapter available · scanning':'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
 function back(){ return `<div class="back-navigation">${renderIconLinkButton({label:'Back to your blinds',action:'home',icon:'back'})}</div>`; }
-function addPage(){ const available=state.observations.filter(o=>!state.managed.some(m=>m.enrollment.logical_id===o.logical_id && !!m.enrollment.is_simulated===!!o.is_simulated)); return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p><div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length?`<div class="stack">${available.map(o=>{const deviceName=o.advertised_name||o.device_name||'Unnamed blind';return `<form class="panel device-row" data-enroll="${esc(o.id)}"><div><h3>${esc(deviceName)}</h3><p class="subtle">${o.is_simulated?'Simulator · ':''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field">Display name<input name="label" maxlength="64" required value="${esc(o.advertised_name||o.device_name||'Blind')}"></label></div>${renderButton({label:'Add blind',accessibleLabel:`Add ${deviceName}`,title:`Add ${deviceName}`,type:'submit',icon:'add',iconOnly:true,variant:'secondary',disabled:o.freshness!=='fresh'})}</form>`;}).join('')}</div>`:`<div class="panel empty"><div class="empty-icon">⌁</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available?'Keep your blind nearby and refresh in a moment.': 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${renderIconButton({label:'Refresh devices',action:'refresh',icon:'refresh',variant:'secondary'})}</div>`}`; }
-export interface DeviceDetailField {label: string; value?: string | number | null; contentMarkup?: string}
+function addPage(){
+ const available=state.observations.filter(o=>!state.managed.some(m=>m.enrollment.logical_id===o.logical_id && !!m.enrollment.is_simulated===!!o.is_simulated));
+ return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p><div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length?`<div class="stack">${available.map(o=>{
+  const deviceName=o.advertised_name||o.device_name||'Unnamed blind';
+  const fieldId=`display-name-${encodeURIComponent(o.id)}`;
+  const errorId=`${fieldId}-error`;
+  return `<form class="panel device-row" data-enroll="${esc(o.id)}" novalidate><div><h3>${esc(deviceName)}</h3><p class="subtle">${o.is_simulated?'Simulator · ':''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field" for="${esc(fieldId)}">Display name<input id="${esc(fieldId)}" name="label" maxlength="64" required value="${esc(o.advertised_name||o.device_name||'Blind')}" aria-describedby="${esc(errorId)}" aria-invalid="false" data-display-name><span class="field-error" id="${esc(errorId)}" hidden role="alert"></span></label></div>${renderButton({label:'Add blind',accessibleLabel:`Add ${deviceName}`,title:`Add ${deviceName}`,type:'submit',icon:'add',iconOnly:true,variant:'secondary',disabled:o.freshness!=='fresh'})}</form>`;
+ }).join('')}</div>`:`<div class="panel empty"><div class="empty-icon empty-illustration">${renderIcon('home')}</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available?'Keep your blind nearby and refresh in a moment.': 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${renderIconButton({label:'Refresh devices',action:'refresh',icon:'refresh',variant:'secondary'})}</div>`}`;
+}
+export interface DeviceDetailField {label: string; value?: string | number | null; contentMarkup?: string; advanced?: boolean}
 
 export function deviceDetailFields(
  device: ManagedDevice,
@@ -594,18 +658,19 @@ export function deviceDetailFields(
  const fields: DeviceDetailField[] = [
   {label:'Availability',value:availability(device.availability)[0]},
   {label:'Position',contentMarkup:renderBlindStatus({positionPercent:device.position?.current_closed_percent,movementStatus:observation?.movement_status ?? 'unavailable',compact:true})},
-  {label:'Last observation',value:device.last_seen_at?new Date(device.last_seen_at).toLocaleString():'Never'},
-  {label:'Advertisement age',value:typeof device.advertisement_age_ms === 'number' && Number.isFinite(device.advertisement_age_ms)?`${Math.floor(device.advertisement_age_ms/1000)} seconds`:'Unavailable'},
-  {label:'Reported target',value:device.position?`${device.position.target_closed_percent}% closed`:'Unavailable'},
-  {label:'Movement feedback',value:motionFeedbackLabel(device.motion_feedback)},
+  {label:'Last heard from',value:device.last_seen_at?new Date(device.last_seen_at).toLocaleString():'Never'},
+  {label:'Advertisement age',value:typeof device.advertisement_age_ms === 'number' && Number.isFinite(device.advertisement_age_ms)?`${Math.floor(device.advertisement_age_ms/1000)} seconds`:'Unavailable',advanced:true},
+  {label:'Reported target',value:device.position?`${device.position.target_closed_percent}% closed`:'Unavailable',advanced:true},
+  {label:'Movement feedback',value:motionFeedbackLabel(device.motion_feedback),advanced:true},
  ];
  const travelRate=device.motion_feedback?.estimated_travel_rate_percent_per_second;
  if(typeof travelRate === 'number' && Number.isFinite(travelRate)) {
-  fields.push({label:'Learned travel rate',value:`${travelRate.toFixed(2)}% per second`});
+  fields.push({label:'Learned travel rate',value:`${travelRate.toFixed(2)}% per second`,advanced:true});
  }
  fields.push(
-  {label:'Signal',value:observation?.rssi_dbm!=null?`${observation.rssi_dbm} dBm`:'Unavailable'},
-  {label:'Battery voltage',value:observation?.battery?.voltage_mv!=null?`${observation.battery.voltage_mv} mV${observation.battery.status!=='observed'?' (cached)':''}`:'Unavailable'},
+  {label:'Signal strength',value:observation?.rssi_dbm!=null?`${observation.rssi_dbm} dBm`:'Unavailable'},
+  {label:'Battery',value:observation?.battery?.percent_estimate!=null?`~${observation.battery.percent_estimate}%${observation.battery.status!=='observed'?' (cached)':''}`:'Unavailable'},
+  {label:'Battery voltage',value:observation?.battery?.voltage_mv!=null?`${observation.battery.voltage_mv} mV${observation.battery.status!=='observed'?' (cached)':''}`:'Unavailable',advanced:true},
   {label:'Source',value:device.enrollment.is_simulated?'Simulator':'Bluetooth'},
  );
  if(device.enrollment.room)fields.push({label:'Room',value:device.enrollment.room});
@@ -615,15 +680,15 @@ export function deviceDetailFields(
 
 function gattDetailFields(readiness: GattReadiness, now: number): DeviceDetailField[] {
  const fields: DeviceDetailField[] = [
-  {label:'Last GATT command',value:gattReadinessLabel(readiness)},
-  {label:'Transport evidence',value:gattTransportEvidenceLabel(readiness.transport_evidence)},
-  {label:'Last command attempt',value:dateTimeLabel(readiness.last_attempt_at,'Not attempted yet')},
-  {label:'Last acknowledged GATT write',value:dateTimeLabel(readiness.last_write_acknowledged_at,'None recorded')},
+  {label:'Last GATT command',value:gattReadinessLabel(readiness),advanced:true},
+  {label:'Transport evidence',value:gattTransportEvidenceLabel(readiness.transport_evidence),advanced:true},
+  {label:'Last command attempt',value:dateTimeLabel(readiness.last_attempt_at,'Not attempted yet'),advanced:true},
+  {label:'Last acknowledged GATT write',value:dateTimeLabel(readiness.last_write_acknowledged_at,'None recorded'),advanced:true},
  ];
  if(readiness.cooldown_until && new Date(readiness.cooldown_until).getTime()>now) {
-  fields.push({label:'Movement cooldown until',value:dateTimeLabel(readiness.cooldown_until,'None')});
+  fields.push({label:'Movement cooldown until',value:dateTimeLabel(readiness.cooldown_until,'None'),advanced:true});
  }
- fields.push({label:'Latest failure',value:readiness.error_code?`${readiness.error_code} · ${readiness.failure_stage||'unknown phase'}`:'None recorded'});
+ fields.push({label:'Latest failure',value:readiness.error_code?`${readiness.error_code} · ${readiness.failure_stage||'unknown phase'}`:'None recorded',advanced:true});
  return fields;
 }
 
@@ -655,13 +720,16 @@ function detailPage(id: string): string {
  if(!device)return `${back()}<div class="notice">This blind is no longer enrolled.</div>`;
  const observation=observationFor(device,state.observations);
  const busy=state.busy.has(id);
- const fields=renderInfoGrid(deviceDetailFields(device,observation));
+ const detailFields=deviceDetailFields(device,observation);
+ const fields=renderInfoGrid(detailFields.filter(field=>!field.advanced));
+ const advancedFields=detailFields.filter(field=>field.advanced);
+ const advanced=advancedFields.length?`<details class="advanced-disclosure"><summary aria-label="Advanced device diagnostics" title="Advanced device diagnostics">${renderIcon('info')}</summary><h2>Advanced diagnostics</h2>${renderInfoGrid(advancedFields)}</details>`:'';
  const motorSettings=device.capabilities?.set_motor_speed
   ? renderMotorSpeedControl({deviceId:id,busy,calibrationActive:device.calibration_mode_active===true})
   : '';
  const calibration=calibrationSection(id,device,busy);
  const enrollment=enrollmentConfirmation(id,device);
- return `${back()}<h1 class="page-title">${esc(device.enrollment.label ?? 'Blind')}</h1><p class="page-intro">The latest observations reported by your blind.</p>${fields}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>${motorSettings}${calibration}<section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${enrollment}</section>`;
+ return `${back()}<h1 class="page-title">${esc(device.enrollment.label ?? 'Blind')}</h1><p class="page-intro">The latest observations reported by your blind.</p>${fields}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>${advanced}${motorSettings}${calibration}<section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${enrollment}</section>`;
 }
 function simulatorControls(): string {
  if(!state.simulators?.length)return '';
@@ -719,7 +787,7 @@ function simulatorControlsForMode(): string {
  return state.demoMode?'':simulatorControls();
 }
 function demoBanner(): string {
- return `<section class="demo-banner" aria-label="Somaris demonstration"><div><p class="eyebrow">Somaris Demo</p><p>Explore a simulated smart home. Your changes only affect this demonstration.</p></div><button type="button" class="button secondary" data-action="demo-reset">Reset demo</button></section>`;
+ return `<section class="demo-banner" aria-label="Somaris demonstration"><div><p class="eyebrow">Somaris Demo</p><p>Explore a simulated smart home. Your changes only affect this demonstration.</p></div>${renderIconButton({label:'Reset demo',action:'demo-reset',icon:'reset',variant:'secondary'})}</section>`;
 }
 function page(): string {return location.hash.slice(1)||'home'}
 function pageContent(route: string): string {
@@ -730,6 +798,7 @@ function pageContent(route: string): string {
 }
 function topbarStatus(): {serviceLabel: string; serviceTone: VisualTone} {
  const diagnostics=state.diagnostics;
+ if(globalThis.navigator?.onLine===false)return {serviceLabel:'Disconnected',serviceTone:'bad'};
  if(state.serviceError)return {serviceLabel:'Disconnected',serviceTone:'bad'};
  if(!diagnostics)return {serviceLabel:'Connecting',serviceTone:''};
  if(diagnostics.demo_mode && diagnostics.simulator_ready) {
@@ -741,16 +810,21 @@ function topbarStatus(): {serviceLabel: string; serviceTone: VisualTone} {
 function updateTopbar(): void {
  const topActions=document.querySelector<HTMLElement>('#top-actions');
  if(!topActions)return;
+ const markup=renderTopbarActions({
+  blindCount:state.managed.length,
+  panelMode:document.documentElement.dataset.displayMode==='panel',
+  demoMode:state.demoMode,
+  displayPreference,
+  themePreference,
+  route:page(),
+  ...topbarStatus(),
+ });
+ if(topActions.innerHTML===markup)return;
  const activeElement=document.activeElement;
  const active=activeElement instanceof HTMLElement && topActions.contains(activeElement) ? activeElement : null;
  const focusId=active?.id || '';
  const focusLabel=active?.getAttribute('aria-label') || '';
- topActions.innerHTML=renderTopbarActions({
-  blindCount:state.managed.length,
-  panelMode:document.documentElement.dataset.displayMode==='panel',
-  displayPreference,
-  ...topbarStatus(),
- });
+ topActions.innerHTML=markup;
  const replacement=focusId ? document.getElementById(focusId)
   : focusLabel ? [...topActions.querySelectorAll<HTMLElement>('[aria-label]')].find(el=>el.getAttribute('aria-label')===focusLabel)
    : null;
@@ -770,14 +844,29 @@ function restoreAppFocus(appRoot: HTMLElement, focusedAction: string | null): vo
 }
 function render(): void {
  if(!app)return;
+ const scrollY=window.scrollY;
  const activeElement=document.activeElement;
+ const focusedPositionGraphic=activeElement instanceof HTMLElement?activeElement.dataset.positionGraphic:null;
+ const focusedPositionInput=activeElement instanceof HTMLElement?activeElement.dataset.positionInput:null;
+ const focusedInputId=activeElement instanceof HTMLElement&&activeElement.matches('input,select,textarea')?activeElement.id:'';
  const focusedAction=activeElement instanceof HTMLElement && app.contains(activeElement)
   ? activeElement.dataset.action ?? null
   : null;
  const content=pageContent(page());
- app.innerHTML=`${state.demoMode?demoBanner():''}${content}`;
+ document.documentElement.dataset.theme=themePreference;
+ app.removeAttribute('aria-busy');
+ app.removeAttribute('aria-label');
+ app.innerHTML=`${state.demoMode?demoBanner():''}${content}${document.documentElement.dataset.displayMode==='panel'?'':renderMobileTabs(page())}`;
+ for(const popover of app.querySelectorAll<HTMLElement>('[popover]'))popover.addEventListener('toggle',()=>{
+  const trigger=app?.querySelector<HTMLButtonElement>(`[aria-controls="${CSS.escape(popover.id)}"]`);
+  trigger?.setAttribute('aria-expanded',String(popover.matches(':popover-open')));
+ });
  updateTopbar();
  restoreAppFocus(app,focusedAction);
+ if(focusedPositionGraphic)app.querySelector<HTMLElement>(`[data-position-graphic="${CSS.escape(focusedPositionGraphic)}"]`)?.focus({preventScroll:true});
+ else if(focusedPositionInput)app.querySelector<HTMLInputElement>(`[data-position-input="${CSS.escape(focusedPositionInput)}"]`)?.focus({preventScroll:true});
+ else if(focusedInputId)document.getElementById(focusedInputId)?.focus({preventScroll:true});
+ window.scrollTo({top:scrollY,behavior:'instant'});
 }
 export async function refreshService(target: RefreshTarget, request: ApiRequest): Promise<void> {
   try {
@@ -890,9 +979,9 @@ export async function handleCommandPollFailure(
   if (refreshResult && refreshResult.positionFresh === true) {
     target.reconciliationRequired.delete(id);
     target.busy?.delete(id);
-    notifyTarget(target,{key:`command-status:${id}`,message:`Could not check command status: ${reason}. Check the latest reported position before trying again.${errors}`,tone:'warning',action:{label:'Refresh position',action:'refresh'}});
+    notifyTarget(target,{key:`command-status:${id}`,message:`Could not check command status: ${reason}. Check the latest reported position before trying again.${errors}`,tone:'warning',action:{label:'Refresh position',action:'refresh',icon:'refresh'}});
   } else {
-    notifyTarget(target,{key:`command-status:${id}`,message:`Could not check command status: ${reason}. A fresh managed-device position is unavailable; movement controls remain locked. Refresh and verify the position before trying again.${errors}`,tone:'warning',action:{label:'Refresh position',action:'refresh'}});
+    notifyTarget(target,{key:`command-status:${id}`,message:`Could not check command status: ${reason}. A fresh managed-device position is unavailable; movement controls remain locked. Refresh and verify the position before trying again.${errors}`,tone:'warning',action:{label:'Refresh position',action:'refresh',icon:'refresh'}});
   }
   onChange();
   return true;
@@ -955,7 +1044,188 @@ export async function removeEnrolledBlind(target: RefreshTarget, request: ApiReq
   return true;
 }
 
-async function refresh(quiet = false): Promise<void> { await refreshService(state,api); if(!quiet || !app?.querySelector('input:focus, select:focus')) render(); }
+async function refresh(quiet = false): Promise<void> {
+ const active=document.activeElement;
+ if(quiet&&(shouldPauseRefresh({dragging:positionInteraction,focusedTag:active?.tagName||'',confirmationOpen:!!state.confirmingRemovalId})||active instanceof HTMLElement&&active.matches('button,a,summary,[role="slider"]')))return;
+ await refreshService(state,api);
+ if(quiet)patchCards();
+ else render();
+}
+
+function beginPositionInteraction(id: string, initial: number): void {
+ positionInteraction=true;
+ positionInteractionId=id;
+ positionStartValues.set(id,initial);
+}
+
+function previewPosition(id: string, value: number): void {
+ const position=Math.max(0,Math.min(100,Math.round(value)));
+ const output=app?.querySelector<HTMLOutputElement>(`[data-position-output="${CSS.escape(id)}"]`);
+ if(output)output.value=`${position}%`;
+ const graphic=app?.querySelector<HTMLElement>(`[data-position-graphic="${CSS.escape(id)}"]`);
+ if(graphic){
+  graphic.setAttribute('aria-valuenow',String(position));
+  graphic.setAttribute('aria-valuetext',`${position}% closed`);
+  graphic.dataset.preview=String(position);
+  graphic.querySelector<HTMLElement>('.blind-art__fill')?.style.setProperty('--blind-fill',`${position}%`);
+ }
+ const range=app?.querySelector<HTMLInputElement>(`[data-position-input="${CSS.escape(id)}"]`);
+ if(range&&document.activeElement!==range)range.value=String(position);
+}
+
+function commitPosition(id: string, value: number): void {
+ const position=Math.max(0,Math.min(100,Math.round(value)));
+ const previous=positionStartValues.get(id);
+ positionStartValues.delete(id);
+ positionInteraction=false;
+ positionInteractionId=null;
+ if(previous===undefined||previous===position)return;
+ const last=lastPositionCommit.get(id);
+ if(last?.value===position&&Date.now()-last.at<500)return;
+ lastPositionCommit.set(id,{value:position,at:Date.now()});
+ const device=state.managed.find(item=>item.enrollment.id===id);
+ if(!device||device.capabilities?.set_position!==true||state.serviceError||device.availability!=='ready')return;
+ void sendCommand(id,'set_position',position);
+}
+
+function cancelPositionInteraction(id: string): void {
+ const previous=positionStartValues.get(id);
+ positionStartValues.delete(id);
+ positionInteraction=false;
+ positionInteractionId=null;
+ if(previous!==undefined)previewPosition(id,previous);
+}
+
+function graphicValueFromPointer(graphic: HTMLElement, clientY: number): number {
+ const rect=graphic.getBoundingClientRect();
+ return rect.height>0?Math.round(Math.max(0,Math.min(1,(clientY-rect.top)/rect.height))*100):0;
+}
+
+function invalidateUndoFor(id: string): void {
+ if(positionUndo?.id===id){positionUndo=null;const button=document.querySelector<HTMLButtonElement>(`[data-action^="undo-position:${CSS.escape(encodeURIComponent(id))}:"]`);if(button)button.disabled=true;}
+ if(batchUndo?.previous.has(id)){
+  batchUndo=null;
+  const button=document.querySelector<HTMLButtonElement>('[data-action="undo-batch"]');
+  if(button)button.disabled=true;
+ }
+}
+
+async function undoBatchTargets(): Promise<void> {
+ const snapshot=batchUndo;
+ if(!snapshot||snapshot.expires<Date.now())return;
+ batchUndo=null;
+ for(const [id,position] of snapshot.previous){
+  const device=state.managed.find(item=>item.enrollment.id===id);
+  if(!device)continue;
+  if(device.capabilities?.set_position===true)await sendCommand(id,'set_position',position);
+  else if(position===0||position===100)await sendCommand(id,position===0?'open':'close');
+ }
+}
+
+export function createServiceWorkerUpdateHandler(reload:()=>void): {
+ requestActivation:(worker:Pick<ServiceWorker,'postMessage'>|null|undefined)=>void;
+ onControllerChange:()=>void;
+} {
+ let expectingControllerChange=false;
+ return {
+  requestActivation(worker){
+   if(!worker)return;
+   expectingControllerChange=true;
+   worker.postMessage({type:'SKIP_WAITING'});
+  },
+  onControllerChange(){
+   if(!expectingControllerChange)return;
+   expectingControllerChange=false;
+   reload();
+  },
+ };
+}
+
+const serviceWorkerUpdateHandler=createServiceWorkerUpdateHandler(()=>globalThis.location.reload());
+
+async function activateWaitingWorker(): Promise<void> {
+ const registration=await navigator.serviceWorker?.getRegistration('/');
+ serviceWorkerUpdateHandler.requestActivation(registration?.waiting);
+}
+
+async function registerServiceWorker(): Promise<void> {
+ if(!('serviceWorker' in navigator))return;
+ try{
+  const registration=await navigator.serviceWorker.register('/sw.js',{scope:'/'});
+  const announce=()=>snackbarQueue.push({key:'pwa-update',message:'A Somaris update is ready to install.',tone:'info',duration:8000,action:{label:'Install update',action:'pwa-update',icon:'refresh'}});
+  if(registration.waiting&&navigator.serviceWorker.controller)announce();
+  registration.addEventListener('updatefound',()=>{
+   const worker=registration.installing;
+   worker?.addEventListener('statechange',()=>{if(worker.state==='installed'&&navigator.serviceWorker.controller)announce();});
+  });
+  navigator.serviceWorker.addEventListener('controllerchange',serviceWorkerUpdateHandler.onControllerChange);
+ }catch{/* Offline or unsupported browser: the app continues without installation support. */}
+}
+
+function patchCards(): void {
+ if(!app)return;
+ if(!['home','activity'].includes(page())){render();return;}
+ const panelMode=document.documentElement.dataset.displayMode==='panel';
+ const oldCards=[...app.querySelectorAll<HTMLElement>('[data-device-card]')];
+ const expectedIds=state.managed.map(device=>device.enrollment.id);
+ if(oldCards.map(card=>card.dataset.deviceCard).join('|')!==expectedIds.join('|')){render();return;}
+ if(state.serviceError&&!state.managed.length&&!app.querySelector('.error-state')){render();return;}
+ if(!state.serviceError&&app.querySelector('.error-state')){render();return;}
+ for(const device of state.managed){
+  const id=device.enrollment.id;
+  const current=app.querySelector<HTMLElement>(`[data-device-card="${CSS.escape(id)}"]`);
+  if(!current)continue;
+  const nextTemplate=document.createElement('template');
+  nextTemplate.innerHTML=renderManagedDeviceCard(device,state,panelMode);
+  const next=nextTemplate.content.querySelector<HTMLElement>('[data-device-card]');
+  if(!next)continue;
+  if(current.dataset.room!==next.dataset.room){render();return;}
+  for(const selector of ['.status-indicator','.blind-state']){
+   const oldNode=current.querySelector(selector);
+   const newNode=next.querySelector(selector);
+   if(oldNode&&newNode)oldNode.replaceWith(newNode.cloneNode(true));
+  }
+  const oldGraphic=current.querySelector<HTMLElement>('[data-position-graphic]');
+  const newGraphic=next.querySelector<HTMLElement>('[data-position-graphic]');
+  if(oldGraphic&&newGraphic&&document.activeElement!==oldGraphic&&!positionInteraction){
+   for(const name of ['aria-valuenow','aria-valuetext','data-movement']){
+    const value=newGraphic.getAttribute(name);
+    if(value===null)oldGraphic.removeAttribute(name);else oldGraphic.setAttribute(name,value);
+   }
+   const oldFill=oldGraphic.querySelector<HTMLElement>('.blind-art__fill');
+   const newFill=newGraphic.querySelector<HTMLElement>('.blind-art__fill');
+   if(oldFill&&newFill)oldFill.style.setProperty('--blind-fill',newFill.style.getPropertyValue('--blind-fill'));
+  }
+  const oldMessages=current.querySelector<HTMLElement>('[data-card-messages]');
+  const newMessages=next.querySelector<HTMLElement>('[data-card-messages]');
+  if(oldMessages&&newMessages)oldMessages.innerHTML=newMessages.innerHTML;
+  const oldProgress=current.querySelector<HTMLElement>('[data-command-progress]');
+  const newProgress=next.querySelector<HTMLElement>('[data-command-progress]');
+  if(oldProgress&&newProgress)oldProgress.replaceWith(newProgress.cloneNode(true));
+  else if(oldProgress&&!newProgress)oldProgress.remove();
+  else if(!oldProgress&&newProgress){
+   const controls=current.querySelector('.controls');
+   controls?.after(newProgress.cloneNode(true));
+  }
+  const oldControls=[...current.querySelectorAll<HTMLButtonElement>('.controls button')];
+  const newControls=[...next.querySelectorAll<HTMLButtonElement>('.controls button')];
+  for(const oldControl of oldControls){
+   const replacement=newControls.find(button=>button.dataset.action===oldControl.dataset.action);
+   if(replacement)oldControl.disabled=replacement.disabled;
+  }
+  const oldRange=current.querySelector<HTMLInputElement>('[data-position-input]');
+  const newRange=next.querySelector<HTMLInputElement>('[data-position-input]');
+  if(oldRange&&newRange){
+   oldRange.disabled=newRange.disabled;
+   if(document.activeElement!==oldRange&&!positionInteraction)oldRange.value=newRange.value;
+  }
+  const oldOutput=current.querySelector<HTMLOutputElement>('[data-position-output]');
+  const newOutput=next.querySelector<HTMLOutputElement>('[data-position-output]');
+  if(oldOutput&&newOutput&&document.activeElement!==oldRange)oldOutput.value=newOutput.value;
+ }
+ updateTopbar();
+}
+
 function notifyCommandResult(id: string, command: CommandRecord): void {
  const [message]=commandMessage(command);
  const label=state.managed.find(device=>device.enrollment.id===id)?.enrollment.label;
@@ -981,6 +1251,8 @@ async function sendCommand(id: string, action: import('./types.mjs').BlindAction
  if((state.busy.has(id)||state.reconciliationRequired.has(id)||blindBatchIsLocked(state.batch)) && action!=='stop')return;
  const target=state.managed.find(device=>device.enrollment.id===id);
  if(!target?.enrollment.label){snackbarQueue.push({key:`command-target:${id}`,message:'Refresh the blind list before sending a command.',tone:'warning'});render();return;}
+ const previousTarget=target.position?.target_closed_percent??target.position?.current_closed_percent;
+ invalidateUndoFor(id);
  const token=Symbol();
  state.busy.add(id);
  state.tokens[id]=token;
@@ -993,12 +1265,18 @@ async function sendCommand(id: string, action: import('./types.mjs').BlindAction
   if(!command.id)throw new Error('The service returned a command without an ID.');
   if(state.tokens[id]!==token)return;
   state.commands[id]=command;
+  if(action==='set_position'&&typeof previousTarget==='number'&&Number.isInteger(previousTarget)&&previousTarget>=0&&previousTarget<=100){
+   const expires=Date.now()+5500;
+   positionUndo={id,previous:previousTarget,commandToken:token,expires};
+   snackbarQueue.push({message:`Target set to ${positionClosedPercent}% closed. The reported position updates when the blind responds.`,tone:'info',duration:5500,action:{label:`Undo position for ${target.enrollment.label}`,action:`undo-position:${encodeURIComponent(id)}:${previousTarget}`,icon:'undo'}});
+  }
   render();
   pollCommand(id,command.id,token);
  }catch(error){
   if(state.tokens[id]!==token)return;
   state.commands[id]={status:'outcome_unknown'};
-  snackbarQueue.push({key:`command-request:${id}`,message:`Command request failed: ${errorMessage(error)}. Its outcome may be unknown; check telemetry before trying again.`,tone:'warning',action:{label:'Refresh position',action:'refresh'}});
+  positionUndo=null;
+  snackbarQueue.push({key:`command-request:${id}`,message:`Command request failed: ${errorMessage(error)}. Its outcome may be unknown; check telemetry before trying again.`,tone:'warning',action:{label:'Refresh position',action:'refresh',icon:'refresh'}});
   if(!state.reconciliationRequired.has(id))state.busy.delete(id);
   render();
  }
@@ -1021,16 +1299,22 @@ function pollBlindBatch(batch: BatchState): void {
   if(state.batch!==batch || !batch.id || !blindBatchIsLocked(batch))return;
   const updated=await checkBlindBatch(state,api,render);
   if(!updated || state.batch!==batch)return;
-  if(!blindBatchIsLocked(batch)){await refresh();return;}
+  if(!blindBatchIsLocked(batch)){completeBatchUndo(batch);await refresh();return;}
   pollBlindBatch(batch);
  },1500);
 }
 async function startBlindBatch(action: BatchAction): Promise<void> {
+ const previous=new Map<string,number>();
+ for(const device of state.managed){
+  const position=device.position?.target_closed_percent??device.position?.current_closed_percent;
+  if(device.availability==='ready'&&device.calibration_mode_active!==true&&typeof position==='number'&&Number.isInteger(position)&&position>=0&&position<=100)previous.set(device.enrollment.id,position);
+ }
+ batchUndo={id:'pending',previous,expires:Date.now()+120000};
  const accepted=await submitBlindBatch(state,api,action,render);
  if(!accepted){if(state.batch?.status==='rejected')await refresh();return;}
  const batch=state.batch;
  if(batch?.id && blindBatchIsLocked(batch))pollBlindBatch(batch);
- else await refresh();
+ else {if(batch)completeBatchUndo(batch);await refresh();}
 }
 async function retryBlindBatchCheck(): Promise<void> {
  const batch=state.batch;
@@ -1038,7 +1322,18 @@ async function retryBlindBatchCheck(): Promise<void> {
  const updated=await checkBlindBatch(state,api,render);
  if(!updated || state.batch!==batch)return;
  if(blindBatchIsLocked(batch) && batch.id)pollBlindBatch(batch);
- else if(!blindBatchIsLocked(batch))await refresh();
+ else if(!blindBatchIsLocked(batch)){completeBatchUndo(batch);await refresh();}
+}
+
+function completeBatchUndo(batch: BatchState): void {
+ if(!['completed','partial'].includes(batch.status)||!batchUndo?.previous.size)return;
+ const result=batch.data||batch;
+ const acknowledged=new Set((result.targets||[]).filter(target=>target.status==='write_acknowledged').map(target=>target.managed_device_id).filter((id):id is string=>typeof id==='string'));
+ const previous=new Map([...batchUndo.previous].filter(([id])=>acknowledged.has(id)));
+ if(!previous.size)return;
+ const expires=Date.now()+5500;
+ batchUndo={id:batch.id||'batch',previous,expires};
+ state.notify({key:`batch-undo:${batch.id||'last'}`,message:`${batch.action==='open'?'Open':'Close'} all finished. Restore the previous targets?`,tone:'success',duration:5500,action:{label:'Undo all-blinds command',action:'undo-batch',icon:'undo'}});
 }
 async function simulatorReset(id: string): Promise<void> {try{await api(`/api/dev/simulators/${encodeURIComponent(id)}/reset`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({position_closed_percent:100})});await refresh();snackbarQueue.push({message:'Simulator reset.',tone:'success'});}catch(error){snackbarQueue.push({message:`Simulator reset failed: ${errorMessage(error)}`,tone:'error'});render();}}
 async function confirmEnrollmentRemoval(id: string): Promise<void> {
@@ -1080,15 +1375,56 @@ export function dispatchBlindCommand(
  return true;
 }
 
-function changeDisplayMode(applyDisplayMode: () => boolean): void {
- displayPreference=nextDisplayPreference(displayPreference);
+function changeDisplayMode(preference: string, applyDisplayMode: () => boolean): void {
+ if(!displayModes.has(preference as DisplayPreference))return;
+ displayPreference=preference as DisplayPreference;
  try {
   globalThis.localStorage?.setItem('somaris-display-mode',displayPreference);
  } catch { /* The current selection still applies until the page reloads. */ }
  applyDisplayMode();
  render();
- const label=DISPLAY_MODE_OPTIONS.find(([value])=>value===displayPreference)?.[1]||'Auto';
- snackbarQueue.push({message:`View changed to ${label}.`,tone:'info'});
+ document.getElementById('display-mode-toggle')?.focus({preventScroll:true});
+}
+
+function changeTheme(preference: string): void {
+ if(!['auto','dark','light','high-contrast'].includes(preference))return;
+ themePreference=preference;
+ try { globalThis.localStorage?.setItem('somaris-theme',themePreference); } catch { /* Current selection still applies for this page. */ }
+ render();
+ document.getElementById('display-mode-toggle')?.focus({preventScroll:true});
+}
+
+function closeDisplayMenu(returnFocus = false): void {
+ const menu=document.querySelector<HTMLElement>('#display-menu');
+ const trigger=document.querySelector<HTMLButtonElement>('#display-mode-toggle');
+ if(menu)menu.hidden=true;
+ trigger?.setAttribute('aria-expanded','false');
+ if(returnFocus)trigger?.focus({preventScroll:true});
+}
+
+function toggleDisplayMenu(): void {
+ const menu=document.querySelector<HTMLElement>('#display-menu');
+ const trigger=document.querySelector<HTMLButtonElement>('#display-mode-toggle');
+ if(!menu||!trigger)return;
+ menu.hidden=!menu.hidden;
+ trigger.setAttribute('aria-expanded',String(!menu.hidden));
+ if(!menu.hidden)menu.querySelector<HTMLElement>('[aria-checked="true"]')?.focus({preventScroll:true});
+}
+
+function toggleBatteryPopover(encodedId: string): void {
+ const id=`battery-info-${encodedId}`;
+ const popover=document.getElementById(id) as HTMLElement & {showPopover?:()=>void;hidePopover?:()=>void};
+ const trigger=document.querySelector<HTMLButtonElement>(`[aria-controls="${CSS.escape(id)}"]`);
+ if(!popover||!trigger)return;
+ if(popover.matches(':popover-open')){popover.hidePopover?.();trigger.setAttribute('aria-expanded','false');return;}
+ popover.showPopover?.();
+ const rect=trigger.getBoundingClientRect();
+ const bounds=popover.getBoundingClientRect();
+ const left=Math.max(12,Math.min(window.innerWidth-bounds.width-12,rect.left+bounds.width>window.innerWidth?rect.right-bounds.width:rect.left));
+ const above=rect.top-bounds.height-8;
+ popover.style.left=`${left}px`;
+ popover.style.top=`${above>=8?above:Math.min(window.innerHeight-bounds.height-8,rect.bottom+8)}px`;
+ trigger.setAttribute('aria-expanded','true');
 }
 
 function handleBatchClick(argument: string): boolean {
@@ -1097,10 +1433,9 @@ function handleBatchClick(argument: string): boolean {
  return true;
 }
 
-function handlePositionClick(argument: string): boolean {
+function handlePositionClick(argument: string, id: string): boolean {
  if(document.documentElement.dataset.displayMode==='panel')return false;
- const input=app?.querySelector<HTMLInputElement>(`[data-position-input="${CSS.escape(argument)}"]`);
- const position=Number(input?.value);
+ const position=Number(id);
  if(Number.isInteger(position)&&position>=0&&position<=100)void sendCommand(argument,'set_position',position);
  return true;
 }
@@ -1133,10 +1468,19 @@ type ClickActionHandler = (
 
 const clickActionHandlers: Record<string, ClickActionHandler> = {
  'snackbar-dismiss':(_argument,_id,deviceId)=>{snackbarQueue.dismiss(deviceId);return true;},
- 'display-mode':(_argument,_id,_deviceId,applyDisplayMode)=>{changeDisplayMode(applyDisplayMode);return true;},
+ 'display-menu-toggle':()=>{toggleDisplayMenu();return true;},
+ display:(argument,_id,deviceId,applyDisplayMode)=>{if(argument==='set')changeDisplayMode(deviceId,applyDisplayMode);closeDisplayMenu();return true;},
+ theme:(argument,_id,deviceId)=>{if(argument==='set')changeTheme(deviceId);closeDisplayMenu();return true;},
  command:(argument,id)=>dispatchBlindCommand(argument,id),
  batch:argument=>handleBatchClick(argument),
- position:argument=>handlePositionClick(argument),
+ position:(_argument,id,deviceId)=>handlePositionClick(deviceId,id),
+ 'activity-toggle':()=>{const expanded=activityCollapsedByUser??document.documentElement.dataset.displayMode!=='mobile';activityCollapsedByUser=!expanded;render();return true;},
+ 'hero-dismiss':()=>{heroDismissed=true;try{globalThis.localStorage?.setItem('somaris-hero-dismissed','true');}catch{}render();return true;},
+ 'demo-hint-dismiss':()=>{hintDismissed=true;try{globalThis.localStorage?.setItem('somaris-demo-hint-dismissed','true');}catch{}render();return true;},
+ 'undo-position':(_argument,id,deviceId)=>{const position=Number(id);if(positionUndo&&positionUndo.id===deviceId&&positionUndo.expires>Date.now()&&state.tokens[deviceId]===positionUndo.commandToken)void sendCommand(deviceId,'set_position',position);return true;},
+ 'undo-batch':()=>{void undoBatchTargets();return true;},
+ 'pwa-update':()=>{void activateWaitingWorker();return true;},
+ 'battery-info':argument=>{toggleBatteryPopover(argument);return true;},
  details:argument=>{
   if(!argument)return false;
   location.hash=`details/${encodeURIComponent(argument)}`;
@@ -1191,11 +1535,22 @@ function submitMotorSpeed(form: HTMLFormElement): void {
 
 async function submitEnrollmentForm(form: HTMLFormElement): Promise<void> {
  const button=form.querySelector<HTMLButtonElement>('button');
- if(button)button.disabled=true;
  const id=form.dataset.enroll;
+ const input=form.querySelector<HTMLInputElement>('[data-display-name]');
  const labelValue=new FormData(form).get('label');
  const label=typeof labelValue==='string' ? labelValue.trim() : '';
+ const validation=validateDisplayName(label);
+ const error=input?.parentElement?.querySelector<HTMLElement>('.field-error');
+ if(validation){
+  input?.setAttribute('aria-invalid','true');
+  if(error){error.textContent=validation;error.hidden=false;}
+  input?.focus();
+  return;
+ }
+ input?.setAttribute('aria-invalid','false');
+ if(error){error.textContent='';error.hidden=true;}
  if(!id || !label)return;
+ if(button){button.disabled=true;button.innerHTML=renderIcon('spinner');button.setAttribute('aria-label',`Adding ${label}`);button.title=`Adding ${label}`;}
  const added=await enrollBlind(state,api,()=>refreshService(state,api),id,label);
  if(added)location.hash='home';
  render();
@@ -1228,15 +1583,77 @@ if(app){
   return previous !== document.documentElement.dataset.displayMode;
  };
  applyDisplayMode();
+ void registerServiceWorker();
  let initialized=false;
  window.addEventListener('resize', () => { if (applyDisplayMode()&&initialized) render(); });
- window.addEventListener('hashchange',()=>{if(initialized)render();});
+ window.addEventListener('hashchange',()=>{
+  routeScrollPositions.set(lastRenderedRoute,window.scrollY);
+  const next=page();
+  if(initialized){render();window.scrollTo({top:routeScrollPositions.get(next)??(next==='activity'?document.getElementById('activity')?.offsetTop??0:0),behavior:'instant'});}
+  lastRenderedRoute=next;
+ });
+ window.addEventListener('offline',()=>{serviceFailure(state,new Error('Network unavailable'));render();});
+ window.addEventListener('online',()=>{void refresh();});
+ document.addEventListener('keydown',(event:KeyboardEvent)=>{
+  if(event.key==='Escape'&&!document.querySelector<HTMLElement>('#display-menu')?.hidden){event.preventDefault();closeDisplayMenu(true);}
+  const graphic=closestHtmlElement(event.target,'[data-position-graphic]');
+  const range=closestHtmlElement(event.target,'[data-position-input]');
+  if(!graphic&&!(range instanceof HTMLInputElement))return;
+  const id=graphic?.dataset.positionGraphic||((range as HTMLInputElement).dataset.positionInput)||'';
+  const current=graphic?Number(graphic.getAttribute('aria-valuenow')||0):Number((range as HTMLInputElement).value);
+  let next=current;
+  const step=event.shiftKey?10:1;
+  if(event.key==='ArrowUp'||event.key==='ArrowRight')next+=step;
+  else if(event.key==='ArrowDown'||event.key==='ArrowLeft')next-=step;
+  else if(event.key==='Home')next=0;
+  else if(event.key==='End')next=100;
+  else if(event.key==='Enter'){event.preventDefault();commitPosition(id,current);return;}
+  else return;
+  event.preventDefault();
+  if(!positionInteraction)beginPositionInteraction(id,current);
+  if(graphic)previewPosition(id,next);
+ });
+ document.addEventListener('keyup',(event:KeyboardEvent)=>{
+  if(!['ArrowUp','ArrowRight','ArrowDown','ArrowLeft','Home','End'].includes(event.key))return;
+  const graphic=closestHtmlElement(event.target,'[data-position-graphic]');
+  const range=closestHtmlElement(event.target,'[data-position-input]');
+  if(graphic){const id=graphic.dataset.positionGraphic||'';commitPosition(id,Number(graphic.getAttribute('aria-valuenow')||0));}
+  else if(range instanceof HTMLInputElement){const id=range.dataset.positionInput||'';commitPosition(id,Number(range.value));}
+ });
+ document.addEventListener('pointerdown',(event:PointerEvent)=>{
+  const picker=document.querySelector<HTMLElement>('.display-picker');
+  if(picker&&!picker.contains(event.target as Node))closeDisplayMenu();
+ });
  actionRoot.addEventListener('click', (event: MouseEvent)=>{
   const target=closestHtmlElement(event.target,'[data-action]');
   if(!target)return;
   const [action,argument,id]=parseActionValue(target.dataset.action);
   dispatchClickAction(action,argument,id,applyDisplayMode);
  });
+ actionRoot.addEventListener('pointerdown',(event:PointerEvent)=>{
+  const graphic=closestHtmlElement(event.target,'[data-position-graphic]');
+  const range=closestHtmlElement(event.target,'[data-position-input]');
+  if(graphic){const id=graphic.dataset.positionGraphic||'';const value=Number(graphic.getAttribute('aria-valuenow')||0);beginPositionInteraction(id,value);graphic.setPointerCapture?.(event.pointerId);previewPosition(id,graphicValueFromPointer(graphic,event.clientY));}
+  else if(range instanceof HTMLInputElement){const id=range.dataset.positionInput||'';const device=state.managed.find(item=>item.enrollment.id===id);range.setPointerCapture?.(event.pointerId);beginPositionInteraction(id,device?.position?.target_closed_percent??Number(range.value));}
+ });
+ actionRoot.addEventListener('pointermove',(event:PointerEvent)=>{
+  if(!positionInteraction||!positionInteractionId)return;
+  const id=positionInteractionId;
+  const graphic=app?.querySelector<HTMLElement>(`[data-position-graphic="${CSS.escape(id)}"]`);
+  const range=app?.querySelector<HTMLInputElement>(`[data-position-input="${CSS.escape(id)}"]`);
+  if(graphic)previewPosition(id,graphicValueFromPointer(graphic,event.clientY));
+  else if(range)previewPosition(id,Number(range.value));
+ });
+ actionRoot.addEventListener('pointerup',(event:PointerEvent)=>{
+  if(!positionInteraction||!positionInteractionId)return;
+  const id=positionInteractionId;
+  const graphic=app?.querySelector<HTMLElement>(`[data-position-graphic="${CSS.escape(id)}"]`);
+  const range=app?.querySelector<HTMLInputElement>(`[data-position-input="${CSS.escape(id)}"]`);
+  const value=graphic?graphicValueFromPointer(graphic,event.clientY):Number(range?.value||0);
+  previewPosition(id,value);
+  commitPosition(id,value);
+ });
+ actionRoot.addEventListener('pointercancel',()=>{if(positionInteractionId)cancelPositionInteraction(positionInteractionId);});
  snackbarRoot?.addEventListener('pointerover',(event: PointerEvent)=>{
   const item=closestHtmlElement(event.target,'[data-snackbar-id]');
   if(item&&!containsRelatedTarget(item,event.relatedTarget))snackbarQueue.pause(item.dataset.snackbarId ?? '','pointer');
@@ -1254,12 +1671,27 @@ if(app){
   if(item&&!containsRelatedTarget(item,event.relatedTarget))snackbarQueue.resume(item.dataset.snackbarId ?? '','focus');
  });
  actionRoot.addEventListener('input',(event: Event)=>{
+  const nameInput=closestHtmlElement(event.target,'[data-display-name]');
+  if(nameInput instanceof HTMLInputElement){
+   if(nameInput.getAttribute('aria-invalid')==='true'){
+    const validation=validateDisplayName(nameInput.value);
+    const error=nameInput.parentElement?.querySelector<HTMLElement>('.field-error');
+    if(error){error.textContent=validation;error.hidden=!validation;}
+    nameInput.setAttribute('aria-invalid',String(!!validation));
+   }
+   return;
+  }
   const input=closestHtmlElement(event.target,'[data-position-input]');
   if(!input)return;
   const range=input instanceof HTMLInputElement ? input : null;
   if(!range)return;
-  const output=app.querySelector<HTMLOutputElement>(`[data-position-output="${CSS.escape(range.dataset.positionInput ?? '')}"]`);
-  if(output)output.value=`${range.value}%`;
+  const id=range.dataset.positionInput||'';
+  if(!positionInteraction){const device=state.managed.find(item=>item.enrollment.id===id);beginPositionInteraction(id,device?.position?.target_closed_percent??Number(range.value));}
+  previewPosition(id,Number(range.value));
+ });
+ app.addEventListener('change',(event:Event)=>{
+  const range=closestHtmlElement(event.target,'[data-position-input]');
+  if(range instanceof HTMLInputElement){const id=range.dataset.positionInput||'';if(!positionInteraction)beginPositionInteraction(id,Number(range.value));commitPosition(id,Number(range.value));}
  });
  app.addEventListener('submit',(event: SubmitEvent)=>void handleFormSubmit(event));
  const initializeDashboard=async()=>{
