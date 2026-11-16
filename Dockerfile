@@ -1,5 +1,5 @@
 # Keep these official-image digests updated with reviewed base-image releases.
-FROM rust:1-bookworm@sha256:e9da6f6c3ed5095fd5d33bf7cdf309830a178a8147888f1b2f76d5769bd9306c AS builder
+FROM rust:1-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder
 
 WORKDIR /build
 
