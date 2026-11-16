@@ -223,7 +223,7 @@ export function renderButton({
   const iconContent = iconMarkup(icon);
   const labelContent = iconOnly ? '' : `<span class="button-label">${escapeHtml(label)}</span>`;
   const actionAttribute = action === undefined ? '' : ` data-action="${escapeHtml(action)}"`;
-  return `<button type="${type}" class="${classes}"${actionAttribute}${accessibility}${titleAttribute}${disabled ? ' disabled' : ''}>${iconContent}${labelContent}</button>`;
+  return `<button type="${escapeHtml(type)}" class="${classes}"${actionAttribute}${accessibility}${titleAttribute}${disabled ? ' disabled' : ''}>${iconContent}${labelContent}</button>`;
 }
 
 export function renderIconButton({label, action, icon, variant = '', disabled = false}: IconButtonOptions): string {
