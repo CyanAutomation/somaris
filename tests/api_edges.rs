@@ -131,6 +131,12 @@ async fn simulator_prewrite_failure_is_retryable() {
     assert_eq!(command["write_state"], "not_sent");
     assert_eq!(command["retryable"], true);
     assert_eq!(command["attempt"], 1);
+    assert_eq!(
+        command["attempts"][0]["failure_cause"],
+        "connection_aborted_by_local"
+    );
+    assert!(command["attempts"][0]["phase_timings"]["connect_ms"].is_number());
+    assert!(command["attempts"][0]["phase_timings"]["gatt_write_ms"].is_null());
 }
 
 #[tokio::test]
@@ -520,6 +526,60 @@ async fn simulator_profiles_drive_battery_and_wireless_snapshots() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(reset.unwrap()["data"]["scenario"], "normal");
+}
+
+#[tokio::test]
+async fn agentlab_realistic_profile_is_selectable_and_reports_its_baseline_delays() {
+    let app = router(AppState::new());
+    let (status, _, response) = request(
+        &app,
+        Method::PUT,
+        "/api/dev/simulator/scenario",
+        &[],
+        Some(json!({"wireless_profile": "agentlab_realistic"})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let simulator = response.unwrap()["data"].clone();
+    assert_eq!(simulator["wireless_profile"], "agentlab_realistic");
+    assert_eq!(simulator["connection_delay_ms"], 1440);
+    assert_eq!(simulator["write_response_delay_ms"], 109);
+}
+
+#[tokio::test(start_paused = true)]
+async fn agentlab_realistic_simulator_commands_report_transport_phase_timings() {
+    let app = router(AppState::new());
+    let managed_id = enroll_device(&app, "Agentlab profile window").await;
+    let (status, _, _) = request(
+        &app,
+        Method::PUT,
+        "/api/dev/simulator/scenario",
+        &[],
+        Some(json!({"wireless_profile": "agentlab_realistic"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, command) = request(
+        &app,
+        Method::POST,
+        &format!("/api/control/v1/devices/{managed_id}/commands"),
+        &[("idempotency-key", "agentlab-profile-open")],
+        Some(json!({"action": "open"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let id = command.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    }
+    let command = wait_for_command(&app, &id).await;
+    assert_eq!(command["status"], "write_acknowledged");
+    assert!(command["attempts"][0]["phase_timings"]["connect_ms"].is_number());
+    assert!(command["attempts"][0]["phase_timings"]["gatt_write_ms"].is_number());
 }
 
 #[tokio::test]

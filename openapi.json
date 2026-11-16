@@ -2366,16 +2366,17 @@
               "gatt_write_error",
               "telemetry_paused"
             ],
-            "description": "Scenario configured for this simulator only."
+            "description": "Scenario configured for this simulator only. pre_write_failure is consumed by the next command, reports connection_aborted_by_local, and completes without a GATT write."
           },
           "wireless_profile": {
             "type": "string",
             "enum": [
               "standard",
               "hallway_observed",
-              "hallway_slow_link"
+              "hallway_slow_link",
+              "agentlab_realistic"
             ],
-            "description": "The default hallway_observed profile uses the observed 80 ms connection and 72 ms write-response delays, one simulated position update per second (about 100 seconds for full travel), and capture-informed synthetic RSSI samples. hallway_slow_link uses the 702 ms maximum seen in six HCI connection samples and the same RSSI samples. standard has no transport delay and fixed -60 dBm synthetic RSSI."
+            "description": "The default hallway_observed profile uses fixed 80 ms connection and 72 ms write-response delays, one simulated position update per second (about 100 seconds for full travel), and capture-informed synthetic RSSI samples. hallway_slow_link uses a fixed 702 ms connection delay and 72 ms write delay. agentlab_realistic selects deterministic per-command delays in the observed Agentlab ranges: 1,440–5,240 ms for connection and 109–699 ms for the GATT write; simulated attempts report those phases separately. standard has no transport delay and fixed -60 dBm synthetic RSSI. Select the one-shot pre_write_failure scenario to inject a local connection abort before any GATT write."
           },
           "battery_state": {
             "type": "string",
@@ -2389,12 +2390,14 @@
           "connection_delay_ms": {
             "type": "integer",
             "minimum": 0,
-            "maximum": 702
+            "maximum": 5240,
+            "description": "Fixed delay for standard hallway profiles; lower bound for the agentlab_realistic profile."
           },
           "write_response_delay_ms": {
             "type": "integer",
             "minimum": 0,
-            "maximum": 72
+            "maximum": 699,
+            "description": "Fixed delay for standard hallway profiles; lower bound for the agentlab_realistic profile."
           },
           "telemetry_paused": {
             "type": "boolean"
@@ -2438,15 +2441,18 @@
               "outcome_unknown",
               "gatt_write_error",
               "telemetry_paused"
-            ]
+            ],
+            "description": "pre_write_failure injects one local connection abort on the next command before any GATT write."
           },
           "wireless_profile": {
             "type": "string",
             "enum": [
               "standard",
               "hallway_observed",
-              "hallway_slow_link"
-            ]
+              "hallway_slow_link",
+              "agentlab_realistic"
+            ],
+            "description": "agentlab_realistic uses repeatable command-ID-seeded delays within the observed Agentlab connection and write-response ranges."
           },
           "battery_state": {
             "type": "string",
