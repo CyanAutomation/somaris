@@ -22,8 +22,9 @@ use tokio::sync::{Notify, mpsc, watch};
 use uuid::Uuid;
 
 use crate::controller::{
-    ServiceAction, encode_service_action, encode_shade_config_readback_query,
-    firmware_supports_motor_speed, parse_motor_settings_readback, service_action_target,
+    MotorSpeedFirmwareSupport, ServiceAction, encode_service_action,
+    encode_shade_config_readback_query, firmware_supports_motor_speed,
+    motor_speed_firmware_support, parse_motor_settings_readback, service_action_target,
 };
 
 use super::{BA71_CHARACTERISTIC_UUID, SOMA_MANUFACTURER_ID, parse_soma_payload};
@@ -160,6 +161,8 @@ pub struct BleFailure {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BleAttemptTimings {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_connection_reused: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peripheral_lookup_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect_ms: Option<u64>,
@@ -175,6 +178,16 @@ pub struct BleAttemptTimings {
     pub gatt_write_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disconnect_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub motor_settings_discovery_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub motor_settings_notifications_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub motor_settings_subscribe_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub motor_settings_query_write_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub motor_settings_readback_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -187,6 +200,11 @@ pub enum BlePhase {
     FirmwareCheck,
     GattWrite,
     Disconnect,
+    MotorSettingsDiscovery,
+    MotorSettingsNotifications,
+    MotorSettingsSubscribe,
+    MotorSettingsQueryWrite,
+    MotorSettingsReadback,
 }
 
 impl BleFailure {
@@ -292,7 +310,23 @@ impl BleCommandControl {
             BlePhase::FirmwareCheck => timings.firmware_check_ms = Some(millis),
             BlePhase::GattWrite => timings.gatt_write_ms = Some(millis),
             BlePhase::Disconnect => timings.disconnect_ms = Some(millis),
+            BlePhase::MotorSettingsDiscovery => timings.motor_settings_discovery_ms = Some(millis),
+            BlePhase::MotorSettingsNotifications => {
+                timings.motor_settings_notifications_ms = Some(millis)
+            }
+            BlePhase::MotorSettingsSubscribe => timings.motor_settings_subscribe_ms = Some(millis),
+            BlePhase::MotorSettingsQueryWrite => {
+                timings.motor_settings_query_write_ms = Some(millis)
+            }
+            BlePhase::MotorSettingsReadback => timings.motor_settings_readback_ms = Some(millis),
         }
+    }
+
+    pub fn record_cached_connection_reuse(&self, reused: bool) {
+        self.timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cached_connection_reused = Some(reused);
     }
 
     pub fn timings(&self) -> BleAttemptTimings {
@@ -524,11 +558,20 @@ pub trait BleAdapter: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MotorSettingsReadback {
     pub firmware_version: String,
+    pub motor_speed_readback_status: MotorSpeedReadbackStatus,
     pub motor_speed_percent: Option<u8>,
     pub local_time_offset_minutes: Option<i16>,
     pub boot_sequence: Option<u32>,
     pub sunrise_epoch_seconds: Option<u32>,
     pub sunset_epoch_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotorSpeedReadbackStatus {
+    Read,
+    SkippedUnsupportedFirmware,
+    SkippedUnrecognizedFirmware,
 }
 
 #[derive(Clone)]
@@ -570,7 +613,7 @@ fn connect_timeout(purpose: ConnectionPurpose, attempt: u8) -> Duration {
     match (purpose, attempt) {
         (ConnectionPurpose::Stop, 1) => Duration::from_secs(4),
         (ConnectionPurpose::Stop, _) => Duration::from_secs(6),
-        (ConnectionPurpose::Command, 1) => Duration::from_secs(5),
+        (ConnectionPurpose::Command, 1) => Duration::from_secs(6),
         (ConnectionPurpose::ReadOnly, _) => Duration::from_secs(6),
         (ConnectionPurpose::Command, _) => Duration::from_secs(6),
     }
@@ -603,6 +646,12 @@ impl DisconnectGuard {
         if let Some(peripheral) = self.0.take() {
             BtleplugAdapter::disconnect(&peripheral).await;
         }
+    }
+
+    async fn disconnect_and_record(&mut self, control: &BleCommandControl) {
+        let started = std::time::Instant::now();
+        self.disconnect().await;
+        control.record_phase(BlePhase::Disconnect, started.elapsed());
     }
 
     async fn abort_connection(&mut self) {
@@ -733,6 +782,7 @@ impl BtleplugAdapter {
         let Some(cached) = self.take_cached_connection() else {
             return Ok(None);
         };
+        control.record_cached_connection_reuse(false);
         let mut disconnect_guard = DisconnectGuard::new(&cached.peripheral);
         if !connection_reusable(
             &cached.peripheral_id,
@@ -784,6 +834,7 @@ impl BtleplugAdapter {
             disconnect_guard.disconnect().await;
             return Err(error);
         }
+        control.record_cached_connection_reuse(true);
         disconnect_guard.disarm();
         Ok(Some(cached.peripheral))
     }
@@ -1400,18 +1451,30 @@ impl BleAdapter for BtleplugAdapter {
             .await?;
         let mut disconnect_guard = DisconnectGuard::new(&peripheral);
         let characteristics = peripheral.characteristics().into_iter().collect::<Vec<_>>();
-        let firmware_version =
-            match read_firmware_revision(&peripheral, &characteristics, control).await {
-                Ok(version) => version,
-                Err(failure) => {
-                    disconnect_guard.disconnect().await;
-                    return Err(failure);
-                }
-            };
-        if !firmware_supports_motor_speed(&firmware_version) {
-            disconnect_guard.disconnect().await;
+        let firmware_started = std::time::Instant::now();
+        let firmware_result = read_firmware_revision(&peripheral, &characteristics, control).await;
+        control.record_phase(BlePhase::FirmwareCheck, firmware_started.elapsed());
+        let firmware_version = match firmware_result {
+            Ok(version) => version,
+            Err(failure) => {
+                disconnect_guard.disconnect_and_record(control).await;
+                return Err(failure);
+            }
+        };
+        let speed_status = match motor_speed_firmware_support(&firmware_version) {
+            MotorSpeedFirmwareSupport::Supported => MotorSpeedReadbackStatus::Read,
+            MotorSpeedFirmwareSupport::Unsupported => {
+                MotorSpeedReadbackStatus::SkippedUnsupportedFirmware
+            }
+            MotorSpeedFirmwareSupport::Unrecognized => {
+                MotorSpeedReadbackStatus::SkippedUnrecognizedFirmware
+            }
+        };
+        if speed_status != MotorSpeedReadbackStatus::Read {
+            disconnect_guard.disconnect_and_record(control).await;
             return Ok(MotorSettingsReadback {
                 firmware_version,
+                motor_speed_readback_status: speed_status,
                 motor_speed_percent: None,
                 local_time_offset_minutes: None,
                 boot_sequence: None,
@@ -1425,6 +1488,7 @@ impl BleAdapter for BtleplugAdapter {
         let characteristic_uuid =
             Uuid::parse_str(crate::controller::SHADE_CONFIG_CHARACTERISTIC_UUID)
                 .expect("Shade Config characteristic UUID is a fixed valid UUID");
+        let discovery_started = std::time::Instant::now();
         let characteristic = characteristics.iter().find(|characteristic| {
             characteristic.service_uuid == service_uuid
                 && characteristic.uuid == characteristic_uuid
@@ -1433,59 +1497,81 @@ impl BleAdapter for BtleplugAdapter {
                     .properties
                     .intersects(CharPropFlags::NOTIFY | CharPropFlags::INDICATE)
         });
+        control.record_phase(
+            BlePhase::MotorSettingsDiscovery,
+            discovery_started.elapsed(),
+        );
         let Some(characteristic) = characteristic else {
-            disconnect_guard.disconnect().await;
+            disconnect_guard.disconnect_and_record(control).await;
             return Err(BleFailure::before_write(
                 BleFailureStage::MotorSettingsDiscovery,
                 false,
             ));
         };
+        let notifications_started = std::time::Instant::now();
         let notifications_result = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                disconnect_guard.disconnect().await;
+                control.record_phase(
+                    BlePhase::MotorSettingsNotifications,
+                    notifications_started.elapsed(),
+                );
+                disconnect_guard.disconnect_and_record(control).await;
                 return Err(control.cancellation_failure());
             }
             result = tokio::time::timeout(Duration::from_secs(5), peripheral.notifications()) => result,
         };
+        control.record_phase(
+            BlePhase::MotorSettingsNotifications,
+            notifications_started.elapsed(),
+        );
         let mut notifications = match notifications_result {
             Ok(Ok(notifications)) => notifications,
             Ok(Err(error)) => {
                 tracing::warn!(operation = "motor_settings_notifications", %error, "BLE motor settings notification stream failed");
-                disconnect_guard.disconnect().await;
+                disconnect_guard.disconnect_and_record(control).await;
                 return Err(BleFailure::before_write(
                     BleFailureStage::MotorSettingsRead,
                     true,
                 ));
             }
             Err(_) => {
-                disconnect_guard.disconnect().await;
+                disconnect_guard.disconnect_and_record(control).await;
                 return Err(BleFailure::before_write(
                     BleFailureStage::MotorSettingsRead,
                     true,
                 ));
             }
         };
+        let subscribe_started = std::time::Instant::now();
         let subscribe = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                disconnect_guard.disconnect().await;
+                control.record_phase(
+                    BlePhase::MotorSettingsSubscribe,
+                    subscribe_started.elapsed(),
+                );
+                disconnect_guard.disconnect_and_record(control).await;
                 return Err(control.cancellation_failure());
             }
             result = tokio::time::timeout(Duration::from_secs(5), peripheral.subscribe(characteristic)) => result,
         };
+        control.record_phase(
+            BlePhase::MotorSettingsSubscribe,
+            subscribe_started.elapsed(),
+        );
         match subscribe {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(operation = "motor_settings_subscribe", %error, "BLE motor settings notification subscription failed");
-                disconnect_guard.disconnect().await;
+                disconnect_guard.disconnect_and_record(control).await;
                 return Err(BleFailure::before_write(
                     BleFailureStage::MotorSettingsRead,
                     true,
                 ));
             }
             Err(_) => {
-                disconnect_guard.disconnect().await;
+                disconnect_guard.disconnect_and_record(control).await;
                 return Err(BleFailure::before_write(
                     BleFailureStage::MotorSettingsRead,
                     true,
@@ -1494,41 +1580,51 @@ impl BleAdapter for BtleplugAdapter {
         }
         let request = encode_shade_config_readback_query(true);
         if !control.begin_read_query_write() {
-            disconnect_guard.disconnect().await;
+            disconnect_guard.disconnect_and_record(control).await;
             return Err(control.cancellation_failure());
         }
+        let query_write_started = std::time::Instant::now();
         let write = tokio::time::timeout(
             Duration::from_secs(5),
             peripheral.write(characteristic, &request, WriteType::WithResponse),
         )
         .await;
+        control.record_phase(
+            BlePhase::MotorSettingsQueryWrite,
+            query_write_started.elapsed(),
+        );
         let stop_or_deadline_arrived = control.finish_read_query_write();
         if stop_or_deadline_arrived || control.is_cancelled() {
-            disconnect_guard.disconnect().await;
+            disconnect_guard.disconnect_and_record(control).await;
             return Err(control.cancellation_failure());
         }
         match write {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(operation = "motor_settings_query", %error, "BLE motor settings query write failed");
-                disconnect_guard.disconnect().await;
+                disconnect_guard.disconnect_and_record(control).await;
                 return Err(BleFailure::before_write(
                     BleFailureStage::MotorSettingsRead,
                     true,
                 ));
             }
             Err(_) => {
-                disconnect_guard.disconnect().await;
+                disconnect_guard.disconnect_and_record(control).await;
                 return Err(BleFailure::before_write(
                     BleFailureStage::MotorSettingsRead,
                     true,
                 ));
             }
         }
+        let readback_started = std::time::Instant::now();
         let readback = tokio::select! {
             biased;
             _ = control.cancelled() => {
-                disconnect_guard.disconnect().await;
+                control.record_phase(
+                    BlePhase::MotorSettingsReadback,
+                    readback_started.elapsed(),
+                );
+                disconnect_guard.disconnect_and_record(control).await;
                 return Err(control.cancellation_failure());
             }
             result = tokio::time::timeout(Duration::from_secs(5), async {
@@ -1543,10 +1639,12 @@ impl BleAdapter for BtleplugAdapter {
                 None
             }) => result,
         };
-        disconnect_guard.disconnect().await;
+        control.record_phase(BlePhase::MotorSettingsReadback, readback_started.elapsed());
+        disconnect_guard.disconnect_and_record(control).await;
         match readback {
             Ok(Some(settings)) => Ok(MotorSettingsReadback {
                 firmware_version,
+                motor_speed_readback_status: MotorSpeedReadbackStatus::Read,
                 motor_speed_percent: settings.motor_speed_percent,
                 local_time_offset_minutes: settings.local_time_offset_minutes,
                 boot_sequence: settings.boot_sequence,
@@ -1752,7 +1850,7 @@ mod battery_tests {
         );
         assert_eq!(
             connect_timeout(ConnectionPurpose::Command, 1),
-            Duration::from_secs(5)
+            Duration::from_secs(6)
         );
         assert_eq!(
             connect_timeout(ConnectionPurpose::Command, 2),
@@ -1802,6 +1900,17 @@ mod battery_tests {
             "HallwayBlind",
             now
         ));
+    }
+
+    #[test]
+    fn cache_reuse_timing_records_a_hit_or_a_discard() {
+        let reused = BleCommandControl::new();
+        reused.record_cached_connection_reuse(true);
+        assert_eq!(reused.timings().cached_connection_reused, Some(true));
+
+        let discarded = BleCommandControl::new();
+        discarded.record_cached_connection_reuse(false);
+        assert_eq!(discarded.timings().cached_connection_reused, Some(false));
     }
 
     #[test]
