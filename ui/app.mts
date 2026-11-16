@@ -1122,9 +1122,30 @@ async function undoBatchTargets(): Promise<void> {
  }
 }
 
+export function createServiceWorkerUpdateHandler(reload:()=>void): {
+ requestActivation:(worker:Pick<ServiceWorker,'postMessage'>|null|undefined)=>void;
+ onControllerChange:()=>void;
+} {
+ let expectingControllerChange=false;
+ return {
+  requestActivation(worker){
+   if(!worker)return;
+   expectingControllerChange=true;
+   worker.postMessage({type:'SKIP_WAITING'});
+  },
+  onControllerChange(){
+   if(!expectingControllerChange)return;
+   expectingControllerChange=false;
+   reload();
+  },
+ };
+}
+
+const serviceWorkerUpdateHandler=createServiceWorkerUpdateHandler(()=>globalThis.location.reload());
+
 async function activateWaitingWorker(): Promise<void> {
  const registration=await navigator.serviceWorker?.getRegistration('/');
- registration?.waiting?.postMessage({type:'SKIP_WAITING'});
+ serviceWorkerUpdateHandler.requestActivation(registration?.waiting);
 }
 
 async function registerServiceWorker(): Promise<void> {
@@ -1137,7 +1158,7 @@ async function registerServiceWorker(): Promise<void> {
    const worker=registration.installing;
    worker?.addEventListener('statechange',()=>{if(worker.state==='installed'&&navigator.serviceWorker.controller)announce();});
   });
-  navigator.serviceWorker.addEventListener('controllerchange',()=>globalThis.location.reload());
+  navigator.serviceWorker.addEventListener('controllerchange',serviceWorkerUpdateHandler.onControllerChange);
  }catch{/* Offline or unsupported browser: the app continues without installation support. */}
 }
 

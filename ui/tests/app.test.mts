@@ -26,6 +26,32 @@ test('automatic display mode distinguishes square panels from phones and desktop
  assert.equal(resolveDisplayMode('auto', 800, 560), 'desktop');
 });
 
+test('service worker reloads only after a user-requested waiting worker activation',async()=>{
+ const {createServiceWorkerUpdateHandler}=await import('../app.mjs') as unknown as {
+  createServiceWorkerUpdateHandler:(reload:()=>void)=>{
+   requestActivation:(worker:Pick<ServiceWorker,'postMessage'>|null|undefined)=>void;
+   onControllerChange:()=>void;
+  };
+ };
+ let reloads=0;
+ const handler=createServiceWorkerUpdateHandler(()=>{reloads++;});
+
+ handler.onControllerChange();
+ assert.equal(reloads,0);
+ handler.requestActivation(null);
+ handler.onControllerChange();
+ assert.equal(reloads,0);
+
+ const messages:unknown[]=[];
+ const waitingWorker={postMessage:(message:unknown)=>messages.push(message)} as unknown as Pick<ServiceWorker,'postMessage'>;
+ handler.requestActivation(waitingWorker);
+ assert.deepEqual(messages,[{type:'SKIP_WAITING'}]);
+ handler.onControllerChange();
+ assert.equal(reloads,1);
+ handler.onControllerChange();
+ assert.equal(reloads,1);
+});
+
 test('availability and relative timestamps use plain language',()=>{
  assert.deepEqual((['ready','stale','not_seen','ambiguous','unavailable'] as const).map(value=>availability(value)[0]),[
   'Online','Not responding','Not found','Needs attention','Unavailable',
