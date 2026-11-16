@@ -122,6 +122,7 @@ export interface SkippedBlind {
 }
 
 export interface BatchTarget {
+  managed_device_id?: string;
   label?: string;
   status: CommandStatus;
 }
@@ -183,6 +184,7 @@ export interface Simulator {
 export interface SnackbarAction {
   label: string;
   action: string;
+  icon?: string;
 }
 
 export interface Notification {
