@@ -20,6 +20,7 @@ use somaris::{
     ble::{
         BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureCause,
         BleFailureStage, BleObservation, BleScanControl, MotorSettingsReadback,
+        MotorSpeedReadbackStatus,
     },
     controller::ServiceAction,
 };
@@ -39,6 +40,7 @@ struct FakeBleAdapter {
     writes: Mutex<Vec<ServiceAction>>,
     gate: Mutex<Option<Arc<ActionGate>>>,
     battery_gate: Mutex<Option<Arc<BatteryGate>>>,
+    motor_settings_failure: Mutex<Option<BleFailure>>,
 }
 
 struct ActionGate {
@@ -127,6 +129,7 @@ impl FakeBleAdapter {
             writes: Mutex::default(),
             gate: Mutex::default(),
             battery_gate: Mutex::default(),
+            motor_settings_failure: Mutex::default(),
         }
     }
 
@@ -139,6 +142,12 @@ impl FakeBleAdapter {
     fn with_battery_gate(observations: Vec<BleObservation>, gate: Arc<BatteryGate>) -> Self {
         let adapter = Self::with_observations(observations);
         *adapter.battery_gate.lock().unwrap() = Some(gate);
+        adapter
+    }
+
+    fn with_motor_settings_failure(observations: Vec<BleObservation>, failure: BleFailure) -> Self {
+        let adapter = Self::with_observations(observations);
+        *adapter.motor_settings_failure.lock().unwrap() = Some(failure);
         adapter
     }
 
@@ -249,6 +258,19 @@ impl BleAdapter for FakeBleAdapter {
         _expected_name: &str,
         control: &BleCommandControl,
     ) -> Result<MotorSettingsReadback, BleFailure> {
+        control.record_timings(BleAttemptTimings {
+            peripheral_lookup_ms: Some(11),
+            connect_ms: Some(22),
+            service_discovery_ms: Some(33),
+            firmware_check_ms: Some(44),
+            cached_connection_reused: Some(true),
+            motor_settings_discovery_ms: Some(55),
+            motor_settings_notifications_ms: Some(66),
+            motor_settings_subscribe_ms: Some(77),
+            motor_settings_query_write_ms: Some(88),
+            motor_settings_readback_ms: Some(99),
+            ..BleAttemptTimings::default()
+        });
         let gate = self.battery_gate.lock().unwrap().clone();
         if let Some(gate) = gate {
             gate.entered.notify_one();
@@ -261,8 +283,12 @@ impl BleAdapter for FakeBleAdapter {
         if control.is_cancelled() {
             return Err(control.cancellation_failure());
         }
+        if let Some(failure) = self.motor_settings_failure.lock().unwrap().clone() {
+            return Err(failure);
+        }
         Ok(MotorSettingsReadback {
             firmware_version: "2.2.0".into(),
+            motor_speed_readback_status: MotorSpeedReadbackStatus::Read,
             motor_speed_percent: Some(37),
             local_time_offset_minutes: Some(240),
             boot_sequence: Some(0x1122_3344),
@@ -339,6 +365,7 @@ impl BleAdapter for FakeBleAdapter {
             firmware_check_ms: None,
             gatt_write_ms: Some(6),
             disconnect_ms: Some(7),
+            ..BleAttemptTimings::default()
         });
         self.writes.lock().unwrap().push(action);
         if should_pause && gate.as_ref().unwrap().after_write {
@@ -469,13 +496,60 @@ async fn enrolled_blind_motor_settings_can_be_read_back_without_a_motor_command(
     assert_eq!(status, StatusCode::OK);
     let settings = response.unwrap()["data"].clone();
     assert_eq!(settings["firmware_version"], "2.2.0");
+    assert_eq!(settings["motor_speed_readback_status"], "read");
     assert_eq!(settings["motor_speed_percent"], 37);
     assert_eq!(settings["local_time_offset_minutes"], 240);
     assert_eq!(settings["boot_sequence"], 0x1122_3344u64);
     assert_eq!(settings["sunrise_epoch_seconds"], 0x6500_0000u64);
     assert_eq!(settings["sunset_epoch_seconds"], 0x6600_0000u64);
+    assert_eq!(settings["phase_timings"]["connect_ms"], 22);
+    assert_eq!(settings["phase_timings"]["firmware_check_ms"], 44);
+    assert_eq!(settings["phase_timings"]["cached_connection_reused"], true);
+    assert_eq!(settings["phase_timings"]["motor_settings_discovery_ms"], 55);
+    assert_eq!(
+        settings["phase_timings"]["motor_settings_notifications_ms"],
+        66
+    );
+    assert_eq!(settings["phase_timings"]["motor_settings_subscribe_ms"], 77);
+    assert_eq!(
+        settings["phase_timings"]["motor_settings_query_write_ms"],
+        88
+    );
+    assert_eq!(settings["phase_timings"]["motor_settings_readback_ms"], 99);
     assert!(settings["observed_at"].is_string());
     assert!(adapter.actions.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn motor_settings_failure_includes_connection_phase_timings() {
+    let adapter = Arc::new(FakeBleAdapter::with_motor_settings_failure(
+        vec![closed_blind()],
+        BleFailure {
+            stage: BleFailureStage::DeviceConnection,
+            cause: Some(BleFailureCause::ConnectionTimeout),
+            retryable_before_write: true,
+            write_may_have_been_sent: false,
+            outcome_unknown: false,
+        },
+    ));
+    let app = app_with_adapter(adapter).await;
+    let blind = wait_for_blind(&app, "Bedroom Right0").await;
+    let managed_id = enroll(&app, &blind).await;
+
+    let (status, response) = request(
+        &app,
+        Method::GET,
+        &format!("/api/control/v1/devices/{managed_id}/motor-settings"),
+        &[],
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let error = response.unwrap()["error"].clone();
+    assert_eq!(error["code"], "device_connection_failed");
+    assert_eq!(error["phase_timings"]["connect_ms"], 22);
+    assert_eq!(error["phase_timings"]["firmware_check_ms"], 44);
 }
 
 #[tokio::test]

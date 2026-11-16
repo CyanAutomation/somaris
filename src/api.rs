@@ -16,8 +16,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use crate::{
     ble::{
         BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureCause,
-        BleFailureStage, BleObservation, BleScanControl, BtleplugAdapter, SOMA_MANUFACTURER_ID,
-        decode_ba71_voltage, parse_soma_payload,
+        BleFailureStage, BleObservation, BleScanControl, BtleplugAdapter, MotorSpeedReadbackStatus,
+        SOMA_MANUFACTURER_ID, decode_ba71_voltage, parse_soma_payload,
     },
     controller::ServiceAction,
     integration::{DeviceCapabilities, StateChange, StateChangePublisher},
@@ -2620,6 +2620,7 @@ async fn set_simulator_scenario_for(
             WirelessProfile::Standard => (0, 0),
             WirelessProfile::HallwayObserved => (80, 72),
             WirelessProfile::HallwaySlowLink => (702, 72),
+            WirelessProfile::AgentlabRealistic => (1_440, 109),
         };
         device.rssi_dbm = simulator_rssi(profile, Utc::now());
     }
@@ -2910,6 +2911,8 @@ struct ErrorEnvelope {
 struct ApiError {
     code: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_timings: Option<BleAttemptTimings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3091,6 +3094,7 @@ enum WirelessProfile {
     Standard,
     HallwayObserved,
     HallwaySlowLink,
+    AgentlabRealistic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3181,11 +3185,13 @@ pub struct ManagedDevice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MotorSettingsData {
     firmware_version: String,
+    motor_speed_readback_status: MotorSpeedReadbackStatus,
     motor_speed_percent: Option<u8>,
     local_time_offset_minutes: Option<i16>,
     boot_sequence: Option<u32>,
     sunrise_epoch_seconds: Option<u32>,
     sunset_epoch_seconds: Option<u32>,
+    phase_timings: BleAttemptTimings,
     observed_at: DateTime<Utc>,
 }
 
@@ -3489,12 +3495,22 @@ fn envelope<T>(data: T, count: Option<u64>) -> Envelope<T> {
 }
 
 fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    error_response_with_phase_timings(status, code, message, None)
+}
+
+fn error_response_with_phase_timings(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    phase_timings: Option<BleAttemptTimings>,
+) -> Response {
     (
         status,
         Json(ErrorEnvelope {
             error: ApiError {
                 code: code.to_owned(),
                 message: message.to_owned(),
+                phase_timings,
             },
             meta: Meta {
                 generated_at: Utc::now(),
@@ -4116,6 +4132,61 @@ fn advance_simulator(device: &mut Device, config: &SimulatorConfig, now: DateTim
     device.rssi_dbm = simulator_rssi(config.wireless_profile, now);
 }
 
+const AGENTLAB_CONNECT_DELAY_RANGE_MS: std::ops::RangeInclusive<u64> = 1_440..=5_240;
+const AGENTLAB_WRITE_DELAY_RANGE_MS: std::ops::RangeInclusive<u64> = 109..=699;
+
+fn simulator_transport_delays(
+    profile: WirelessProfile,
+    command_id: &str,
+    configured_connection_delay_ms: u64,
+    configured_write_delay_ms: u64,
+) -> (u64, u64) {
+    if profile != WirelessProfile::AgentlabRealistic {
+        return (configured_connection_delay_ms, configured_write_delay_ms);
+    }
+
+    (
+        deterministic_simulator_delay(command_id, "connect", AGENTLAB_CONNECT_DELAY_RANGE_MS),
+        deterministic_simulator_delay(command_id, "gatt_write", AGENTLAB_WRITE_DELAY_RANGE_MS),
+    )
+}
+
+fn deterministic_simulator_delay(
+    command_id: &str,
+    phase: &str,
+    range: std::ops::RangeInclusive<u64>,
+) -> u64 {
+    let start = *range.start();
+    let end = *range.end();
+    let digest = Sha256::digest(format!("somaris-simulator:{command_id}:{phase}").as_bytes());
+    let sample = u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest includes at least eight bytes"),
+    );
+    start + sample % (end - start + 1)
+}
+
+async fn wait_for_simulator_phase(
+    control: &BleCommandControl,
+    deadline: tokio::time::Instant,
+    delay_ms: u64,
+) -> Result<(), BleFailure> {
+    let delay = tokio::time::sleep(StdDuration::from_millis(delay_ms));
+    tokio::pin!(delay);
+    tokio::select! {
+        biased;
+        _ = control.cancelled() => Err(BleFailure::command_preempted()),
+        result = tokio::time::timeout_at(deadline, &mut delay) => match result {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                control.request_deadline_cancel();
+                Err(control.cancellation_failure())
+            }
+        }
+    }
+}
+
 fn simulator_rssi(profile: WirelessProfile, now: DateTime<Utc>) -> i16 {
     const HALLWAY_RSSI_SAMPLES: [i16; 26] = [
         -82, -85, -87, -71, -83, -67, -67, -90, -85, -85, -86, -85, -88, -85, -87, -86, -83, -83,
@@ -4123,7 +4194,9 @@ fn simulator_rssi(profile: WirelessProfile, now: DateTime<Utc>) -> i16 {
     ];
     match profile {
         WirelessProfile::Standard => -60,
-        WirelessProfile::HallwayObserved | WirelessProfile::HallwaySlowLink => {
+        WirelessProfile::HallwayObserved
+        | WirelessProfile::HallwaySlowLink
+        | WirelessProfile::AgentlabRealistic => {
             let index = now
                 .timestamp()
                 .rem_euclid(HALLWAY_RSSI_SAMPLES.len() as i64) as usize;
@@ -4447,6 +4520,7 @@ async fn get_motor_settings(
         adapter.read_motor_settings(&peripheral_id, &expected_name, &control),
     )
     .await;
+    let phase_timings = control.timings();
     state
         .unregister_background_read(&managed_device_id, &control)
         .await;
@@ -4455,23 +4529,19 @@ async fn get_motor_settings(
         Ok(Ok(settings)) => {
             let result = MotorSettingsData {
                 firmware_version: settings.firmware_version,
+                motor_speed_readback_status: settings.motor_speed_readback_status,
                 motor_speed_percent: settings.motor_speed_percent,
                 local_time_offset_minutes: settings.local_time_offset_minutes,
                 boot_sequence: settings.boot_sequence,
                 sunrise_epoch_seconds: settings.sunrise_epoch_seconds,
                 sunset_epoch_seconds: settings.sunset_epoch_seconds,
+                phase_timings,
                 observed_at: Utc::now(),
             };
             (StatusCode::OK, Json(envelope(result, None))).into_response()
         }
         Ok(Err(failure)) => {
-            let (status, code, message) = if failure.stage == BleFailureStage::UnsupportedFirmware {
-                (
-                    StatusCode::CONFLICT,
-                    "firmware_unsupported",
-                    "Motor-speed settings require SOMA firmware 2.2.0 or later.",
-                )
-            } else if failure.stage == BleFailureStage::CommandPreempted {
+            let (status, code, message) = if failure.stage == BleFailureStage::CommandPreempted {
                 (
                     StatusCode::CONFLICT,
                     "preempted_by_stop",
@@ -4484,12 +4554,13 @@ async fn get_motor_settings(
                     "The motor settings could not be read from the blind.",
                 )
             };
-            error_response(status, code, message)
+            error_response_with_phase_timings(status, code, message, Some(phase_timings))
         }
-        Err(_) => error_response(
+        Err(_) => error_response_with_phase_timings(
             StatusCode::GATEWAY_TIMEOUT,
             "motor_settings_timeout",
             "Timed out reading motor settings from the blind.",
+            Some(phase_timings),
         ),
     }
 }
@@ -5922,12 +5993,21 @@ async fn process_command_with_retry_budget(
         let scenario = config
             .as_ref()
             .map_or(SimulatorScenario::Normal, |config| config.scenario);
-        let connection_delay_ms = config
+        let wireless_profile = config
+            .as_ref()
+            .map_or(WirelessProfile::Standard, |config| config.wireless_profile);
+        let configured_connection_delay_ms = config
             .as_ref()
             .map_or(0, |config| config.connection_delay_ms);
-        let write_delay_ms = config
+        let configured_write_delay_ms = config
             .as_ref()
             .map_or(0, |config| config.write_response_delay_ms);
+        let (connection_delay_ms, write_delay_ms) = simulator_transport_delays(
+            wireless_profile,
+            &command_id,
+            configured_connection_delay_ms,
+            configured_write_delay_ms,
+        );
         set_activity_status(&mut inner, &command_id, "connecting", None);
         let _ = state
             .persist_with_operation(&inner, "command_connecting")
@@ -5966,48 +6046,60 @@ async fn process_command_with_retry_budget(
     };
     drop(adapter_permit);
     let simulation_started = Instant::now();
-    let delay = tokio::time::sleep(StdDuration::from_millis(
-        connection_delay_ms.saturating_add(write_delay_ms),
-    ));
-    tokio::pin!(delay);
-    let delay_result = tokio::select! {
-        biased;
-        _ = control.cancelled() => Err(BleFailure::command_preempted()),
-        result = tokio::time::timeout_at(execution_deadline, &mut delay) => match result {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                control.request_deadline_cancel();
-                Err(control.cancellation_failure())
-            }
-        }
-    };
-    if let Err(failure) = delay_result {
+    let mut phase_timings = BleAttemptTimings::default();
+    let connect_started = Instant::now();
+    let connect_result =
+        wait_for_simulator_phase(&control, execution_deadline, connection_delay_ms).await;
+    phase_timings.connect_ms =
+        Some(connect_started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    if let Err(failure) = connect_result {
         let error_code = ble_failure_code(&failure);
         finish_command_attempt(
             &state,
             &command_id,
             first_attempt,
             simulation_started.elapsed(),
-            BleAttemptTimings::default(),
+            phase_timings,
             Err(&failure),
         )
         .await;
         complete_physical_failure(&state, &command_id, failure, error_code).await;
         return;
     }
-    if scenario != SimulatorScenario::PreWriteFailure && !control.begin_write() {
-        let failure = BleFailure::command_preempted();
-        finish_command_attempt(
-            &state,
-            &command_id,
-            first_attempt,
-            simulation_started.elapsed(),
-            BleAttemptTimings::default(),
-            Err(&failure),
-        )
-        .await;
-        complete_physical_failure(&state, &command_id, failure, "preempted_by_stop").await;
-        return;
+    if scenario != SimulatorScenario::PreWriteFailure {
+        if !control.begin_write() {
+            let failure = BleFailure::command_preempted();
+            finish_command_attempt(
+                &state,
+                &command_id,
+                first_attempt,
+                simulation_started.elapsed(),
+                phase_timings,
+                Err(&failure),
+            )
+            .await;
+            complete_physical_failure(&state, &command_id, failure, "preempted_by_stop").await;
+            return;
+        }
+        let write_started = Instant::now();
+        let write_result =
+            wait_for_simulator_phase(&control, execution_deadline, write_delay_ms).await;
+        phase_timings.gatt_write_ms =
+            Some(write_started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+        if let Err(failure) = write_result {
+            let error_code = ble_failure_code(&failure);
+            finish_command_attempt(
+                &state,
+                &command_id,
+                first_attempt,
+                simulation_started.elapsed(),
+                phase_timings,
+                Err(&failure),
+            )
+            .await;
+            complete_physical_failure(&state, &command_id, failure, error_code).await;
+            return;
+        }
     }
 
     let mut inner = state.inner.lock().await;
@@ -6079,6 +6171,7 @@ async fn process_command_with_retry_budget(
                     .num_milliseconds()
                     .max(0) as u64,
             );
+            attempt.phase_timings = phase_timings;
         }
         match scenario {
             SimulatorScenario::PreWriteFailure => {
@@ -6090,6 +6183,8 @@ async fn process_command_with_retry_budget(
                 if let Some(attempt) = command.attempts.last_mut() {
                     attempt.phase = "device_connection".into();
                     attempt.failure_stage = Some("device_connection".into());
+                    attempt.failure_cause =
+                        Some(BleFailureCause::ConnectionAbortedByLocal.as_str().into());
                     attempt.error_code = Some("connection_failed".into());
                     attempt.write_state = WriteState::NotSent;
                 }
@@ -6356,12 +6451,27 @@ fn cooldown_remaining_seconds(
     })
 }
 
-fn retry_backoff(command_id: &str, attempt: u8, failure_streak: usize) -> std::time::Duration {
+fn retry_backoff(
+    command_id: &str,
+    attempt: u8,
+    failure_streak: usize,
+    failure_cause: Option<BleFailureCause>,
+) -> std::time::Duration {
     let exponent = failure_streak
         .saturating_add(attempt.saturating_sub(1) as usize)
         .min(4) as u32;
-    let base_ms = 250_u64.saturating_mul(1_u64 << exponent).min(4_000);
-    let digest = Sha256::digest(format!("{command_id}:{attempt}:{failure_streak}").as_bytes());
+    let initial_delay_ms: u64 = if failure_cause == Some(BleFailureCause::ConnectionAbortedByLocal)
+    {
+        750
+    } else {
+        250
+    };
+    let base_ms = initial_delay_ms
+        .saturating_mul(1_u64 << exponent)
+        .min(4_000);
+    let digest = Sha256::digest(
+        format!("{command_id}:{attempt}:{failure_streak}:{failure_cause:?}").as_bytes(),
+    );
     let seed = u16::from_be_bytes([digest[0], digest[1]]) as u64;
     let jitter_ms = seed % (base_ms / 2 + 1);
     std::time::Duration::from_millis(base_ms / 2 + jitter_ms)
@@ -6629,7 +6739,7 @@ async fn process_physical_command(
             && failure_streak.saturating_add(attempt as usize) < COOLDOWN_FAILURE_THRESHOLD
             && retryable_prewrite_failure(failure)
         {
-            let delay = retry_backoff(command_id, attempt, failure_streak);
+            let delay = retry_backoff(command_id, attempt, failure_streak, failure.cause);
             let recovery = retry_recovery_policy(failure);
             let scan_refreshed = match recovery {
                 RetryRecoveryPolicy::QuickReconnect => false,
@@ -7568,16 +7678,63 @@ mod security_hardening_tests {
     }
 
     #[test]
+    fn agentlab_simulator_delays_are_repeatable_and_vary_with_command_id() {
+        let sample = |command_id| {
+            simulator_transport_delays(WirelessProfile::AgentlabRealistic, command_id, 0, 0)
+        };
+        let first = sample("command-1");
+        assert!((1_440..=5_240).contains(&first.0));
+        assert!((109..=699).contains(&first.1));
+        assert_eq!(first, sample("command-1"));
+
+        let mut samples = HashSet::new();
+        for index in 0..32 {
+            let command_id = format!("command-{index}");
+            samples.insert(simulator_transport_delays(
+                WirelessProfile::AgentlabRealistic,
+                &command_id,
+                0,
+                0,
+            ));
+        }
+        assert!(samples.len() > 1, "the profile should vary by command ID");
+    }
+
+    #[test]
     fn retry_backoff_is_stable_jittered_and_grows_with_failure_history() {
-        let first = retry_backoff("command-1", 1, 0);
-        assert_eq!(first, retry_backoff("command-1", 1, 0));
-        let later = retry_backoff("command-1", 1, 2);
+        let first = retry_backoff("command-1", 1, 0, None);
+        assert_eq!(first, retry_backoff("command-1", 1, 0, None));
+        let later = retry_backoff("command-1", 1, 2, None);
         assert!(later >= first);
         assert!(first >= StdDuration::from_millis(125));
         assert!(later <= StdDuration::from_millis(1_000));
         assert_eq!(cooldown_duration_seconds(3), None);
         assert_eq!(cooldown_duration_seconds(4), Some(15));
         assert_eq!(cooldown_duration_seconds(20), Some(120));
+    }
+
+    #[test]
+    fn local_abort_reconnect_backoff_is_longer_and_still_bounded() {
+        let generic = retry_backoff("command-1", 1, 0, None);
+        let local_abort = retry_backoff(
+            "command-1",
+            1,
+            0,
+            Some(BleFailureCause::ConnectionAbortedByLocal),
+        );
+        assert!(local_abort > generic);
+        assert!(local_abort >= StdDuration::from_millis(375));
+        // The inclusive jitter formula can produce the configured 750 ms ceiling.
+        assert!(local_abort <= StdDuration::from_millis(750));
+        assert_eq!(
+            local_abort,
+            retry_backoff(
+                "command-1",
+                1,
+                0,
+                Some(BleFailureCause::ConnectionAbortedByLocal)
+            )
+        );
     }
 
     #[test]
