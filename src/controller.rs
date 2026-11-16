@@ -193,6 +193,17 @@ pub fn parse_motor_speed_readback(response: &[u8]) -> Option<u8> {
 /// Motor-speed writes are supported by SOMA firmware 2.2.0 and newer.
 /// Semantic pre-releases above 2.2.0 pass the threshold; pre-releases of 2.2.0 do not.
 pub fn firmware_supports_motor_speed(version: &str) -> bool {
+    motor_speed_firmware_support(version) == MotorSpeedFirmwareSupport::Supported
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotorSpeedFirmwareSupport {
+    Supported,
+    Unsupported,
+    Unrecognized,
+}
+
+pub fn motor_speed_firmware_support(version: &str) -> MotorSpeedFirmwareSupport {
     let version = version.trim();
     let version = version
         .strip_prefix('v')
@@ -204,7 +215,7 @@ pub fn firmware_supports_motor_speed(version: &str) -> bool {
             (version, Some(metadata))
         });
     if build_metadata.is_some_and(|metadata| !valid_version_identifiers(metadata, false)) {
-        return false;
+        return MotorSpeedFirmwareSupport::Unrecognized;
     }
     let (version, prerelease) = version
         .split_once('-')
@@ -212,7 +223,7 @@ pub fn firmware_supports_motor_speed(version: &str) -> bool {
             (version, Some(prerelease))
         });
     if prerelease.is_some_and(|prerelease| !valid_version_identifiers(prerelease, true)) {
-        return false;
+        return MotorSpeedFirmwareSupport::Unrecognized;
     }
     let mut components = version.split('.');
     let (Some(major), Some(minor), Some(patch), None) = (
@@ -221,12 +232,14 @@ pub fn firmware_supports_motor_speed(version: &str) -> bool {
         components.next().and_then(parse_version_number),
         components.next(),
     ) else {
-        return false;
+        return MotorSpeedFirmwareSupport::Unrecognized;
     };
     match (major, minor, patch).cmp(&(2, 2, 0)) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Equal => prerelease.is_none(),
-        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Greater => MotorSpeedFirmwareSupport::Supported,
+        std::cmp::Ordering::Equal if prerelease.is_none() => MotorSpeedFirmwareSupport::Supported,
+        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
+            MotorSpeedFirmwareSupport::Unsupported
+        }
     }
 }
 
@@ -422,5 +435,21 @@ mod shade_config_tests {
         assert!(!firmware_supports_motor_speed("2.3.0rc1"));
         assert!(!firmware_supports_motor_speed("unknown"));
         assert!(!firmware_supports_motor_speed("2.2"));
+    }
+
+    #[test]
+    fn motor_speed_firmware_gate_distinguishes_unknown_from_older_firmware() {
+        assert_eq!(
+            motor_speed_firmware_support("2.1.9"),
+            MotorSpeedFirmwareSupport::Unsupported
+        );
+        assert_eq!(
+            motor_speed_firmware_support("52fcf2c8"),
+            MotorSpeedFirmwareSupport::Unrecognized
+        );
+        assert_eq!(
+            motor_speed_firmware_support("2.2.0"),
+            MotorSpeedFirmwareSupport::Supported
+        );
     }
 }

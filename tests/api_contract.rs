@@ -1254,6 +1254,20 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
             ["maximum"],
         100
     );
+    assert_eq!(
+        contract["components"]["schemas"]["MotorSettingsData"]["properties"]["motor_speed_readback_status"]
+            ["enum"],
+        json!([
+            "read",
+            "skipped_unsupported_firmware",
+            "skipped_unrecognized_firmware"
+        ])
+    );
+    assert!(
+        contract["components"]["schemas"]["MotorSettingsData"]["properties"]
+            .get("phase_timings")
+            .is_some()
+    );
     assert!(
         contract["components"]["schemas"]["ScannerDiagnostics"]["properties"]
             .get("adapter_recovery_count")
@@ -1263,6 +1277,33 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         contract["components"]["schemas"]["BleAttemptTimings"]["properties"]
             .get("firmware_check_ms")
             .is_some()
+    );
+    assert!(
+        contract["components"]["schemas"]["BleAttemptTimings"]["properties"]
+            .get("motor_settings_readback_ms")
+            .is_some()
+    );
+    assert!(
+        contract["components"]["schemas"]["ErrorEnvelope"]["properties"]["error"]["properties"]
+            .get("phase_timings")
+            .is_some()
+    );
+    let simulator_profile = &contract["components"]["schemas"]["SimulatorStatus"]["properties"]["wireless_profile"]
+        ["enum"];
+    assert!(
+        simulator_profile
+            .as_array()
+            .unwrap()
+            .contains(&json!("agentlab_realistic"))
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["SimulatorStatus"]["properties"]["connection_delay_ms"]["maximum"],
+        5_240
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["SimulatorStatus"]["properties"]["write_response_delay_ms"]
+            ["maximum"],
+        699
     );
     let command_request = &contract["components"]["schemas"]["CommandRequest"];
     assert_eq!(
