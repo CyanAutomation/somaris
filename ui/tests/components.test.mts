@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {parseHTML} from 'linkedom';
+import {readFileSync} from 'node:fs';
 import {
   blindState,
   movementStatusFromPositions,
@@ -19,6 +20,7 @@ import {
   renderAddBlindButton,
   renderConfirmationPanel,
   renderDeviceList,
+  renderMobileTabs,
   renderBatchControls,
   renderBatchFeedback,
   renderSnackbar,
@@ -91,18 +93,45 @@ test('percentage-position control reflects the observed target and has an access
   assert.match(controls, /type="range" min="0" max="100" step="1" value="47"/);
   assert.match(controls, /aria-label="Target position for Hallway in percent closed"/);
   assert.match(controls, /data-position-output="blind-1">47%/);
-  assert.match(controls, /data-action="position:blind-1"/);
-  assert.match(controls, /data-action="position:blind-1"[^>]*aria-label="Move to selected position for Hallway"/);
-  assert.match(controls, /data-action="position:blind-1"[^>]*title="Move to selected position for Hallway"/);
-  assert.match(controls, /data-icon="target"/);
-  assert.doesNotMatch(controls, /<span class="button-label">Move to position<\/span>/);
+  assert.match(controls, /data-position-preset="blind-1:50"/);
+  assert.match(controls, /aria-label="Move Hallway to 50% closed"/);
+  assert.doesNotMatch(controls, /position-submit|Move to selected position/);
+  for (const preset of [0, 25, 50, 75, 100]) assert.match(controls, new RegExp(`data-position-preset="blind-1:${preset}"`));
 
   const disabled = renderBlindActions({
     deviceId:'blind-1', blindLabel:'Hallway', supportsPosition:true,
     positionClosedPercent:47, movementDisabled:true,
   });
   assert.match(disabled, /data-position-input="blind-1"[^>]*disabled/);
-  assert.match(disabled, /data-action="position:blind-1"[^>]*disabled/);
+  assert.match(disabled, /data-position-preset="blind-1:50"[^>]*disabled/);
+});
+
+test('direct blind graphic is a keyboard accessible position slider outside panel mode', () => {
+  const regular = renderBlindCard({
+    id:'blind-1', label:'Hallway', availabilityLabel:'Online', availabilityStatus:'ready',
+    positionPercent:42, movementStatus:'at_target', supportsPosition:true,
+    controlsMarkup:renderBlindActions({deviceId:'blind-1',blindLabel:'Hallway',supportsPosition:true}),
+  });
+  assert.match(regular, /class="blind-art[^\"]*"[^>]*role="slider"/);
+  assert.match(regular, /aria-valuemin="0" aria-valuemax="100" aria-valuenow="42"/);
+  assert.match(regular, /aria-label="Blind position for Hallway, percent closed"/);
+
+  const panel = renderBlindCard({
+    id:'blind-1', label:'Hallway', availabilityLabel:'Online', availabilityStatus:'ready',
+    positionPercent:42, movementStatus:'at_target', supportsPosition:true, panelMode:true,
+    controlsMarkup:renderBlindActions({deviceId:'blind-1',blindLabel:'Hallway',supportsPosition:true,panelMode:true}),
+  });
+  assert.doesNotMatch(panel, /role="slider"/);
+});
+
+test('mobile tabs expose icon-only navigation and the current route', () => {
+  const root = parseMarkup(renderMobileTabs('activity'));
+  const tabs = [...root.querySelectorAll('.mobile-tab')];
+  assert.equal(tabs.length, 3);
+  assert.deepEqual(tabs.map(tab => tab.getAttribute('aria-label')), ['Blinds', 'Activity', 'Service status']);
+  assert.equal(tabs[1]?.getAttribute('aria-current'), 'page');
+  assert.ok(tabs.every(tab => tab.getAttribute('title')));
+  assert.ok(tabs.every(tab => tab.textContent === ''));
 });
 
 test('panel blind controls omit percentage positioning while other views retain it', () => {
@@ -119,7 +148,7 @@ test('panel blind controls omit percentage positioning while other views retain 
     deviceId:'blind-1', blindLabel:'Hallway', supportsPosition:true,
     positionClosedPercent:47,
   });
-  assert.match(regular, /data-action="position:blind-1"/);
+  assert.match(regular, /data-position-preset="blind-1:50"/);
 });
 
 test('motor speed control uses a typed percentage and disables during calibration', () => {
@@ -244,10 +273,10 @@ test('device badge and header expose escaped labels and accessible device detail
 });
 
 test('availability is a compact reusable icon indicator with an accessible status name', () => {
-  const ready = parseMarkup(renderStatusIndicator({label:'Observed recently', status:'ready'}));
+  const ready = parseMarkup(renderStatusIndicator({label:'Online', status:'ready'}));
   const indicator = ready.querySelector('[role="img"]');
-  assert.equal(indicator?.getAttribute('aria-label'), 'Observed recently');
-  assert.equal(indicator?.getAttribute('title'), 'Observed recently');
+  assert.equal(indicator?.getAttribute('aria-label'), 'Online');
+  assert.equal(indicator?.getAttribute('title'), 'Online');
   assert.equal(indicator?.textContent, '');
   const stale = parseMarkup(renderStatusIndicator({label:'Stale', tone:'warn', status:'stale'}));
   assert.equal(stale.querySelector('[role="img"]')?.getAttribute('aria-label'), 'Stale');
@@ -278,7 +307,7 @@ test('device cards expose blind identity, reported status, and named actions in 
   for (const panelMode of [false, true]) {
     const card = parseMarkup(renderBlindCard({
       id:'blind-1', label:'Bedroom Left', isSimulated:false, lastSeen:'Seen just now',
-      availabilityLabel:'Observed recently', availabilityStatus:'ready', positionPercent:100,
+      availabilityLabel:'Online', availabilityStatus:'ready', positionPercent:100,
       movementStatus:'opening',
       controlsMarkup:renderBlindActions({deviceId:'blind-1', blindLabel:'Bedroom Left', panelMode}),
       panelMode,
@@ -288,7 +317,7 @@ test('device cards expose blind identity, reported status, and named actions in 
     assert.equal(card.querySelector('article h3 button')?.getAttribute('aria-label'), 'View details for Bedroom Left');
     assert.equal(card.querySelector('.blind-state__label')?.textContent, 'Opening');
     assert.equal(card.querySelector('.blind-state__percent')?.textContent, '100% closed');
-    assert.equal(card.querySelector('[role="img"]')?.getAttribute('aria-label'), 'Observed recently');
+    assert.equal(card.querySelector('[role="img"]')?.getAttribute('aria-label'), 'Online');
     assert.deepEqual([...card.querySelectorAll('.controls button')]
       .map(button => button.getAttribute('aria-label')),
     ['Open Bedroom Left', 'Stop Bedroom Left', 'Close Bedroom Left']);
@@ -402,20 +431,55 @@ test('snackbar primitives escape content, announce by tone, and render an option
   assert.match(region, /Working/);
 });
 
+test('undo snackbar actions are icon-only and remain named',()=>{
+ const root=parseMarkup(renderSnackbar({message:'Target changed',action:{label:'Undo position',action:'undo-position:blind-1:42',icon:'undo'}}));
+ const action=root.querySelector('[data-snackbar-control="action"]');
+ assert.equal(action?.textContent,'');
+ assert.equal(action?.getAttribute('aria-label'),'Undo position');
+ assert.equal(action?.getAttribute('title'),'Undo position');
+ assert.equal(action?.querySelector('svg')?.getAttribute('data-icon'),'undo');
+});
+
+test('display menu lists icon-only display and theme choices with checked states',()=>{
+ const root=parseMarkup(renderTopbarActions({panelMode:false,displayPreference:'panel',themePreference:'light'}));
+ const menu=root.querySelector('[role="menu"]');
+ assert.ok(menu);
+ const items=[...menu.querySelectorAll('[role="menuitemradio"]')];
+ assert.equal(items.length,8);
+ assert.equal(items.find(item=>item.getAttribute('aria-label')==='Panel')?.getAttribute('aria-checked'),'true');
+ assert.equal(items.find(item=>item.getAttribute('aria-label')==='Light theme')?.getAttribute('aria-checked'),'true');
+ assert.ok(items.every(item=>item.getAttribute('title')));
+ assert.ok(items.every(item=>item.textContent===''));
+ assert.match(root.toString(),/data-action="service"/);
+});
+
+test('dark muted and footer token colors exceed AA text contrast',()=>{
+ const css=readFileSync(new URL('../style.css',import.meta.url),'utf8');
+ const token=(name:string)=>css.match(new RegExp(`${name}:(#[0-9a-fA-F]{6})`))?.[1]||'';
+ const luminance=(hex:string)=>{
+  const channels=[1,3,5].map(index=>parseInt(hex.slice(index,index+2),16)/255).map(value=>value<=.04045?value/12.92:((value+.055)/1.055)**2.4);
+  return channels[0]!*0.2126+channels[1]!*0.7152+channels[2]!*0.0722;
+ };
+ const ratio=(foreground:string,background:string)=>{const [high,low]=[luminance(foreground),luminance(background)].sort((a,b)=>b-a);return(high+.05)/(low+.05);};
+ const background=token('--token-bg');
+ assert.ok(ratio(token('--token-muted'),background)>=4.5);
+ assert.ok(ratio(token('--token-footer'),background)>=4.5);
+});
+
 test('topbar composes the plus-only add action beside a named mode toggle and refresh controls', () => {
   const panel = renderTopbarActions({blindCount:3, panelMode:true, displayPreference:'panel'});
   assert.match(panel, /class="topbar-device-count">3 blinds<\/span>/);
   assert.match(panel, /data-action="add"[^>]*aria-label="Add a blind"/);
   assert.match(panel, /data-icon="add"/);
   assert.match(panel, /id="display-mode-toggle"/);
-  assert.match(panel, /aria-label="Display mode: Panel\. Switch to Desktop"/);
-  assert.match(panel, /data-action="display-mode"/);
+  assert.match(panel, /aria-label="Display and theme settings/);
+  assert.match(panel, /data-action="display-menu-toggle"/);
   assert.match(panel, /data-icon="display"/);
-  assert.doesNotMatch(panel, /<select|<details class="display-menu"/);
+  assert.match(panel, /class="display-menu"/);
   assert.match(panel, /data-action="refresh"[^>]*aria-label="Refresh"/);
   assert.match(panel, /data-icon="refresh"/);
-  assert.ok(panel.indexOf('data-action="add"') < panel.indexOf('data-action="display-mode"'));
-  assert.ok(panel.indexOf('data-action="display-mode"') < panel.indexOf('data-action="refresh"'));
+  assert.ok(panel.indexOf('data-action="add"') < panel.indexOf('data-action="display-menu-toggle"'));
+  assert.ok(panel.indexOf('data-action="display-menu-toggle"') < panel.indexOf('data-action="refresh"'));
   assert.doesNotMatch(panel, />Add a blind</);
 
   for (const displayPreference of ['mobile', 'desktop']) {
@@ -427,10 +491,20 @@ test('topbar composes the plus-only add action beside a named mode toggle and re
   }
 });
 
+test('panel topbar keeps a demo reset icon when the demo banner is compacted away', () => {
+  const panel = renderTopbarActions({panelMode:true, demoMode:true});
+  const reset = parseMarkup(panel).querySelector('[data-action="demo-reset"]');
+  assert.ok(reset);
+  assert.equal(reset.getAttribute('aria-label'),'Reset demo');
+  assert.equal(reset.getAttribute('title'),'Reset demo');
+  assert.equal(reset.textContent,'');
+  assert.equal(reset.querySelector('svg')?.getAttribute('data-icon'),'reset');
+});
+
 test('demo device cards show optional room metadata without changing control semantics', () => {
   const card = renderBlindCard({
     id:'demo-living', label:'Living Room — Main Window', room:'Living Room', isSimulated:true,
-    lastSeen:'Seen just now', availabilityLabel:'Observed recently', positionPercent:75,
+    lastSeen:'Last heard from just now', availabilityLabel:'Online', positionPercent:75,
     movementStatus:'at_target', controlsMarkup:'OPEN STOP CLOSE',
   });
   assert.match(card, /Living Room — Main Window/);

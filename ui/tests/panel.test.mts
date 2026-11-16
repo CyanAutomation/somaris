@@ -50,14 +50,31 @@ function panelMarkup({longLabels = false, notices = false}: {longLabels?: boolea
   }).join('');
   const toolbar = renderBatchControls({blindCount:4, eligibleCount:4, panelMode:true});
   const devices = renderDeviceList({count:4, panelMode:true, cardsMarkup:cards, toolbarMarkup:toolbar});
-  const topbar = renderTopbarActions({blindCount:4, panelMode:true, displayPreference:'panel'});
+  const topbar = renderTopbarActions({blindCount:4, panelMode:true, displayPreference:'panel', demoMode:true});
 
-  return `<!doctype html><html lang="en" data-display-mode="panel"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><a class="brand" href="#home">somaris.</a><div class="top-actions">${topbar}</div></header><main id="app">${devices}</main></div></body></html>`;
+  return `<!doctype html><html lang="en" data-display-mode="panel"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><a class="brand" href="#home">somaris.</a><div class="top-actions">${topbar}</div></header><main id="app"><section class="demo-banner"><span>Explore a simulated smart home.</span><button class="icon-button">Reset</button></section>${devices}</main></div></body></html>`;
 }
 
 async function openPanel(width: number, height: number, options: {longLabels?: boolean; notices?: boolean} = {}): Promise<Page> {
   const page = await browser.newPage({viewport:{width, height}});
   await page.setContent(panelMarkup(options));
+  return page;
+}
+
+async function openMobile(width: number): Promise<Page> {
+  const page = await browser.newPage({viewport:{width, height:844}});
+  const controls = renderBlindActions({deviceId:'mobile-blind', blindLabel:'Living Room Main Window', supportsPosition:true});
+  const card = renderBlindCard({
+    id:'mobile-blind',
+    label:'Living Room Main Window',
+    availabilityLabel:'Online',
+    availabilityStatus:'ready',
+    positionPercent:50,
+    movementStatus:'at_target',
+    controlsMarkup:controls,
+  });
+  const toolbar = renderTopbarActions({blindCount:1, displayPreference:'mobile'});
+  await page.setContent(`<!doctype html><html lang="en" data-display-mode="mobile"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><a class="brand" href="#home"><span class="brand-mark"><i></i><i></i><i></i></span><span>somaris<span class="brand-dot">.</span></span></a><div class="top-actions">${toolbar}</div></header><main id="app"><section class="demo-banner"><div>Demo</div><button class="button icon-button icon-action">↻</button></section><section class="hero"><div>Welcome</div><button class="button icon-button hero-dismiss icon-action">×</button></section><section class="device-list"><div class="grid">${card}</div></section></main></div></body></html>`);
   return page;
 }
 
@@ -108,7 +125,7 @@ test('square desk panel keeps all blind cards and controls visible at 480px', as
           const rect = button.getBoundingClientRect();
           return {left:rect.left, right:rect.right, top:rect.top, bottom:rect.bottom, width:rect.width, height:rect.height};
         });
-      const topbarControls = [...document.querySelectorAll('.top-actions button')]
+      const topbarControls = [...document.querySelectorAll('.top-actions button')].filter(button => button.getClientRects().length > 0)
         .map(button => {
           const rect = button.getBoundingClientRect();
           return {left:rect.left, right:rect.right, top:rect.top, bottom:rect.bottom, width:rect.width, height:rect.height};
@@ -124,6 +141,8 @@ test('square desk panel keeps all blind cards and controls visible at 480px', as
         cards,
         controls,
         topbarControls,
+        demoBannerHeight:document.querySelector('.demo-banner')!.getBoundingClientRect().height,
+        demoResetLabel:document.querySelector('.top-actions [data-action="demo-reset"]')?.getAttribute('aria-label'),
         documentCanScroll:document.documentElement.scrollHeight > window.innerHeight,
       };
     });
@@ -132,7 +151,9 @@ test('square desk panel keeps all blind cards and controls visible at 480px', as
     assert.ok(layout.cards.every(card => card.top >= layout.appTop && card.bottom <= layout.appBottom));
     assert.ok(layout.controls.every(control => control.top >= layout.appTop && control.bottom <= layout.appBottom));
     assert.ok(layout.controls.every(control => control.width >= 44 && control.height >= 44));
-    assert.equal(layout.topbarControls.length, 3);
+    assert.equal(layout.topbarControls.length, 4);
+    assert.equal(layout.demoBannerHeight, 0);
+    assert.equal(layout.demoResetLabel,'Reset demo');
     assert.ok(layout.topbarControls.every(control => control.left >= layout.topbarLeft && control.right <= layout.topbarRight));
     assert.ok(layout.topbarControls.every(control => control.top >= layout.topbarTop && control.bottom <= layout.topbarBottom));
     assert.ok(layout.topbarControls.every(control => control.width >= 44 && control.height >= 44));
@@ -244,6 +265,8 @@ test('narrow panel view stacks blind cards and batch controls without horizontal
         panelButtons,
         actionButtons,
         scrollWidth:document.documentElement.scrollWidth,
+        topbarRight:document.querySelector('.topbar')!.getBoundingClientRect().right,
+        resetLabel:document.querySelector('.top-actions [data-action="demo-reset"]')?.getAttribute('aria-label'),
       };
     });
 
@@ -256,6 +279,30 @@ test('narrow panel view stacks blind cards and batch controls without horizontal
     assert.ok(layout.panelButtons.every(height => height >= 44));
     assert.ok(layout.actionButtons.every(height => height >= 44));
     assert.ok(layout.scrollWidth <= 359);
+    assert.ok(layout.topbarRight <= 359);
+    assert.equal(layout.resetLabel,'Reset demo');
+  } finally {
+    await page.close();
+  }
+});
+
+test('mobile cards and topbar fit at 390px with direct-position presets', async () => {
+  const page = await openMobile(390);
+  try {
+    const layout = await page.evaluate(() => ({
+      viewport:innerWidth,
+      document:document.documentElement.scrollWidth,
+      topbarRight:document.querySelector('.topbar')!.getBoundingClientRect().right,
+      presetsWidth:document.querySelector('.position-presets')!.getBoundingClientRect().width,
+      cardWidth:document.querySelector('[data-device-card]')!.getBoundingClientRect().width,
+      heroDismissWidth:document.querySelector('.hero-dismiss')!.getBoundingClientRect().width,
+      demoResetWidth:document.querySelector('.demo-banner button')!.getBoundingClientRect().width,
+    }));
+    assert.ok(layout.document <= layout.viewport);
+    assert.ok(layout.topbarRight <= layout.viewport);
+    assert.ok(layout.presetsWidth > layout.cardWidth / 2);
+    assert.ok(layout.heroDismissWidth <= 56);
+    assert.ok(layout.demoResetWidth <= 56);
   } finally {
     await page.close();
   }

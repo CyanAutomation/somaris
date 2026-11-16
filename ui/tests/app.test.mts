@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, resetDemo, resolveDisplayMode} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
 import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, DashboardState, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
 
 type CommandTarget = RefreshTarget & {
@@ -24,6 +24,29 @@ test('automatic display mode distinguishes square panels from phones and desktop
  assert.equal(resolveDisplayMode('auto', 390, 844), 'mobile');
  assert.equal(resolveDisplayMode('auto', 1440, 900), 'desktop');
  assert.equal(resolveDisplayMode('auto', 800, 560), 'desktop');
+});
+
+test('availability and relative timestamps use plain language',()=>{
+ assert.deepEqual((['ready','stale','not_seen','ambiguous','unavailable'] as const).map(value=>availability(value)[0]),[
+  'Online','Not responding','Not found','Needs attention','Unavailable',
+ ]);
+ assert.equal(relativeAt('2026-11-16T11:57:00.000Z',Date.parse('2026-11-16T12:00:00.000Z')),'Last heard from 3 min ago');
+});
+
+test('refresh pauses while a drag, focused input, or confirmation is active',()=>{
+ assert.equal(shouldPauseRefresh({dragging:true}),true);
+ assert.equal(shouldPauseRefresh({focusedTag:'INPUT'}),true);
+ assert.equal(shouldPauseRefresh({focusedTag:'SELECT'}),true);
+ assert.equal(shouldPauseRefresh({confirmationOpen:true}),true);
+ assert.equal(shouldPauseRefresh({focusedTag:'BUTTON'}),false);
+ assert.equal(shouldPauseRefresh({}),false);
+});
+
+test('display name validation reports required and maximum length failures',()=>{
+ assert.equal(validateDisplayName(''), 'Enter a name for this blind.');
+ assert.equal(validateDisplayName('  '), 'Enter a name for this blind.');
+ assert.equal(validateDisplayName('x'.repeat(65)), 'Use 64 characters or fewer.');
+ assert.equal(validateDisplayName(' Living Room '), '');
 });
 
 test('demo readiness stays positive while the physical adapter remains unavailable', async () => {
@@ -225,11 +248,14 @@ test('device detail fields retain cached telemetry and only show active cooldown
  };
  const fields = deviceDetailFields(device,observation,now);
  assert.deepEqual(fields.map(field=>field.label),[
-  'Availability','Position','Last observation','Advertisement age','Reported target','Movement feedback',
-  'Learned travel rate','Signal','Battery voltage','Source','Room','Last GATT command',
+  'Availability','Position','Last heard from','Advertisement age','Reported target','Movement feedback',
+  'Learned travel rate','Signal strength','Battery','Battery voltage','Source','Room','Last GATT command',
   'Transport evidence','Last command attempt','Last acknowledged GATT write','Movement cooldown until','Latest failure',
  ]);
  assert.equal(fields.find(field=>field.label==='Battery voltage')?.value,'4000 mV (cached)');
+ assert.equal(fields.find(field=>field.label==='Battery voltage')?.advanced,true);
+ assert.equal(fields.find(field=>field.label==='Availability')?.value,'Online');
+ assert.notEqual(fields.find(field=>field.label==='Signal strength')?.advanced,true);
  assert.equal(fields.find(field=>field.label==='Learned travel rate')?.value,'0.75% per second');
  assert.equal(fields.find(field=>field.label==='Movement cooldown until')?.value,new Date('2026-11-15T17:01:00Z').toLocaleString());
 
@@ -261,9 +287,9 @@ test('managed device cards preserve targets, status details, and panel safety st
  const regular=renderManagedDeviceCard(device,dashboard,false,now);
  assert.match(regular,/Study shade/);
  assert.match(regular,/blind-state__label">Closing/);
- assert.match(regular,/data-action="position:blind-1"/);
+ assert.match(regular,/data-position-preset="blind-1:50"/);
  assert.match(regular,/Battery ~80%/);
- assert.match(regular,/Seen 1 min ago/);
+ assert.match(regular,/Last heard from 1 min ago/);
 
  dashboard.commands['blind-1']={status:'outcome_unknown'};
  const panel=renderManagedDeviceCard({
@@ -285,7 +311,7 @@ test('display preference query pins a mode and otherwise uses the saved choice',
  assert.equal(displayPreferenceFrom('', 'unknown'), 'auto');
 });
 
-test('display mode control cycles through auto, mobile, panel, and desktop',()=>{
+test('display mode values remain ordered for the display picker',()=>{
  assert.equal(nextDisplayPreference('auto'), 'mobile');
  assert.equal(nextDisplayPreference('mobile'), 'panel');
  assert.equal(nextDisplayPreference('panel'), 'desktop');
@@ -469,7 +495,7 @@ test('stale command poll failure cannot clear a newer command state', async()=>{
  assert.equal(state.notifications.length,0);
 });
 test('fresh observations are not presented as GATT command readiness',()=>{
- assert.equal(availability('ready')[0], 'Observed recently');
+ assert.equal(availability('ready')[0], 'Online');
  assert.equal(gattReadinessLabel({status:'untested'}), 'No command sent yet');
  assert.equal(gattReadinessLabel({status:'connection_failed'}), 'Could not connect; no write sent');
  assert.equal(gattReadinessLabel({status:'write_acknowledged'}), 'GATT write acknowledged');
@@ -567,7 +593,8 @@ test('battery display shows estimated percentage and retains cached and unavaila
  const observed = batteryDisplay({status:'observed', percent_estimate:76, voltage_mv:3980});
  assert.match(observed, /Battery ~76%/);
  assert.match(observed, /Battery voltage: 3980 mV/);
- assert.match(observed, /<details class="battery-info">/);
+ assert.match(observed, /aria-haspopup="dialog"/);
+ assert.match(observed, /class="battery-popover"[^>]*popover/);
  assert.doesNotMatch(observed, /cached/);
  assert.match(batteryDisplay({status:'unavailable', percent_estimate:0, voltage_mv:3600}), /Battery ~0% · cached/);
  assert.match(batteryDisplay({status:'observed', percent_estimate:100}), /Battery ~100%/);

@@ -32,6 +32,8 @@ Open `http://127.0.0.1:8080/` after starting Somaris (or use your configured add
 
 The panel viewport and accessibility behavior covered by dashboard regression tests is specified in [the test contracts](docs/test-contracts.md).
 
+The dashboard is installable as a progressive web app. Its versioned service worker caches only the static app shell; all `/api/*` requests continue to reach Somaris, and live API responses are never stored by the worker. The cached shell can open offline and reports the disconnected state until the service is reachable again. A waiting dashboard update is announced in the notification area. On phones, use the icon tabs at the bottom to move between blinds, activity, and service status. The display and theme menu offers Auto, Mobile, Panel, Desktop, and opt-in Dark, Light, and High contrast themes. Auto follows the device color and contrast preferences.
+
 The dashboard and control API have no authentication. Keep the default loopback binding or put the service behind a trusted access boundary before exposing it.
 
 ## API
