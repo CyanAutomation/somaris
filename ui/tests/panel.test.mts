@@ -286,24 +286,34 @@ test('narrow panel view stacks blind cards and batch controls without horizontal
   }
 });
 
-test('mobile cards and topbar fit at 390px with direct-position presets', async () => {
-  const page = await openMobile(390);
-  try {
-    const layout = await page.evaluate(() => ({
-      viewport:innerWidth,
-      document:document.documentElement.scrollWidth,
-      topbarRight:document.querySelector('.topbar')!.getBoundingClientRect().right,
-      presetsWidth:document.querySelector('.position-presets')!.getBoundingClientRect().width,
-      cardWidth:document.querySelector('[data-device-card]')!.getBoundingClientRect().width,
-      heroDismissWidth:document.querySelector('.hero-dismiss')!.getBoundingClientRect().width,
-      demoResetWidth:document.querySelector('.demo-banner button')!.getBoundingClientRect().width,
-    }));
-    assert.ok(layout.document <= layout.viewport);
-    assert.ok(layout.topbarRight <= layout.viewport);
-    assert.ok(layout.presetsWidth > layout.cardWidth / 2);
-    assert.ok(layout.heroDismissWidth <= 56);
-    assert.ok(layout.demoResetWidth <= 56);
-  } finally {
-    await page.close();
+test('mobile cards and topbar fit at 360px and 390px with direct-position presets', async () => {
+  for (const width of [360, 390]) {
+    const page = await openMobile(width);
+    try {
+      const layout = await page.evaluate(() => {
+        const shell = document.querySelector('.app-shell')!;
+        const shellRect = shell.getBoundingClientRect();
+        const shellStyle = getComputedStyle(shell);
+        return {
+          viewport:innerWidth,
+          document:document.documentElement.scrollWidth,
+          topbarRight:document.querySelector('.topbar')!.getBoundingClientRect().right,
+          actionsRight:document.querySelector('.top-actions')!.getBoundingClientRect().right,
+          shellContentRight:shellRect.right - parseFloat(shellStyle.paddingRight),
+          presetsWidth:document.querySelector('.position-presets')!.getBoundingClientRect().width,
+          cardWidth:document.querySelector('[data-device-card]')!.getBoundingClientRect().width,
+          heroDismissWidth:document.querySelector('.hero-dismiss')!.getBoundingClientRect().width,
+          demoResetWidth:document.querySelector('.demo-banner button')!.getBoundingClientRect().width,
+        };
+      });
+      assert.ok(layout.document <= layout.viewport);
+      assert.ok(layout.topbarRight <= layout.viewport);
+      assert.ok(layout.actionsRight <= layout.shellContentRight);
+      assert.ok(layout.presetsWidth > layout.cardWidth / 2);
+      assert.ok(layout.heroDismissWidth <= 56);
+      assert.ok(layout.demoResetWidth <= 56);
+    } finally {
+      await page.close();
+    }
   }
 });
