@@ -134,7 +134,7 @@ html[data-display-mode="panel"] .device-card-header .status-indicator{width:28px
 html[data-display-mode="panel"] .card-messages{display:contents}
 @media(prefers-reduced-motion:reduce){.blind-art i,.command-progress__track i,.activity-toggle{animation:none!important;transition:none!important}.skeleton-card>*{animation:none;background:var(--color-raised)}}
 html[data-display-mode="mobile"] .service-status{gap:0}
-html[data-display-mode="mobile"] .top-actions{gap:6px}
+html[data-display-mode="mobile"] .top-actions{gap:4px}
 html[data-display-mode="mobile"] .brand{gap:8px;font-size:24px}
 @media(max-width:380px){html[data-display-mode="mobile"] .brand{gap:6px;font-size:20px}html[data-display-mode="mobile"] .brand-mark{width:28px;height:28px}}
 html[data-display-mode="mobile"] .hero .button.hero-dismiss{width:44px;min-width:44px;align-self:flex-end}
