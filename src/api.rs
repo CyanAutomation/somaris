@@ -16,8 +16,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use crate::{
     ble::{
         BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureCause,
-        BleFailureStage, BleObservation, BleScanControl, BtleplugAdapter, SOMA_MANUFACTURER_ID,
-        decode_ba71_voltage, parse_soma_payload,
+        BleFailureStage, BleObservation, BleScanControl, BtleplugAdapter, MotorSpeedReadbackStatus,
+        SOMA_MANUFACTURER_ID, decode_ba71_voltage, parse_soma_payload,
     },
     controller::ServiceAction,
     integration::{DeviceCapabilities, StateChange, StateChangePublisher},
@@ -2910,6 +2910,8 @@ struct ErrorEnvelope {
 struct ApiError {
     code: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase_timings: Option<BleAttemptTimings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3181,11 +3183,13 @@ pub struct ManagedDevice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MotorSettingsData {
     firmware_version: String,
+    motor_speed_readback_status: MotorSpeedReadbackStatus,
     motor_speed_percent: Option<u8>,
     local_time_offset_minutes: Option<i16>,
     boot_sequence: Option<u32>,
     sunrise_epoch_seconds: Option<u32>,
     sunset_epoch_seconds: Option<u32>,
+    phase_timings: BleAttemptTimings,
     observed_at: DateTime<Utc>,
 }
 
@@ -3489,12 +3493,22 @@ fn envelope<T>(data: T, count: Option<u64>) -> Envelope<T> {
 }
 
 fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    error_response_with_phase_timings(status, code, message, None)
+}
+
+fn error_response_with_phase_timings(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    phase_timings: Option<BleAttemptTimings>,
+) -> Response {
     (
         status,
         Json(ErrorEnvelope {
             error: ApiError {
                 code: code.to_owned(),
                 message: message.to_owned(),
+                phase_timings,
             },
             meta: Meta {
                 generated_at: Utc::now(),
@@ -4447,6 +4461,7 @@ async fn get_motor_settings(
         adapter.read_motor_settings(&peripheral_id, &expected_name, &control),
     )
     .await;
+    let phase_timings = control.timings();
     state
         .unregister_background_read(&managed_device_id, &control)
         .await;
@@ -4455,11 +4470,13 @@ async fn get_motor_settings(
         Ok(Ok(settings)) => {
             let result = MotorSettingsData {
                 firmware_version: settings.firmware_version,
+                motor_speed_readback_status: settings.motor_speed_readback_status,
                 motor_speed_percent: settings.motor_speed_percent,
                 local_time_offset_minutes: settings.local_time_offset_minutes,
                 boot_sequence: settings.boot_sequence,
                 sunrise_epoch_seconds: settings.sunrise_epoch_seconds,
                 sunset_epoch_seconds: settings.sunset_epoch_seconds,
+                phase_timings,
                 observed_at: Utc::now(),
             };
             (StatusCode::OK, Json(envelope(result, None))).into_response()
@@ -4484,12 +4501,13 @@ async fn get_motor_settings(
                     "The motor settings could not be read from the blind.",
                 )
             };
-            error_response(status, code, message)
+            error_response_with_phase_timings(status, code, message, Some(phase_timings))
         }
-        Err(_) => error_response(
+        Err(_) => error_response_with_phase_timings(
             StatusCode::GATEWAY_TIMEOUT,
             "motor_settings_timeout",
             "Timed out reading motor settings from the blind.",
+            Some(phase_timings),
         ),
     }
 }
@@ -6356,12 +6374,27 @@ fn cooldown_remaining_seconds(
     })
 }
 
-fn retry_backoff(command_id: &str, attempt: u8, failure_streak: usize) -> std::time::Duration {
+fn retry_backoff(
+    command_id: &str,
+    attempt: u8,
+    failure_streak: usize,
+    failure_cause: Option<BleFailureCause>,
+) -> std::time::Duration {
     let exponent = failure_streak
         .saturating_add(attempt.saturating_sub(1) as usize)
         .min(4) as u32;
-    let base_ms = 250_u64.saturating_mul(1_u64 << exponent).min(4_000);
-    let digest = Sha256::digest(format!("{command_id}:{attempt}:{failure_streak}").as_bytes());
+    let initial_delay_ms: u64 = if failure_cause == Some(BleFailureCause::ConnectionAbortedByLocal)
+    {
+        750
+    } else {
+        250
+    };
+    let base_ms = initial_delay_ms
+        .saturating_mul(1_u64 << exponent)
+        .min(4_000);
+    let digest = Sha256::digest(
+        format!("{command_id}:{attempt}:{failure_streak}:{failure_cause:?}").as_bytes(),
+    );
     let seed = u16::from_be_bytes([digest[0], digest[1]]) as u64;
     let jitter_ms = seed % (base_ms / 2 + 1);
     std::time::Duration::from_millis(base_ms / 2 + jitter_ms)
@@ -6629,7 +6662,7 @@ async fn process_physical_command(
             && failure_streak.saturating_add(attempt as usize) < COOLDOWN_FAILURE_THRESHOLD
             && retryable_prewrite_failure(failure)
         {
-            let delay = retry_backoff(command_id, attempt, failure_streak);
+            let delay = retry_backoff(command_id, attempt, failure_streak, failure.cause);
             let recovery = retry_recovery_policy(failure);
             let scan_refreshed = match recovery {
                 RetryRecoveryPolicy::QuickReconnect => false,
@@ -7569,15 +7602,38 @@ mod security_hardening_tests {
 
     #[test]
     fn retry_backoff_is_stable_jittered_and_grows_with_failure_history() {
-        let first = retry_backoff("command-1", 1, 0);
-        assert_eq!(first, retry_backoff("command-1", 1, 0));
-        let later = retry_backoff("command-1", 1, 2);
+        let first = retry_backoff("command-1", 1, 0, None);
+        assert_eq!(first, retry_backoff("command-1", 1, 0, None));
+        let later = retry_backoff("command-1", 1, 2, None);
         assert!(later >= first);
         assert!(first >= StdDuration::from_millis(125));
         assert!(later <= StdDuration::from_millis(1_000));
         assert_eq!(cooldown_duration_seconds(3), None);
         assert_eq!(cooldown_duration_seconds(4), Some(15));
         assert_eq!(cooldown_duration_seconds(20), Some(120));
+    }
+
+    #[test]
+    fn local_abort_reconnect_backoff_is_longer_and_still_bounded() {
+        let generic = retry_backoff("command-1", 1, 0, None);
+        let local_abort = retry_backoff(
+            "command-1",
+            1,
+            0,
+            Some(BleFailureCause::ConnectionAbortedByLocal),
+        );
+        assert!(local_abort > generic);
+        assert!(local_abort >= StdDuration::from_millis(375));
+        assert!(local_abort <= StdDuration::from_millis(750));
+        assert_eq!(
+            local_abort,
+            retry_backoff(
+                "command-1",
+                1,
+                0,
+                Some(BleFailureCause::ConnectionAbortedByLocal)
+            )
+        );
     }
 
     #[test]
