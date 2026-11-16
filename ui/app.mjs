@@ -1139,9 +1139,27 @@ async function undoBatchTargets() {
             await sendCommand(id, position === 0 ? 'open' : 'close');
     }
 }
+export function createServiceWorkerUpdateHandler(reload) {
+    let expectingControllerChange = false;
+    return {
+        requestActivation(worker) {
+            if (!worker)
+                return;
+            expectingControllerChange = true;
+            worker.postMessage({ type: 'SKIP_WAITING' });
+        },
+        onControllerChange() {
+            if (!expectingControllerChange)
+                return;
+            expectingControllerChange = false;
+            reload();
+        },
+    };
+}
+const serviceWorkerUpdateHandler = createServiceWorkerUpdateHandler(() => globalThis.location.reload());
 async function activateWaitingWorker() {
     const registration = await navigator.serviceWorker?.getRegistration('/');
-    registration?.waiting?.postMessage({ type: 'SKIP_WAITING' });
+    serviceWorkerUpdateHandler.requestActivation(registration?.waiting);
 }
 async function registerServiceWorker() {
     if (!('serviceWorker' in navigator))
@@ -1156,7 +1174,7 @@ async function registerServiceWorker() {
             worker?.addEventListener('statechange', () => { if (worker.state === 'installed' && navigator.serviceWorker.controller)
                 announce(); });
         });
-        navigator.serviceWorker.addEventListener('controllerchange', () => globalThis.location.reload());
+        navigator.serviceWorker.addEventListener('controllerchange', serviceWorkerUpdateHandler.onControllerChange);
     }
     catch { /* Offline or unsupported browser: the app continues without installation support. */ }
 }
