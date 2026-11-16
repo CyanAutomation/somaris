@@ -10,7 +10,11 @@ use tower::ServiceExt;
 async fn dashboard_and_assets_are_served_with_correct_content_types() {
     for (path, content_type, marker) in [
         ("/", "text/html", "rel=\"apple-touch-icon\""),
-        ("/manifest.webmanifest", "application/manifest+json", "\"display\": \"standalone\""),
+        (
+            "/manifest.webmanifest",
+            "application/manifest+json",
+            "\"display\": \"standalone\"",
+        ),
         ("/sw.js", "text/javascript", "precache-manifest"),
         ("/ui/app.mjs", "text/javascript", "resolveDisplayMode"),
         (
@@ -52,7 +56,12 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
 #[tokio::test]
 async fn service_worker_is_allowed_to_control_the_root_scope_and_skips_api_responses() {
     let response = router(AppState::new())
-        .oneshot(Request::builder().uri("/sw.js").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/sw.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);

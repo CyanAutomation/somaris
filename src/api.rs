@@ -1895,7 +1895,10 @@ async fn ui_index() -> impl IntoResponse {
 
 async fn ui_manifest() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "application/manifest+json; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/manifest+json; charset=utf-8",
+        )],
         include_str!("../ui/manifest.webmanifest"),
     )
 }
@@ -1904,7 +1907,10 @@ async fn ui_service_worker() -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
-            (header::HeaderName::from_static("service-worker-allowed"), "/"),
+            (
+                header::HeaderName::from_static("service-worker-allowed"),
+                "/",
+            ),
         ],
         include_str!("../ui/sw.js"),
     )
