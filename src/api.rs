@@ -1782,6 +1782,8 @@ pub fn router(state: AppState) -> Router {
         .expose_headers([header::ETAG]);
     let app = Router::new()
         .route("/", get(ui_index))
+        .route("/manifest.webmanifest", get(ui_manifest))
+        .route("/sw.js", get(ui_service_worker))
         .route("/ui/style.css", get(ui_style))
         .route("/ui/components.css", get(ui_components_style))
         .route("/ui/panel.css", get(ui_panel_style))
@@ -1796,6 +1798,9 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/favicon.svg", get(ui_favicon_svg))
         .route("/ui/favicon-32x32.png", get(ui_favicon_png))
         .route("/ui/apple-touch-icon.png", get(ui_apple_touch_icon))
+        .route("/ui/pwa-192.png", get(ui_pwa_192))
+        .route("/ui/pwa-512.png", get(ui_pwa_512))
+        .route("/ui/pwa-maskable-512.png", get(ui_pwa_maskable_512))
         .route("/api/v1/health", get(health).options(preflight))
         .route("/api/v1/ready", get(ready).options(preflight))
         .route("/api/v1/demo", get(demo_info).options(preflight))
@@ -1885,6 +1890,23 @@ async fn ui_index() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         include_str!("../ui/index.html"),
+    )
+}
+
+async fn ui_manifest() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/manifest+json; charset=utf-8")],
+        include_str!("../ui/manifest.webmanifest"),
+    )
+}
+
+async fn ui_service_worker() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::HeaderName::from_static("service-worker-allowed"), "/"),
+        ],
+        include_str!("../ui/sw.js"),
     )
 }
 
@@ -1983,6 +2005,27 @@ async fn ui_apple_touch_icon() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "image/png")],
         Bytes::from_static(include_bytes!("../ui/apple-touch-icon.png")),
+    )
+}
+
+async fn ui_pwa_192() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        Bytes::from_static(include_bytes!("../ui/pwa-192.png")),
+    )
+}
+
+async fn ui_pwa_512() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        Bytes::from_static(include_bytes!("../ui/pwa-512.png")),
+    )
+}
+
+async fn ui_pwa_maskable_512() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        Bytes::from_static(include_bytes!("../ui/pwa-maskable-512.png")),
     )
 }
 

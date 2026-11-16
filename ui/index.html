@@ -1,8 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="auto">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#11141a"><title>Somaris — your blinds</title>
+  <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" type="image/svg+xml" href="/ui/favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="/ui/favicon-32x32.png">
   <link rel="apple-touch-icon" sizes="180x180" href="/ui/apple-touch-icon.png">
@@ -14,9 +15,9 @@
   <div class="app-shell">
     <header class="topbar">
       <a class="brand" href="#home" aria-label="Somaris home"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span>somaris<span class="brand-dot">.</span></span></a>
-      <div class="top-actions" id="top-actions"></div>
+      <div class="top-actions" id="top-actions"><span id="service-status" class="service-status"><span class="status-dot"></span> Connecting</span></div>
     </header>
-    <main id="app"><div class="loading">Connecting to Somaris…</div></main>
+    <main id="app" class="loading-shell" aria-busy="true" aria-label="Loading your blinds"><div class="skeleton-grid" aria-hidden="true"><article class="skeleton-card"><span></span><i></i><i></i><b></b></article><article class="skeleton-card"><span></span><i></i><i></i><b></b></article><article class="skeleton-card"><span></span><i></i><i></i><b></b></article><article class="skeleton-card"><span></span><i></i><i></i><b></b></article></div></main>
     <div id="snackbar-root"></div>
     <footer>Made for a little more light. <span>Somaris</span></footer>
   </div>
