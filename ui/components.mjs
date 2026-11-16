@@ -5,7 +5,9 @@ export { renderDeviceList, renderHomeSupportingSections, renderInfoGrid } from '
 export { renderSnackbar, renderSnackbarRegion } from './snackbar-components.mjs';
 const icons = {
     add: '<path d="M12 5v14M5 12h14"/>',
+    back: '<path d="M19 12H5m7 7-7-7 7-7"/>',
     display: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/>',
+    info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/>',
     observed: '<circle cx="12" cy="12" r="8.5"/><path d="m8.5 12 2.3 2.3 4.8-5"/>',
     stale: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3 2"/>',
     not_seen: '<circle cx="12" cy="12" r="8.5"/><path d="m9 9 6 6m0-6-6 6"/>',
@@ -15,6 +17,7 @@ const icons = {
     open: '<path d="M12 19V5M5 12l7-7 7 7"/>',
     stop: '<rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"/>',
     close: '<path d="M12 5v14m7-7-7 7-7-7"/>',
+    target: '<circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="3"/><path d="M12 1v3m0 16v3M1 12h3m16 0h3"/>',
     trash: '<path d="M4 7h16M10 11v6m4-6v6M5 7l1 14h12l1-14M9 7V4h6v3"/>',
 };
 const availabilityIcons = { ready: 'observed', stale: 'stale', not_seen: 'not_seen', ambiguous: 'ambiguous' };
@@ -94,7 +97,7 @@ export function renderDeviceCardHeader({ id, label, availabilityLabel, availabil
     const kind = isSimulated ? 'SIMULATED BLIND' : 'YOUR BLIND';
     return `<div class="card-top device-card-header"><div class="device-card-heading"><div class="subtle">${kind}</div><h3><button type="button" class="card-title" data-action="details:${escapedId}" aria-label="View details for ${escapedLabel}">${escapedLabel}</button></h3>${room ? `<div class="subtle room-label">${escapeHtml(room)}</div>` : ''}<div class="subtle">${escapeHtml(lastSeen)}</div></div>${renderStatusIndicator({ label: availabilityLabel, tone: availabilityTone, status: availabilityStatus })}</div>`;
 }
-export function renderButton({ label, action, variant = '', disabled = false, icon = null, iconOnly = false, accessibleLabel = label, title = '', }) {
+export function renderButton({ label, action, type = 'button', variant = '', disabled = false, icon = null, iconOnly = false, accessibleLabel = label, title = '', }) {
     const classes = ['button', variant, iconOnly ? 'icon-action' : ''].filter(Boolean).map(escapeHtml).join(' ');
     const accessibility = iconOnly || accessibleLabel !== label ? ` aria-label="${escapeHtml(accessibleLabel)}"` : '';
     const tooltipLabel = title || (iconOnly ? accessibleLabel : '');
@@ -103,7 +106,8 @@ export function renderButton({ label, action, variant = '', disabled = false, ic
         : '';
     const iconContent = iconMarkup(icon);
     const labelContent = iconOnly ? '' : `<span class="button-label">${escapeHtml(label)}</span>`;
-    return `<button type="button" class="${classes}" data-action="${escapeHtml(action)}"${accessibility}${titleAttribute}${disabled ? ' disabled' : ''}>${iconContent}${labelContent}</button>`;
+    const actionAttribute = action === undefined ? '' : ` data-action="${escapeHtml(action)}"`;
+    return `<button type="${type}" class="${classes}"${actionAttribute}${accessibility}${titleAttribute}${disabled ? ' disabled' : ''}>${iconContent}${labelContent}</button>`;
 }
 export function renderIconButton({ label, action, icon, variant = '', disabled = false }) {
     return renderButton({
@@ -112,6 +116,18 @@ export function renderIconButton({ label, action, icon, variant = '', disabled =
         title: label,
         action,
         variant: ['icon-button', variant].filter(Boolean).join(' '),
+        disabled,
+        icon,
+        iconOnly: true,
+    });
+}
+export function renderIconLinkButton({ label, action, icon, disabled = false }) {
+    return renderButton({
+        label,
+        accessibleLabel: label,
+        title: label,
+        action,
+        variant: 'icon-link-button',
         disabled,
         icon,
         iconOnly: true,
@@ -188,7 +204,7 @@ export function renderBlindActions({ deviceId, blindLabel, panelMode = false, di
             iconOnly: panelMode,
             title: panelMode ? accessibleLabel : '',
         });
-    }).join('')}${supportsPosition && !panelMode ? `<div class="position-control"><label for="position-${escapeHtml(deviceId)}">Target position <output data-position-output="${escapeHtml(deviceId)}">${escapeHtml(positionClosedPercent)}%</output> closed</label><input id="position-${escapeHtml(deviceId)}" type="range" min="0" max="100" step="1" value="${escapeHtml(positionClosedPercent)}" data-position-input="${escapeHtml(deviceId)}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent closed"${disabled || movementDisabled || busy ? ' disabled' : ''}><button type="button" class="button secondary position-submit" data-action="position:${escapeHtml(deviceId)}"${disabled || movementDisabled || busy ? ' disabled' : ''}>Move to position</button></div>` : ''}</div>`;
+    }).join('')}${supportsPosition && !panelMode ? `<div class="position-control"><label for="position-${escapeHtml(deviceId)}">Target position <output data-position-output="${escapeHtml(deviceId)}">${escapeHtml(positionClosedPercent)}%</output> closed</label><input id="position-${escapeHtml(deviceId)}" type="range" min="0" max="100" step="1" value="${escapeHtml(positionClosedPercent)}" data-position-input="${escapeHtml(deviceId)}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent closed"${disabled || movementDisabled || busy ? ' disabled' : ''}>${renderButton({ label: 'Move to position', accessibleLabel: `Move to selected position for ${blindLabel}`, action: `position:${deviceId}`, variant: 'secondary position-submit', disabled: disabled || movementDisabled || busy, icon: 'target', iconOnly: true, title: `Move to selected position for ${blindLabel}` })}</div>` : ''}</div>`;
 }
 export function renderBatchFeedback(batch) {
     return renderBatchFeedbackMarkup(batch, escapeHtml, renderButton);
@@ -204,7 +220,7 @@ export function renderBatchControls({ blindCount = 0, eligibleCount = 0, disable
             : 'No enrolled blinds are currently ready to move.';
     const panelVariant = panelMode ? ' all-blinds-controls--panel' : '';
     const controls = blindCount > 0
-        ? `<section class="all-blinds-controls${panelVariant}" aria-label="All blinds controls"${busy ? ' aria-busy="true"' : ''}><div class="all-blinds-copy"><h2>All blinds</h2><p>${escapeHtml(description)}</p></div><div class="all-blinds-actions">${renderButton({ label: 'Open all', accessibleLabel: 'Open all blinds', action: 'batch:open', icon: 'open', variant: panelMode ? 'panel-target' : '', disabled: unavailable })}${renderButton({ label: 'Close all', accessibleLabel: 'Close all blinds', action: 'batch:close', icon: 'close', variant: panelMode ? 'secondary panel-target' : 'secondary', disabled: unavailable })}</div>${renderBatchFeedback(batch)}</section>`
+        ? `<section class="all-blinds-controls${panelVariant}" aria-label="All blinds controls"${busy ? ' aria-busy="true"' : ''}><div class="all-blinds-copy"><h2>All blinds</h2><p>${escapeHtml(description)}</p></div><div class="all-blinds-actions">${renderButton({ label: 'Open all', accessibleLabel: 'Open all blinds', action: 'batch:open', icon: 'open', iconOnly: panelMode, title: panelMode ? 'Open all blinds' : '', variant: panelMode ? 'panel-target' : '', disabled: unavailable })}${renderButton({ label: 'Close all', accessibleLabel: 'Close all blinds', action: 'batch:close', icon: 'close', iconOnly: panelMode, title: panelMode ? 'Close all blinds' : '', variant: panelMode ? 'secondary panel-target' : 'secondary', disabled: unavailable })}</div>${renderBatchFeedback(batch)}</section>`
         : '';
     return `${controls}${blindCount < 1 ? renderBatchFeedback(batch) : ''}`;
 }
