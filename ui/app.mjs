@@ -1410,6 +1410,13 @@ export function parseActionValue(value) {
     const [action = '', argument = '', id = ''] = value?.split(':') ?? [];
     return [action, argument, id];
 }
+export function dispatchMenuActionValue(value, apply) {
+    const [action, operation, preference] = parseActionValue(value);
+    if (action !== 'display' && action !== 'theme')
+        return false;
+    dispatchMenuChoice(action, operation, preference, apply);
+    return true;
+}
 function isBlindAction(action) {
     return action !== undefined && [
         'open', 'close', 'stop', 'toggle', 'set_position', 'set_motor_speed',
@@ -1521,8 +1528,6 @@ function handleRemovalClick(action, deviceId) {
 const clickActionHandlers = {
     'snackbar-dismiss': (_argument, _id, deviceId) => { snackbarQueue.dismiss(deviceId); return true; },
     'display-menu-toggle': () => { toggleDisplayMenu(); return true; },
-    display: (argument, _id, value, applyDisplayMode) => { dispatchMenuChoice('display', argument, value, (_kind, preference) => changeDisplayMode(preference, applyDisplayMode)); closeDisplayMenu(); return true; },
-    theme: (argument, _id, value) => { dispatchMenuChoice('theme', argument, value, (_kind, preference) => changeTheme(preference)); closeDisplayMenu(); return true; },
     command: (argument, id) => dispatchBlindCommand(argument, id),
     batch: argument => handleBatchClick(argument),
     position: (_argument, id, deviceId) => handlePositionClick(deviceId, id),
@@ -1725,7 +1730,17 @@ if (app) {
             const target = closestHtmlElement(event.target, '[data-action]');
             if (!target)
                 return;
-            const [action, argument, id] = parseActionValue(target.dataset.action);
+            const actionValue = target.dataset.action;
+            if (dispatchMenuActionValue(actionValue, (kind, preference) => {
+                if (kind === 'display')
+                    changeDisplayMode(preference, applyDisplayMode);
+                else
+                    changeTheme(preference);
+            })) {
+                closeDisplayMenu();
+                return;
+            }
+            const [action, argument, id] = parseActionValue(actionValue);
             dispatchClickAction(action, argument, id, applyDisplayMode);
         });
         actionRoot.addEventListener('pointerdown', (event) => {

@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandMessage, displayPreferenceFrom, dispatchMenuChoice, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, parseActionValue, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandMessage, displayPreferenceFrom, dispatchMenuActionValue, dispatchMenuChoice, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, parseActionValue, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
 import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, DashboardState, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
 
 type CommandTarget = RefreshTarget & {
@@ -231,6 +231,15 @@ test('display and theme menu actions dispatch the selected option value', () => 
  assert.equal(dispatchMenuChoice(displayAction,displayOperation,displayValue,(kind,value)=>choices.push([kind,value])),true);
  assert.equal(dispatchMenuChoice(themeAction,themeOperation,themeValue,(kind,value)=>choices.push([kind,value])),true);
  assert.equal(dispatchMenuChoice('display','set','unknown',()=>{}),false);
+ assert.deepEqual(choices,[['display','panel'],['theme','light']]);
+});
+
+test('menu click dispatch reads the selected option from the full data-action value', () => {
+ const choices:Array<[string,string]>=[];
+ const apply=(kind:'display'|'theme',preference:string)=>choices.push([kind,preference]);
+ assert.equal(dispatchMenuActionValue('display:set:panel',apply),true);
+ assert.equal(dispatchMenuActionValue('theme:set:light',apply),true);
+ assert.equal(dispatchMenuActionValue('command:open:blind-1',apply),false);
  assert.deepEqual(choices,[['display','panel'],['theme','light']]);
 });
 
