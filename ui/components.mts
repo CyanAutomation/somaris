@@ -39,6 +39,7 @@ const icons: Record<string, string> = {
   display:'<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/>',
   info:'<circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/>',
   observed:'<circle cx="12" cy="12" r="8.5"/><path d="m8.5 12 2.3 2.3 4.8-5"/>',
+  clock:'<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3 2"/>',
   stale:'<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3 2"/>',
   not_seen:'<circle cx="12" cy="12" r="8.5"/><path d="m9 9 6 6m0-6-6 6"/>',
   ambiguous:'<path d="M12 3.5 22 20H2L12 3.5Z"/><path d="M12 9v5m0 3h.01"/>',
@@ -73,7 +74,7 @@ interface PanelNoticeOptions {
   tone?: VisualTone;
 }
 
-type MovementStatus = 'opening' | 'closing' | 'at_target' | 'unavailable';
+type MovementStatus = 'opening' | 'closing' | 'at_target' | 'unavailable' | 'stop_queued' | 'stopping';
 
 interface BadgeOptions {
   label: string;
@@ -95,6 +96,7 @@ interface DeviceCardHeaderOptions {
   isSimulated?: boolean;
   room?: string;
   lastSeen?: string;
+  panelMode?: boolean;
 }
 
 interface ButtonOptions {
@@ -171,6 +173,8 @@ export function blindState(positionPercent: number | null | undefined, movementS
     : null;
   if (movementStatus === 'opening') return {label:'Opening', percentClosed};
   if (movementStatus === 'closing') return {label:'Closing', percentClosed};
+  if (movementStatus === 'stop_queued') return {label:'Stop queued', percentClosed};
+  if (movementStatus === 'stopping') return {label:'Stopping', percentClosed};
   if (percentClosed === null) return {label:'Position unavailable', percentClosed:null};
   if (percentClosed === 0) return {label:'Open', percentClosed};
   if (percentClosed === 100) return {label:'Closed', percentClosed};
@@ -227,14 +231,20 @@ function renderDisplayModeToggle({displayPreference = 'auto', themePreference = 
     label, accessibleLabel:`${label} theme`, title:`${label} theme`, action:`theme:set:${value}`, icon, iconOnly:true,
     variant:'display-menu-choice',
   }).replace('<button ', `<button role="menuitemradio" aria-checked="${value === themePreference}" `)).join('');
-  return `<div class="display-picker"><button type="button" id="display-mode-toggle" class="icon-button display-mode-button" data-action="display-menu-toggle" aria-label="${escapeHtml(accessibleName)}" title="${escapeHtml(accessibleName)}" aria-haspopup="menu" aria-expanded="false" aria-controls="display-menu">${iconMarkup('display')}</button><div class="display-menu" id="display-menu" role="menu" aria-label="Display and theme settings" hidden><div class="display-menu__section" aria-label="Display mode">${modeChoices}</div><div class="display-menu__section" aria-label="Theme">${themeChoices}</div></div></div>`;
+  return `<div class="display-picker"><button type="button" id="display-mode-toggle" class="icon-button display-mode-button" data-action="display-menu-toggle" aria-label="${escapeHtml(accessibleName)}" title="${escapeHtml(accessibleName)}" data-tooltip="${escapeHtml(accessibleName)}" aria-haspopup="menu" aria-expanded="false" aria-controls="display-menu">${iconMarkup('display')}</button><div class="display-menu" id="display-menu" role="menu" aria-label="Display and theme settings" hidden><div class="display-menu__section" aria-label="Display mode">${modeChoices}</div><div class="display-menu__section" aria-label="Theme">${themeChoices}</div></div></div>`;
 }
 
-export function renderDeviceCardHeader({id, label, availabilityLabel, availabilityTone = '', availabilityStatus = 'unavailable', isSimulated = false, room, lastSeen = ''}: DeviceCardHeaderOptions): string {
+export function renderFreshnessIndicator(label: string): string {
+  const name=escapeHtml(label || 'Last heard time unavailable');
+  return `<span class="freshness-indicator" role="img" aria-label="${name}" title="${name}">${iconMarkup('clock')}</span>`;
+}
+
+export function renderDeviceCardHeader({id, label, availabilityLabel, availabilityTone = '', availabilityStatus = 'unavailable', isSimulated = false, room, lastSeen = '', panelMode = false}: DeviceCardHeaderOptions): string {
   const escapedId = escapeHtml(id);
   const escapedLabel = escapeHtml(label);
   const kind = isSimulated ? 'SIMULATED BLIND' : 'YOUR BLIND';
-  return `<div class="card-top device-card-header"><div class="device-card-heading"><div class="subtle">${kind}</div><h3><button type="button" class="card-title" data-action="details:${escapedId}" aria-label="View details for ${escapedLabel}">${escapedLabel}</button></h3>${room ? `<div class="subtle room-label">${escapeHtml(room)}</div>` : ''}<div class="subtle">${escapeHtml(lastSeen)}</div></div>${renderStatusIndicator({label:availabilityLabel, tone:availabilityTone, status:availabilityStatus})}</div>`;
+  const freshness=lastSeen ? panelMode ? renderFreshnessIndicator(lastSeen) : `<div class="subtle">${escapeHtml(lastSeen)}</div>` : '';
+  return `<div class="card-top device-card-header"><div class="device-card-heading"><div class="subtle">${kind}</div><h3><button type="button" class="card-title" data-action="details:${escapedId}" aria-label="View details for ${escapedLabel}">${escapedLabel}</button></h3>${room ? `<div class="subtle room-label">${escapeHtml(room)}</div>` : ''}${!panelMode&&freshness ? freshness : ''}</div><div class="device-card-indicators">${panelMode&&freshness ? freshness : ''}${renderStatusIndicator({label:availabilityLabel, tone:availabilityTone, status:availabilityStatus})}</div></div>`;
 }
 
 export function renderButton({
@@ -254,10 +264,13 @@ export function renderButton({
   const titleAttribute = tooltipLabel
     ? ` title="${escapeHtml(tooltipLabel)}"`
     : '';
+  const tooltipAttribute = tooltipLabel
+    ? ` data-tooltip="${escapeHtml(tooltipLabel)}"`
+    : '';
   const iconContent = iconMarkup(icon);
   const labelContent = iconOnly ? '' : `<span class="button-label">${escapeHtml(label)}</span>`;
   const actionAttribute = action === undefined ? '' : ` data-action="${escapeHtml(action)}"`;
-  return `<button type="${escapeHtml(type)}" class="${classes}"${actionAttribute}${accessibility}${titleAttribute}${disabled ? ' disabled' : ''}>${iconContent}${labelContent}</button>`;
+  return `<button type="${escapeHtml(type)}" class="${classes}"${actionAttribute}${accessibility}${titleAttribute}${tooltipAttribute}${disabled ? ' disabled' : ''}>${iconContent}${labelContent}</button>`;
 }
 
 export function renderIconButton({label, action, icon, variant = '', disabled = false}: IconButtonOptions): string {
@@ -304,7 +317,7 @@ export function renderServiceSummary(summary: string): string {
 }
 
 export function renderDemoBanner(): string {
-  const reset=renderButton({
+  const reset=renderIconButton({
     label:'Reset demo',
     action:'demo-reset',
     icon:'reset',
@@ -447,7 +460,51 @@ export function renderMobileTabs(route = 'home'): string {
   const tabs = [
     ['home','Blinds','home'],['activity','Activity','activity'],['service','Service status','service'],
   ] as const;
-  return `<nav class="mobile-tabs" aria-label="Main navigation">${tabs.map(([id,label,icon])=>`<a class="mobile-tab" href="#${id}" aria-label="${label}" title="${label}"${active===id?' aria-current="page"':''}>${iconMarkup(icon)}</a>`).join('')}</nav>`;
+  return `<nav class="mobile-tabs" aria-label="Main navigation">${tabs.map(([id,label,icon])=>`<a class="mobile-tab" href="#${id}" aria-label="${label}" title="${label}" data-tooltip="${label}"${active===id?' aria-current="page"':''}>${iconMarkup(icon)}</a>`).join('')}</nav>`;
+}
+
+export function renderEmptyState({title, description, icon = null, actionMarkup = ''}: {
+  title: string;
+  description: string;
+  icon?: string | null;
+  actionMarkup?: string;
+}): string {
+  const illustration=icon ? `<div class="empty-icon empty-illustration">${iconMarkup(icon)}</div>` : '';
+  return `<div class="panel empty">${illustration}<h3>${escapeHtml(title)}</h3><p>${escapeHtml(description)}</p>${actionMarkup}</div>`;
+}
+
+export function renderAddDeviceEmptyState({demoMode, adapterAvailable}: {demoMode: boolean; adapterAvailable: boolean}): string {
+  if (demoMode) {
+    return renderEmptyState({
+      title:'Demo devices are ready',
+      description:'This demo uses four simulated blinds. Adding Bluetooth devices is unavailable here.',
+      icon:'home',
+    });
+  }
+  const description=adapterAvailable
+    ? 'Keep your blind nearby and refresh in a moment.'
+    : 'The Bluetooth adapter is unavailable. Check the service status and try again.';
+  return renderEmptyState({
+    title:'No new blinds found',
+    description,
+    icon:'home',
+    actionMarkup:renderIconButton({label:'Refresh devices',action:'refresh',icon:'refresh',variant:'secondary'}),
+  });
+}
+
+export function renderHomeContent({deviceListMarkup, heroMarkup = '', demoHintMarkup = '', supportingMarkup = ''}: {
+  deviceListMarkup: string;
+  heroMarkup?: string;
+  demoHintMarkup?: string;
+  supportingMarkup?: string;
+}): string {
+  return `${deviceListMarkup}${heroMarkup}${demoHintMarkup}${supportingMarkup}`;
+}
+
+export function renderDisclosure({label, contentMarkup, variant = ''}: {label: string; contentMarkup: string; variant?: string}): string {
+  const classes=['disclosure',variant].filter(Boolean).map(escapeHtml).join(' ');
+  const name=escapeHtml(label);
+  return `<details class="${classes}"><summary class="disclosure__trigger" aria-label="${name}" title="${name}" data-tooltip="${name}">${iconMarkup('chevron')}</summary><div class="disclosure__content">${contentMarkup}</div></details>`;
 }
 
 export function renderBlindActions({deviceId, blindLabel, panelMode = false, disabled = false, busy = false, movementDisabled = false, supportsPosition = false, positionClosedPercent = 100}: BlindActionsOptions): string {
@@ -516,7 +573,7 @@ export function renderBlindCard({
   const fill=`<span class="blind-art__fill" style="--blind-fill:${Math.max(0,Math.min(100,positionPercent??0))}%">${slats}</span>`;
   const cardVariant = panelMode ? ' card--panel' : '';
   const displayVariant = panelMode ? ' blind-display--panel' : '';
-  const header = renderDeviceCardHeader({id, label, availabilityLabel, availabilityTone, availabilityStatus, isSimulated, room, lastSeen});
+  const header = renderDeviceCardHeader({id, label, availabilityLabel, availabilityTone, availabilityStatus, isSimulated, room, lastSeen, panelMode});
   const status = renderBlindStatus({positionPercent, movementStatus, panelMode});
   const graphic = supportsPosition && !panelMode
     ? `<div class="blind-art blind-art--interactive" data-position-graphic="${escapeHtml(id)}" role="slider" tabindex="0" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeHtml(positionPercent ?? 0)}" aria-label="Blind position for ${escapeHtml(label)}, percent closed" data-movement="${escapeHtml(movementStatus)}">${fill}</div>`

@@ -468,6 +468,8 @@ html[data-display-mode="panel"] #app > .subtle {
 html[data-display-mode="panel"] .icon-button{width:44px;min-width:44px;height:44px;min-height:44px}
 html[data-display-mode="panel"] .topbar-add{width:44px;min-width:44px;height:44px;min-height:44px}
 html[data-display-mode="panel"] .device-card-header .status-indicator{width:28px;min-width:28px;height:28px}
+html[data-display-mode="panel"] .device-card-indicators .freshness-indicator{width:28px;height:28px;border-radius:10px}
+html[data-display-mode="panel"] .device-card-indicators .freshness-indicator .ui-icon{width:20px;height:20px}
 html[data-display-mode="panel"] .card--panel .controls .button.icon-action{min-height:44px}
 @media (min-width:360px) and (max-width:520px) and (max-height:520px){
  html[data-display-mode="panel"]{--panel-card-min-size:136px}

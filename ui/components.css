@@ -118,6 +118,8 @@
 .topbar-icon-button,.topbar-add{width:44px;min-width:44px;height:44px;min-height:44px}
 .button.icon-link-button{width:44px;min-width:44px;height:44px;min-height:44px}
 button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,[role="slider"]:focus-visible,summary:focus-visible{outline:3px solid var(--token-focus);outline-offset:3px}
+[data-tooltip]:focus-visible{position:relative;z-index:1000}
+[data-tooltip]:focus-visible::after{content:attr(data-tooltip);position:absolute;z-index:1001;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%);width:max-content;max-width:calc(100vw - 24px);padding:7px 10px;border:1px solid var(--color-border);border-radius:9px;background:var(--color-raised);color:var(--color-text);box-shadow:0 4px 16px var(--token-shadow);font-size:12px;font-weight:650;line-height:1.35;text-align:center;white-space:normal;pointer-events:none}
 .controls>.position-control{grid-column:1/-1}
 .button.utility-icon-button{display:inline-grid;place-items:center;width:44px;min-width:44px;height:44px;min-height:44px;padding:0;border:1px solid var(--color-border);border-radius:50%;background:transparent;color:var(--color-muted);box-shadow:none}
 .button.utility-icon-button:hover{background:var(--color-raised);color:var(--color-text)}
