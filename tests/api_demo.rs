@@ -498,8 +498,9 @@ async fn batches_and_simulator_settings_are_scoped_to_the_demo_cookie() {
     assert_eq!(foreign_batch.unwrap()["error"]["code"], "batch_not_found");
 }
 
-#[tokio::test]
-async fn reset_cancels_in_flight_simulator_commands_before_restoring_seed_state() {
+#[tokio::test(start_paused = true)]
+async fn demo_reset_clears_an_in_flight_command_and_preserves_seed_state_after_time_advance() {
+    // Contract: DEMO-RESET-01 in docs/test-contracts.md.
     let app = router(AppState::demo());
     let visitor = create_session(&app).await;
     let main = devices(&app, &visitor).await;
@@ -521,7 +522,7 @@ async fn reset_cancels_in_flight_simulator_commands_before_restoring_seed_state(
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let command_id = accepted.unwrap()["data"]["id"].as_str().unwrap().to_owned();
-    let mut command_state = String::new();
+    let mut command_state = None;
     for _ in 0..100 {
         let (status, _, command) = request(
             &app,
@@ -532,20 +533,22 @@ async fn reset_cancels_in_flight_simulator_commands_before_restoring_seed_state(
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        command_state = command.unwrap()["data"]["status"]
+        let observed_state = command.unwrap()["data"]["status"]
             .as_str()
             .unwrap()
             .to_owned();
-        if command_state == "connecting" {
+        if observed_state == "connecting" {
+            command_state = Some(observed_state);
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        tokio::task::yield_now().await;
     }
-    assert_eq!(command_state, "connecting");
+    assert_eq!(command_state.as_deref(), Some("connecting"));
 
     let (status, _, _) = request(&app, Method::POST, "/api/demo/reset", Some(&visitor), None).await;
     assert_eq!(status, StatusCode::OK);
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
     let (status, _, missing_command) = request(
         &app,
         Method::GET,

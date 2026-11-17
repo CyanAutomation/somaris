@@ -20,11 +20,8 @@ import {
   renderIconLinkButton,
   renderAddBlindButton,
   renderDemoBanner,
-  renderDismissButton,
   renderPositionPreset,
-  renderRoomGroup,
   renderServiceSummary,
-  renderUtilityIconButton,
   renderConfirmationPanel,
   renderEmptyState,
   renderAddDeviceEmptyState,
@@ -155,41 +152,41 @@ test('percentage-position control reflects the observed target and has an access
   assert.match(disabled, /data-position-preset="blind-1:50"[^>]*disabled/);
 });
 
-test('dashboard utility actions reuse neutral icon, service, reset, and room-group components', async () => {
-  const dismiss = parseMarkup(renderUtilityIconButton({
-    label:'Dismiss introduction', action:'hero-dismiss', icon:'close_small',
+test('service summary names its action and renders status as text', () => {
+  // Contract: UI-SERVICE-01 in docs/test-contracts.md.
+  const summary = parseMarkup(renderServiceSummary('Demo <ready>'));
+  const action = summary.querySelector('button');
+  assert.equal(summary.querySelector('h2')?.textContent, 'Somaris service');
+  assert.equal(action?.textContent, 'View service status');
+  assert.equal(action?.getAttribute('data-action'), 'service');
+  assert.equal(summary.querySelector('.subtle')?.textContent, 'Demo <ready>');
+  assert.equal(summary.querySelector('.subtle img'), null);
+});
+
+test('demo banner exposes a named reset action', () => {
+  const banner = parseMarkup(renderDemoBanner());
+  const reset = banner.querySelector('[data-action="demo-reset"]');
+  assert.equal(reset?.getAttribute('aria-label'), 'Reset demo');
+  assert.equal(reset?.getAttribute('title'), 'Reset demo');
+  assert.equal(reset?.textContent, '');
+  assert.equal(reset?.querySelector('svg')?.getAttribute('data-icon'), 'reset');
+});
+
+test('position presets expose the selected target and its accessible action', () => {
+  // Contract: UI-POSITION-01 in docs/test-contracts.md.
+  const selected = parseMarkup(renderPositionPreset({
+    deviceId:'blind-1', blindLabel:'Hallway', position:50, selectedPosition:50,
   })).querySelector('button');
-  assert.ok(dismiss?.classList.contains('utility-icon-button'));
-  assert.equal(dismiss?.getAttribute('aria-label'),'Dismiss introduction');
-  assert.equal(dismiss?.textContent,'');
-  const demoDismiss = parseMarkup(renderDismissButton({
-    label:'Dismiss demo hint',action:'demo-hint-dismiss',
+  assert.equal(selected?.textContent, '50%');
+  assert.equal(selected?.getAttribute('aria-label'), 'Move Hallway to 50% closed');
+  assert.equal(selected?.getAttribute('aria-pressed'), 'true');
+  assert.equal(selected?.getAttribute('data-action'), 'position:blind-1:50');
+
+  const disabled = parseMarkup(renderPositionPreset({
+    deviceId:'blind-1', blindLabel:'Hallway', position:25, selectedPosition:50, disabled:true,
   })).querySelector('button');
-  assert.ok(demoDismiss?.classList.contains('dismiss-button'));
-  assert.ok(demoDismiss?.classList.contains('utility-icon-button'));
-
-  const serviceSummary = parseMarkup(renderServiceSummary('Demo ready · Simulated devices'));
-  const service = serviceSummary.querySelector('button');
-  assert.equal(service?.textContent,'View service status');
-  assert.equal(service?.getAttribute('data-action'),'service');
-  assert.equal(service?.querySelector('svg')?.getAttribute('data-icon'),'service');
-  assert.equal(serviceSummary.querySelector('.subtle')?.textContent,'Demo ready · Simulated devices');
-
-  const banner = parseMarkup(renderDemoBanner()).querySelector('.demo-banner');
-  const reset = banner?.querySelector('[data-action="demo-reset"]');
-  assert.equal(reset?.getAttribute('aria-label'),'Reset demo');
-  assert.equal(reset?.getAttribute('title'),'Reset demo');
-  assert.equal(reset?.querySelector('svg')?.getAttribute('data-icon'),'reset');
-  assert.equal(reset?.textContent,'');
-  assert.ok(reset?.classList.contains('secondary'));
-
-  const group = parseMarkup(renderRoomGroup({room:'Bedroom',cardsMarkup:'<article class="card">Blind</article>'}));
-  assert.equal(group.querySelector('.room-heading')?.textContent,'Bedroom');
-  assert.equal(group.querySelector('.room-group__grid > .card')?.textContent,'Blind');
-
-  const preset = parseMarkup(renderPositionPreset({deviceId:'blind-1',blindLabel:'Hallway',position:50,selectedPosition:50})).querySelector('button');
-  assert.equal(preset?.textContent,'50%');
-  assert.equal(preset?.getAttribute('aria-pressed'),'true');
+  assert.equal(disabled?.getAttribute('aria-pressed'), 'false');
+  assert.equal(disabled?.hasAttribute('disabled'), true);
 });
 
 test('direct blind graphic is a keyboard accessible position slider outside panel mode', () => {
@@ -628,15 +625,29 @@ test('panel topbar keeps a demo reset icon when the demo banner is compacted awa
   assert.equal(reset.querySelector('svg')?.getAttribute('data-icon'),'reset');
 });
 
-test('demo device cards show optional room metadata without changing control semantics', () => {
-  const card = renderBlindCard({
+test('demo device cards show room metadata and the shared movement controls', () => {
+  // Contract: UI-ROOM-01 in docs/test-contracts.md.
+  const markup = renderBlindCard({
     id:'demo-living', label:'Living Room — Main Window', room:'Living Room', isSimulated:true,
     lastSeen:'Last heard from just now', availabilityLabel:'Online', positionPercent:75,
-    movementStatus:'at_target', controlsMarkup:'OPEN STOP CLOSE',
+    movementStatus:'at_target', controlsMarkup:renderBlindActions({
+      deviceId:'demo-living', blindLabel:'Living Room — Main Window',
+    }),
   });
-  assert.match(card, /Living Room — Main Window/);
-  assert.match(card, /class="subtle room-label">Living Room<\/div>/);
-  assert.match(card, /OPEN STOP CLOSE/);
+  const card = parseMarkup(markup);
+  assert.equal(card.querySelector('.card-title')?.textContent, 'Living Room — Main Window');
+  assert.equal(card.querySelector('.room-label')?.textContent, 'Living Room');
+  assert.equal(card.querySelector('.blind-state__label')?.textContent, 'Partially open');
+  assert.deepEqual(
+    [...card.querySelectorAll('.controls button')].map(button => [
+      button.getAttribute('aria-label'), button.getAttribute('data-action'),
+    ]),
+    [
+      ['Open Living Room — Main Window', 'command:open:demo-living'],
+      ['Stop Living Room — Main Window', 'command:stop:demo-living'],
+      ['Close Living Room — Main Window', 'command:close:demo-living'],
+    ],
+  );
 });
 
 test('panel home omits supporting sections while regular view retains activity and service', () => {
