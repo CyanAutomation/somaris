@@ -14,6 +14,7 @@ import {
   renderBadge,
   renderStatusIndicator,
   renderDeviceCardHeader,
+  renderFreshnessIndicator,
   renderButton,
   renderIconButton,
   renderIconLinkButton,
@@ -25,6 +26,10 @@ import {
   renderServiceSummary,
   renderUtilityIconButton,
   renderConfirmationPanel,
+  renderEmptyState,
+  renderAddDeviceEmptyState,
+  renderHomeContent,
+  renderDisclosure,
   renderDeviceList,
   renderMobileTabs,
   renderBatchControls,
@@ -64,6 +69,38 @@ test('blind status renders state before secondary percentage', () => {
   assert.match(markup, /blind-state__percent">42% closed/);
   assert.ok(markup.indexOf('Partially open') < markup.indexOf('42% closed'));
   assert.doesNotMatch(renderBlindStatus({positionPercent:null, movementStatus:'unavailable'}), /% closed/);
+  assert.match(renderBlindStatus({positionPercent:50,movementStatus:'stop_queued'}), /Stop queued/);
+  assert.match(renderBlindStatus({positionPercent:50,movementStatus:'stopping'}), /Stopping/);
+});
+
+test('shared empty states explain demo enrollment and reuse icon actions', () => {
+  const empty = parseMarkup(renderEmptyState({
+    title:'No blinds yet', description:'Add a nearby blind.', icon:'home',
+    actionMarkup:renderIconButton({label:'Add a blind', action:'add', icon:'add'}),
+  }));
+  assert.equal(empty.querySelector('.empty h3')?.textContent, 'No blinds yet');
+  assert.equal(empty.querySelector('.empty p')?.textContent, 'Add a nearby blind.');
+  assert.equal(empty.querySelector('[data-action="add"]')?.getAttribute('aria-label'), 'Add a blind');
+
+  const demo = parseMarkup(renderAddDeviceEmptyState({demoMode:true, adapterAvailable:false}));
+  assert.match(demo.textContent || '', /four simulated blinds/i);
+  assert.match(demo.textContent || '', /adding bluetooth devices is unavailable/i);
+  assert.equal(demo.querySelector('[data-action="refresh"]'), null);
+  assert.doesNotMatch(demo.textContent || '', /bluetooth adapter is unavailable/i);
+
+  const normal = parseMarkup(renderAddDeviceEmptyState({demoMode:false, adapterAvailable:false}));
+  assert.match(normal.textContent || '', /bluetooth adapter is unavailable/i);
+  assert.equal(normal.querySelector('[data-action="refresh"]')?.getAttribute('aria-label'), 'Refresh devices');
+});
+
+test('home composition places blind controls before introduction and demo hints', () => {
+  const root = parseMarkup(renderHomeContent({
+    deviceListMarkup:'<section id="devices"></section>',
+    heroMarkup:'<section id="hero"></section>',
+    demoHintMarkup:'<aside id="hint"></aside>',
+    supportingMarkup:'<section id="supporting"></section>',
+  }));
+  assert.deepEqual([...root.children].map(child => child.id), ['devices','hero','hint','supporting']);
 });
 
 test('icon-only blind actions have named controls, visible glyphs and disabled states', () => {
@@ -71,6 +108,7 @@ test('icon-only blind actions have named controls, visible glyphs and disabled s
   assert.match(actions, /role="group" aria-label="Bedroom Left controls"/);
   assert.match(actions, /aria-label="Open Bedroom Left"/);
   assert.match(actions, /title="Open Bedroom Left"/);
+  assert.match(actions, /data-tooltip="Open Bedroom Left"/);
   assert.match(actions, /data-action="command:open:blind-1"/);
   assert.match(actions, /data-icon="open"/);
   assert.match(actions, /aria-label="Stop Bedroom Left"/);
@@ -139,7 +177,10 @@ test('dashboard utility actions reuse neutral icon, service, reset, and room-gro
 
   const banner = parseMarkup(renderDemoBanner()).querySelector('.demo-banner');
   const reset = banner?.querySelector('[data-action="demo-reset"]');
-  assert.equal(reset?.textContent,'Reset demo');
+  assert.equal(reset?.getAttribute('aria-label'),'Reset demo');
+  assert.equal(reset?.getAttribute('title'),'Reset demo');
+  assert.equal(reset?.querySelector('svg')?.getAttribute('data-icon'),'reset');
+  assert.equal(reset?.textContent,'');
   assert.ok(reset?.classList.contains('secondary'));
 
   const group = parseMarkup(renderRoomGroup({room:'Bedroom',cardsMarkup:'<article class="card">Blind</article>'}));
@@ -176,6 +217,7 @@ test('mobile tabs expose icon-only navigation and the current route', () => {
   assert.deepEqual(tabs.map(tab => tab.getAttribute('aria-label')), ['Blinds', 'Activity', 'Service status']);
   assert.equal(tabs[1]?.getAttribute('aria-current'), 'page');
   assert.ok(tabs.every(tab => tab.getAttribute('title')));
+  assert.ok(tabs.every(tab => tab.getAttribute('data-tooltip')));
   assert.ok(tabs.every(tab => tab.textContent === ''));
 });
 
@@ -249,6 +291,7 @@ test('icon-only actions expose an accessible name and an actionable enabled stat
   assert.ok(button);
   assert.equal(button.getAttribute('aria-label'), 'Refresh');
   assert.equal(button.getAttribute('title'), 'Refresh');
+  assert.equal(button.getAttribute('data-tooltip'), 'Refresh');
   assert.equal(button.getAttribute('data-action'), 'refresh');
   assert.equal(button.textContent, '');
   assert.equal(button.querySelector('svg')?.getAttribute('aria-hidden'), 'true');
@@ -264,6 +307,7 @@ test('icon link buttons keep a descriptive accessible name without visible label
   const button = root.querySelector('button');
   assert.equal(button?.getAttribute('aria-label'), 'View details for Bedroom Left');
   assert.equal(button?.getAttribute('title'), 'View details for Bedroom Left');
+  assert.equal(button?.getAttribute('data-tooltip'), 'View details for Bedroom Left');
   assert.ok(button?.classList.contains('icon-link-button'));
   assert.equal(button?.getAttribute('data-action'), 'details:blind-1');
   assert.equal(button?.querySelector('svg')?.getAttribute('data-icon'), 'info');
@@ -317,6 +361,44 @@ test('device badge and header expose escaped labels and accessible device detail
   assert.equal(header.querySelector('img'), null);
 });
 
+test('compact device headers show an icon-only freshness cue without hiding its meaning', () => {
+  const panel = parseMarkup(renderDeviceCardHeader({
+    id:'blind-1', label:'Hallway', availabilityLabel:'Online', availabilityStatus:'ready',
+    panelMode:true, lastSeen:'Last heard from 3 min ago',
+  }));
+  const freshness = panel.querySelector('.freshness-indicator');
+  assert.equal(freshness?.getAttribute('role'), 'img');
+  assert.equal(freshness?.getAttribute('aria-label'), 'Last heard from 3 min ago');
+  assert.equal(freshness?.getAttribute('title'), 'Last heard from 3 min ago');
+  assert.equal(freshness?.querySelector('svg')?.getAttribute('data-icon'), 'clock');
+  assert.equal(freshness?.textContent, '');
+  assert.doesNotMatch(panel.textContent || '', /Last heard from 3 min ago/);
+
+  const wide = parseMarkup(renderDeviceCardHeader({
+    id:'blind-1', label:'Hallway', availabilityLabel:'Online', availabilityStatus:'ready',
+    lastSeen:'Last heard from 3 min ago',
+  }));
+  assert.equal(wide.querySelector('.freshness-indicator'), null);
+  assert.match(wide.textContent || '', /Last heard from 3 min ago/);
+});
+
+test('native disclosure primitive is icon-first and exposes a named keyboard target', () => {
+  const root = parseMarkup(renderDisclosure({
+    label:'Advanced device diagnostics',
+    contentMarkup:'<h2>Advanced diagnostics</h2><p>Telemetry details</p>',
+    variant:'advanced-disclosure',
+  }));
+  const details = root.querySelector('details');
+  const summary = details?.querySelector('summary');
+  assert.ok(details);
+  assert.equal(summary?.getAttribute('aria-label'), 'Advanced device diagnostics');
+  assert.equal(summary?.getAttribute('title'), 'Advanced device diagnostics');
+  assert.equal(summary?.getAttribute('data-tooltip'), 'Advanced device diagnostics');
+  assert.equal(summary?.querySelector('svg')?.getAttribute('data-icon'), 'chevron');
+  assert.equal(summary?.textContent, '');
+  assert.equal(details?.querySelector('.disclosure__content h2')?.textContent, 'Advanced diagnostics');
+});
+
 test('availability is a compact reusable icon indicator with an accessible status name', () => {
   const ready = parseMarkup(renderStatusIndicator({label:'Online', status:'ready'}));
   const indicator = ready.querySelector('[role="img"]');
@@ -362,7 +444,7 @@ test('device cards expose blind identity, reported status, and named actions in 
     assert.equal(card.querySelector('article h3 button')?.getAttribute('aria-label'), 'View details for Bedroom Left');
     assert.equal(card.querySelector('.blind-state__label')?.textContent, 'Opening');
     assert.equal(card.querySelector('.blind-state__percent')?.textContent, '100% closed');
-    assert.equal(card.querySelector('[role="img"]')?.getAttribute('aria-label'), 'Online');
+    assert.equal(card.querySelector('.status-indicator[role="img"]')?.getAttribute('aria-label'), 'Online');
     assert.deepEqual([...card.querySelectorAll('.controls button')]
       .map(button => button.getAttribute('aria-label')),
     ['Open Bedroom Left', 'Stop Bedroom Left', 'Close Bedroom Left']);
