@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandAwareMovementStatus, commandMessage, displayPreferenceFrom, dispatchMenuActionValue, dispatchMenuChoice, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, parseActionValue, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandAwareMovementStatus, commandMessage, displayPreferenceFrom, dispatchMenuActionValue, dispatchMenuChoice, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
 import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, DashboardState, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
 
 type CommandTarget = RefreshTarget & {
@@ -224,22 +224,16 @@ test('action data parsing preserves encoded identifiers and ignores extra segmen
  assert.deepEqual(parseActionValue('remove:blind-1:ignored'), ['remove','blind-1','ignored']);
 });
 
-test('display and theme menu actions dispatch the selected option value', () => {
- const [displayAction,displayOperation,displayValue]=parseActionValue('display:set:panel');
- const [themeAction,themeOperation,themeValue]=parseActionValue('theme:set:light');
- const choices:Array<[string,string]>=[];
- assert.equal(dispatchMenuChoice(displayAction,displayOperation,displayValue,(kind,value)=>choices.push([kind,value])),true);
- assert.equal(dispatchMenuChoice(themeAction,themeOperation,themeValue,(kind,value)=>choices.push([kind,value])),true);
- assert.equal(dispatchMenuChoice('display','set','unknown',()=>{}),false);
- assert.deepEqual(choices,[['display','panel'],['theme','light']]);
-});
-
-test('menu click dispatch reads the selected option from the full data-action value', () => {
+test('display and theme action values dispatch supported preferences', () => {
+ // Contract: UI-PREF-01 in docs/test-contracts.md.
  const choices:Array<[string,string]>=[];
  const apply=(kind:'display'|'theme',preference:string)=>choices.push([kind,preference]);
  assert.equal(dispatchMenuActionValue('display:set:panel',apply),true);
  assert.equal(dispatchMenuActionValue('theme:set:light',apply),true);
  assert.equal(dispatchMenuActionValue('command:open:blind-1',apply),false);
+ assert.equal(dispatchMenuChoice('display','set','unknown',apply),false);
+ assert.equal(dispatchMenuChoice('theme','set','unknown',apply),false);
+ assert.equal(dispatchMenuActionValue('theme:set:unknown',apply),true);
  assert.deepEqual(choices,[['display','panel'],['theme','light']]);
 });
 
