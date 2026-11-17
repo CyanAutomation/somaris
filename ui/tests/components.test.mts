@@ -18,6 +18,12 @@ import {
   renderIconButton,
   renderIconLinkButton,
   renderAddBlindButton,
+  renderDemoBanner,
+  renderDismissButton,
+  renderPositionPreset,
+  renderRoomGroup,
+  renderServiceSummary,
+  renderUtilityIconButton,
   renderConfirmationPanel,
   renderDeviceList,
   renderMobileTabs,
@@ -96,6 +102,11 @@ test('percentage-position control reflects the observed target and has an access
   assert.match(controls, /data-position-preset="blind-1:50"/);
   assert.match(controls, /aria-label="Move Hallway to 50% closed"/);
   assert.doesNotMatch(controls, /position-submit|Move to selected position/);
+  assert.deepEqual(
+    [...parseMarkup(controls).querySelectorAll('.position-preset .button-label')].map(label=>label.textContent),
+    ['0%','25%','50%','75%','100%'],
+  );
+  assert.ok(controls.indexOf('data-action="command:close:blind-1"') < controls.indexOf('class="position-control"'));
   for (const preset of [0, 25, 50, 75, 100]) assert.match(controls, new RegExp(`data-position-preset="blind-1:${preset}"`));
 
   const disabled = renderBlindActions({
@@ -104,6 +115,40 @@ test('percentage-position control reflects the observed target and has an access
   });
   assert.match(disabled, /data-position-input="blind-1"[^>]*disabled/);
   assert.match(disabled, /data-position-preset="blind-1:50"[^>]*disabled/);
+});
+
+test('dashboard utility actions reuse neutral icon, service, reset, and room-group components', async () => {
+  const dismiss = parseMarkup(renderUtilityIconButton({
+    label:'Dismiss introduction', action:'hero-dismiss', icon:'close_small',
+  })).querySelector('button');
+  assert.ok(dismiss?.classList.contains('utility-icon-button'));
+  assert.equal(dismiss?.getAttribute('aria-label'),'Dismiss introduction');
+  assert.equal(dismiss?.textContent,'');
+  const demoDismiss = parseMarkup(renderDismissButton({
+    label:'Dismiss demo hint',action:'demo-hint-dismiss',
+  })).querySelector('button');
+  assert.ok(demoDismiss?.classList.contains('dismiss-button'));
+  assert.ok(demoDismiss?.classList.contains('utility-icon-button'));
+
+  const serviceSummary = parseMarkup(renderServiceSummary('Demo ready · Simulated devices'));
+  const service = serviceSummary.querySelector('button');
+  assert.equal(service?.textContent,'View service status');
+  assert.equal(service?.getAttribute('data-action'),'service');
+  assert.equal(service?.querySelector('svg')?.getAttribute('data-icon'),'service');
+  assert.equal(serviceSummary.querySelector('.subtle')?.textContent,'Demo ready · Simulated devices');
+
+  const banner = parseMarkup(renderDemoBanner()).querySelector('.demo-banner');
+  const reset = banner?.querySelector('[data-action="demo-reset"]');
+  assert.equal(reset?.textContent,'Reset demo');
+  assert.ok(reset?.classList.contains('secondary'));
+
+  const group = parseMarkup(renderRoomGroup({room:'Bedroom',cardsMarkup:'<article class="card">Blind</article>'}));
+  assert.equal(group.querySelector('.room-heading')?.textContent,'Bedroom');
+  assert.equal(group.querySelector('.room-group__grid > .card')?.textContent,'Blind');
+
+  const preset = parseMarkup(renderPositionPreset({deviceId:'blind-1',blindLabel:'Hallway',position:50,selectedPosition:50})).querySelector('button');
+  assert.equal(preset?.textContent,'50%');
+  assert.equal(preset?.getAttribute('aria-pressed'),'true');
 });
 
 test('direct blind graphic is a keyboard accessible position slider outside panel mode', () => {

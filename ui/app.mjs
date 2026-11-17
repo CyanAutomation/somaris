@@ -1,7 +1,8 @@
-import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderMotorSpeedControl, renderCalibrationControls, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
+import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderMotorSpeedControl, renderCalibrationControls, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
 import { SnackbarQueue } from './snackbar.mjs';
 export { escapeHtml };
 const displayModes = new Set(DISPLAY_MODE_OPTIONS.map(([value]) => value));
+const themeModes = new Set(['auto', 'dark', 'light', 'high-contrast']);
 const displayPreferenceCycle = DISPLAY_MODE_OPTIONS.map(([value]) => value);
 export function nextDisplayPreference(preference) {
     const index = displayPreferenceCycle.indexOf(preference);
@@ -22,6 +23,27 @@ export function displayPreferenceFrom(search, saved) {
     if (requested && displayModes.has(requested))
         return requested;
     return saved && displayModes.has(saved) ? saved : 'auto';
+}
+function menuChoicePreference(action, operation, value) {
+    if (operation !== 'set')
+        return null;
+    if (action === 'display' && displayModes.has(value))
+        return value;
+    if (action === 'theme' && themeModes.has(value))
+        return value;
+    return null;
+}
+export function dispatchMenuChoice(action, operation, value, apply) {
+    const preference = menuChoicePreference(action, operation, value);
+    if (!preference)
+        return false;
+    if (action === 'display')
+        apply('display', preference);
+    else if (action === 'theme')
+        apply('theme', preference);
+    else
+        return false;
+    return true;
 }
 export function resolveActionFocus({ focusedAction = null, pendingConfirmationId = null, confirmingRemovalId = null, availableActions = [], }) {
     if (pendingConfirmationId && pendingConfirmationId === confirmingRemovalId) {
@@ -517,54 +539,6 @@ export function renderManagedDeviceCard(device, dashboard, panelMode, now = Date
     });
     let messageMarkup = cardMessageMarkup(panelMode, message, msgTone, availabilityDetail, cooldownDetail, calibrationDetail);
     const footerMarkup = `${batteryDisplay(o?.battery, e.id)}${renderIconLinkButton({ label: `View details for ${blindLabel}`, action: `details:${e.id}`, icon: 'info' })}`;
-    const feedback = device.motion_feedback?.status;
-    const progressStatus = dashboard.commands[e.id]?.status;
-    let progressCopy = '';
-    let progressIcon = 'spinner';
-    let progressPercent = 28;
-    let progressTone = '';
-    if (progressStatus === 'queued') {
-        progressCopy = 'Command queued. Waiting for the blind.';
-        progressPercent = 20;
-    }
-    else if (progressStatus === 'connecting') {
-        progressCopy = 'Sending command to the blind.';
-        progressPercent = 55;
-    }
-    else if (progressStatus === 'write_acknowledged') {
-        progressCopy = 'Command acknowledged. Movement is shown when reported by the blind.';
-        progressIcon = 'check';
-        progressPercent = 70;
-    }
-    else if (['outcome_unknown', 'write_failed'].includes(progressStatus || '')) {
-        progressCopy = commandMessage(dashboard.commands[e.id])[0];
-        progressIcon = 'warning';
-        progressTone = 'warn';
-        progressPercent = 38;
-    }
-    else if (feedback === 'awaiting_progress') {
-        progressCopy = motionFeedbackLabel(device.motion_feedback);
-        progressPercent = 35;
-    }
-    else if (feedback === 'progress_observed') {
-        progressCopy = motionFeedbackLabel(device.motion_feedback);
-        progressIcon = 'check';
-        progressPercent = 72;
-    }
-    else if (feedback === 'stalled') {
-        progressCopy = motionFeedbackLabel(device.motion_feedback);
-        progressIcon = 'warning';
-        progressTone = 'warn';
-        progressPercent = 48;
-    }
-    else if (feedback === 'target_reached') {
-        progressCopy = motionFeedbackLabel(device.motion_feedback);
-        progressIcon = 'check';
-        progressPercent = 100;
-    }
-    const progressMarkup = progressCopy ? `<div class="command-progress command-progress--${progressTone || 'active'}" data-command-progress="${esc(e.id)}" role="status" aria-label="${esc(progressCopy)}" title="${esc(progressCopy)}"><span class="command-progress__icon" role="img" aria-label="${esc(progressCopy)}">${renderIcon(progressIcon)}</span><span class="command-progress__track" aria-hidden="true"><i style="--progress:${progressPercent}%"></i></span><span class="sr-only" aria-live="polite">${esc(progressCopy)}</span></div>` : '';
-    if (progressCopy && !panelMode)
-        messageMarkup = regularCardMessageMarkup('', msgTone, availabilityDetail, cooldownDetail, calibrationDetail);
     return renderBlindCard({
         id: e.id, label: blindLabel, isSimulated: e.is_simulated, room: e.room, lastSeen: relativeAt(device.last_seen_at, now),
         availabilityLabel: label, availabilityTone: tone,
@@ -572,7 +546,6 @@ export function renderManagedDeviceCard(device, dashboard, panelMode, now = Date
         positionPercent: p, movementStatus: o?.movement_status ?? 'unavailable', blindLines: lines,
         controlsMarkup, messageMarkup, footerMarkup, panelMode,
         supportsPosition: device.capabilities?.set_position === true,
-        progressMarkup,
     });
 }
 function card(device) {
@@ -593,7 +566,7 @@ function activityPanel() {
 }
 function home() {
     const panelMode = document.documentElement.dataset.displayMode === 'panel';
-    const hero = panelMode || heroDismissed ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${renderIconButton({ label: 'Dismiss introduction', action: 'hero-dismiss', icon: 'close_small', variant: 'hero-dismiss' })}</section>`;
+    const hero = panelMode || heroDismissed ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${renderDismissButton({ label: 'Dismiss introduction', action: 'hero-dismiss', variant: 'hero-dismiss' })}</section>`;
     const empty = panelMode
         ? `<div class="panel empty"><h3>No blinds yet</h3><p>Add a nearby blind to see its status and controls here.</p></div>`
         : `<div class="panel empty"><div class="empty-icon empty-illustration">${renderIcon('home')}</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p>${renderIconButton({ label: 'Add a blind', action: 'add', icon: 'add' })}</div>`;
@@ -609,10 +582,10 @@ function home() {
     const listMarkup = renderDeviceList({
         count: state.managed.length, panelMode,
         cardsMarkup: state.managed.map(card).join(''), emptyMarkup: loadingError || empty, toolbarMarkup: batchControls,
-        groupsMarkup: !panelMode && state.managed.some(device => device.enrollment.room) ? [...new Set(state.managed.map(device => device.enrollment.room || 'Other'))].map(room => `<section class="room-group"><h3 class="room-heading">${esc(room)}</h3><div class="grid">${state.managed.filter(device => (device.enrollment.room || 'Other') === room).map(card).join('')}</div></section>`).join('') : '',
+        groupsMarkup: !panelMode && state.managed.some(device => device.enrollment.room) ? [...new Set(state.managed.map(device => device.enrollment.room || 'Other'))].map(room => renderRoomGroup({ room, cardsMarkup: state.managed.filter(device => (device.enrollment.room || 'Other') === room).map(card).join('') })).join('') : '',
     });
-    const serviceMarkup = `<div class="section-heading service-summary"><h2>Somaris service</h2>${renderIconButton({ label: 'View service status', action: 'service', icon: 'service' })}</div><p class="subtle">${esc(scannerSummary())}</p>`;
-    const demoHint = state.demoMode && !hintDismissed && !panelMode ? `<aside class="demo-hint"><span>${renderIcon('open')}${renderIcon('stop')}${renderIcon('close')} Try the blind controls to explore the demo.</span>${renderIconButton({ label: 'Dismiss demo hint', action: 'demo-hint-dismiss', icon: 'close_small' })}</aside>` : '';
+    const serviceMarkup = renderServiceSummary(scannerSummary());
+    const demoHint = state.demoMode && !hintDismissed && !panelMode ? `<aside class="demo-hint"><span>${renderIcon('open')}${renderIcon('stop')}${renderIcon('close')} Try the blind controls to explore the demo.</span>${renderDismissButton({ label: 'Dismiss demo hint', action: 'demo-hint-dismiss', variant: 'demo-hint-dismiss' })}</aside>` : '';
     const supportingSections = renderHomeSupportingSections({
         panelMode,
         activityMarkup: panelMode ? '' : activityPanel(),
@@ -766,9 +739,6 @@ function servicePageIntro() {
 function simulatorControlsForMode() {
     return state.demoMode ? '' : simulatorControls();
 }
-function demoBanner() {
-    return `<section class="demo-banner" aria-label="Somaris demonstration"><div><p class="eyebrow">Somaris Demo</p><p>Explore a simulated smart home. Your changes only affect this demonstration.</p></div>${renderIconButton({ label: 'Reset demo', action: 'demo-reset', icon: 'reset', variant: 'secondary' })}</section>`;
-}
 function page() { return location.hash.slice(1) || 'home'; }
 function pageContent(route) {
     if (route === 'add')
@@ -847,7 +817,7 @@ function render() {
     document.documentElement.dataset.theme = themePreference;
     app.removeAttribute('aria-busy');
     app.removeAttribute('aria-label');
-    app.innerHTML = `${state.demoMode ? demoBanner() : ''}${content}${document.documentElement.dataset.displayMode === 'panel' ? '' : renderMobileTabs(page())}`;
+    app.innerHTML = `${state.demoMode ? renderDemoBanner() : ''}${content}${document.documentElement.dataset.displayMode === 'panel' ? '' : renderMobileTabs(page())}`;
     for (const popover of app.querySelectorAll('[popover]'))
         popover.addEventListener('toggle', () => {
             const trigger = app?.querySelector(`[aria-controls="${CSS.escape(popover.id)}"]`);
@@ -1239,16 +1209,6 @@ function patchCards() {
         const newMessages = next.querySelector('[data-card-messages]');
         if (oldMessages && newMessages)
             oldMessages.innerHTML = newMessages.innerHTML;
-        const oldProgress = current.querySelector('[data-command-progress]');
-        const newProgress = next.querySelector('[data-command-progress]');
-        if (oldProgress && newProgress)
-            oldProgress.replaceWith(newProgress.cloneNode(true));
-        else if (oldProgress && !newProgress)
-            oldProgress.remove();
-        else if (!oldProgress && newProgress) {
-            const controls = current.querySelector('.controls');
-            controls?.after(newProgress.cloneNode(true));
-        }
         const oldControls = [...current.querySelectorAll('.controls button')];
         const newControls = [...next.querySelectorAll('.controls button')];
         for (const oldControl of oldControls) {
@@ -1476,7 +1436,7 @@ function changeDisplayMode(preference, applyDisplayMode) {
     document.getElementById('display-mode-toggle')?.focus({ preventScroll: true });
 }
 function changeTheme(preference) {
-    if (!['auto', 'dark', 'light', 'high-contrast'].includes(preference))
+    if (!themeModes.has(preference))
         return;
     themePreference = preference;
     try {
@@ -1561,10 +1521,8 @@ function handleRemovalClick(action, deviceId) {
 const clickActionHandlers = {
     'snackbar-dismiss': (_argument, _id, deviceId) => { snackbarQueue.dismiss(deviceId); return true; },
     'display-menu-toggle': () => { toggleDisplayMenu(); return true; },
-    display: (argument, _id, deviceId, applyDisplayMode) => { if (argument === 'set')
-        changeDisplayMode(deviceId, applyDisplayMode); closeDisplayMenu(); return true; },
-    theme: (argument, _id, deviceId) => { if (argument === 'set')
-        changeTheme(deviceId); closeDisplayMenu(); return true; },
+    display: (argument, _id, value, applyDisplayMode) => { dispatchMenuChoice('display', argument, value, (_kind, preference) => changeDisplayMode(preference, applyDisplayMode)); closeDisplayMenu(); return true; },
+    theme: (argument, _id, value) => { dispatchMenuChoice('theme', argument, value, (_kind, preference) => changeTheme(preference)); closeDisplayMenu(); return true; },
     command: (argument, id) => dispatchBlindCommand(argument, id),
     batch: argument => handleBatchClick(argument),
     position: (_argument, id, deviceId) => handlePositionClick(deviceId, id),
