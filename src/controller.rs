@@ -1,3 +1,9 @@
+//! Controller protocol helpers.
+//!
+//! [`ControllerCommand`], its encoder, and the notification helpers model an
+//! older standalone protocol API retained as public exports. The running BLE
+//! adapter uses [`ServiceAction`] and `ble::protocol` for current SOMA devices.
+
 use thiserror::Error;
 
 pub const OPEN_CLOSE_SERVICE_UUID: &str = "00001890-b87f-490c-92cb-11ba5ea5167c";
@@ -12,6 +18,7 @@ pub const SHADE_CONFIG_SERVICE_UUID: &str = OPEN_CLOSE_SERVICE_UUID;
 pub const SHADE_CONFIG_CHARACTERISTIC_UUID: &str = OPEN_CLOSE_CHARACTERISTIC_UUID;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A command in the older standalone controller protocol.
 pub enum ControllerCommand {
     Open,
     Close,
@@ -57,6 +64,9 @@ pub enum PositionError {
     NotFinite(String),
 }
 
+/// Encodes a command for the older standalone controller protocol.
+///
+/// The live BLE adapter uses [`encode_service_action`] instead.
 pub fn encode_controller_command(command: ControllerCommand) -> Vec<u8> {
     match command {
         ControllerCommand::Open => vec![0x01, 0x00, 0x00],
@@ -291,6 +301,10 @@ pub fn service_action_target(action: ServiceAction) -> (&'static str, &'static s
     }
 }
 
+/// Encodes an open percentage for the older standalone controller protocol.
+///
+/// The current API uses integer percent-closed targets and does not call this
+/// conversion helper.
 pub fn set_position_byte(position: f64) -> Result<u8, PositionError> {
     if !position.is_finite() {
         return Err(PositionError::NotFinite(position.to_string()));
@@ -301,14 +315,17 @@ pub fn set_position_byte(position: f64) -> Result<u8, PositionError> {
     Ok((position * 255.0 / 100.0).round() as u8)
 }
 
+/// Converts a legacy notification's wire position byte to percent open.
 pub fn open_percent_from_wire_byte(value: u8) -> u8 {
     ((u16::from(value) * 100 + 127) / 255) as u8
 }
 
+/// Converts a legacy percent-open value to the service's percent-closed scale.
 pub fn closed_percent_from_open_percent(open_percent: u8) -> u8 {
     100u8.saturating_sub(open_percent.min(100))
 }
 
+/// Parses notifications from the older standalone controller protocol.
 pub fn parse_notification(bytes: &[u8]) -> Option<Notification> {
     let operation = *bytes.first()?;
     match operation {

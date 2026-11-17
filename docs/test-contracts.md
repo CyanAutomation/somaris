@@ -19,9 +19,16 @@ These stable identifiers link regression tests to the behavior they protect. The
 - **UI-INPUT-01 — Inline enrollment validation:** Display names are required, limited to 64 characters, and report errors with `aria-invalid` and `aria-describedby` before the add request is sent.
 - **UI-THEME-01 — Opt-in themes:** Dark remains the default; Light and High contrast are explicit choices, while Auto follows system color and contrast preferences.
 - **UI-UNDO-01 — Undo positioning and bulk actions:** Position and completed all-blinds actions offer icon-only undo actions. A later command on an affected blind invalidates its bulk undo.
+- **UI-PREF-01 — Display and theme selection:** Selecting a supported display mode or theme applies that preference. Unsupported values and unrelated actions do not apply a preference.
+- **UI-ROOM-01 — Room grouping:** Room groups show their room name. At a desktop width that supports two columns, a one-blind group uses the same card width as each card in a pair.
+- **UI-SERVICE-01 — Service summary:** The dashboard exposes a visible action to open service status and renders its summary as text.
 
 ## Bluetooth cleanup
 
 - **BLE-CLEANUP-01 — Bounded disconnect cleanup:** After a BLE operation, Somaris attempts disconnect cleanup and does not wait on a disconnect indefinitely. Cleanup finishes within the service's documented 10-second command-finalization allowance, including when the adapter returns an error or never completes.
+
+## Demo session
+
+- **DEMO-RESET-01 — Session reset:** Reset restores the seeded demo household and clears that visitor's command history and activity. An in-flight simulator command does not change the restored state after reset.
 
 The dashboard contracts complement the user-facing behavior described in the README. BLE-CLEANUP-01 follows the command cleanup limit documented in the README's API section.

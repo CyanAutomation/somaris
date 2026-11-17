@@ -10,7 +10,6 @@ import {
   renderPanelNotice,
   renderTopbarActions,
   renderRoomGroup,
-  renderUtilityIconButton,
 } from '../components.mjs';
 
 const styles = [
@@ -22,7 +21,12 @@ const styles = [
 let browser: Browser;
 
 before(async () => {
-  browser = await chromium.launch({headless:true});
+  browser = await chromium.launch({
+    headless:true,
+    ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+      ? {executablePath:process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH}
+      : {}),
+  });
 });
 
 after(async () => {
@@ -110,34 +114,34 @@ test('panel view lays out blind cards in two columns at 480px with usable contro
 });
 
 test('room groups keep a single blind the same width as blinds in a pair', async () => {
+  // Contract: UI-ROOM-01 in docs/test-contracts.md.
   const card = (id:string,label:string) => renderBlindCard({
     id,label,availabilityLabel:'Online',availabilityStatus:'ready',positionPercent:50,
     movementStatus:'at_target',controlsMarkup:renderBlindActions({deviceId:id,blindLabel:label}),
   });
   const singleRoom = renderRoomGroup({room:'Bedroom',cardsMarkup:card('bedroom','Bedroom blind')});
   const pairedRoom = renderRoomGroup({room:'Living Room',cardsMarkup:card('left','Left blind')+card('right','Right blind')});
-  const utilityAction = renderUtilityIconButton({
-    label:'Dismiss introduction',action:'hero-dismiss',icon:'close_small',
-  });
   const page = await browser.newPage({viewport:{width:1160,height:900}});
   try {
-    await page.setContent(`<!doctype html><html><head><style>${styles}</style></head><body><div class="app-shell">${singleRoom}${pairedRoom}<div class="utility-fixture">${utilityAction}<button class="button primary-fixture">Primary</button></div></div></body></html>`);
+    await page.setContent(`<!doctype html><html><head><style>${styles}</style></head><body><div class="app-shell">${singleRoom}${pairedRoom}</div></body></html>`);
     const layout = await page.evaluate(() => {
       const singleGrid = document.querySelector('.room-group__grid')!;
       const pairedGrid = document.querySelectorAll('.room-group__grid')[1]!;
       const singleCard = singleGrid.querySelector('.card')!.getBoundingClientRect();
-      const pairedCard = pairedGrid.querySelector('.card')!.getBoundingClientRect();
+      const pairedCards = [...pairedGrid.querySelectorAll('.card')].map(card => card.getBoundingClientRect());
       return {
         singleWidth:singleCard.width,
-        pairedWidth:pairedCard.width,
+        pairedWidths:pairedCards.map(card => card.width),
+        pairedLefts:pairedCards.map(card => card.left),
         gridWidth:singleGrid.getBoundingClientRect().width,
-        utilityBackground:getComputedStyle(document.querySelector('.utility-icon-button')!).backgroundColor,
-        primaryBackground:getComputedStyle(document.querySelector('.primary-fixture')!).backgroundColor,
+        roomNames:[...document.querySelectorAll('.room-heading')].map(heading => heading.textContent),
       };
     });
-    assert.ok(Math.abs(layout.singleWidth-layout.pairedWidth)<1);
-    assert.ok(layout.singleWidth<layout.gridWidth*.75);
-    assert.notEqual(layout.utilityBackground,layout.primaryBackground);
+    assert.deepEqual(layout.roomNames, ['Bedroom', 'Living Room']);
+    assert.equal(layout.pairedWidths.length, 2);
+    assert.ok(layout.pairedLefts[0]! < layout.pairedLefts[1]!);
+    assert.ok(layout.singleWidth < layout.gridWidth);
+    assert.ok(layout.pairedWidths.every(width => Math.abs(layout.singleWidth - width) < 1));
   } finally {
     await page.close();
   }

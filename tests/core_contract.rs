@@ -62,8 +62,10 @@ impl CharacteristicReader for FailOnceReader {
     }
 }
 
+// These tests cover public legacy helpers documented in src/controller.rs.
+// The active SOMA V2 advertisement path is covered in ble_contract.rs.
 #[test]
-fn controller_wire_positions_and_dashboard_positions_have_explicit_conventions() {
+fn legacy_controller_position_helpers_preserve_open_and_closed_percent_conventions() {
     assert_eq!(open_percent_from_wire_byte(0x00), 0);
     assert_eq!(open_percent_from_wire_byte(0x80), 50);
     assert_eq!(open_percent_from_wire_byte(0xff), 100);
@@ -90,6 +92,10 @@ fn legacy_controller_commands_encode_the_documented_operation_bytes() {
     assert_eq!(
         encode_controller_command(ControllerCommand::SetPosition(50)),
         [0x10, 0x80]
+    );
+    assert_eq!(
+        encode_controller_command(ControllerCommand::GetVersion),
+        [0x20]
     );
 }
 
@@ -199,7 +205,7 @@ fn controller_uses_the_expected_gatt_service_and_characteristic_uuids() {
 }
 
 #[test]
-fn controller_rejects_invalid_positions_before_encoding() {
+fn legacy_position_encoder_rejects_non_finite_and_out_of_range_values() {
     assert_eq!(set_position_byte(0.0), Ok(0));
     assert_eq!(set_position_byte(50.0), Ok(128));
     assert_eq!(set_position_byte(100.0), Ok(255));
@@ -222,7 +228,7 @@ fn controller_rejects_invalid_positions_before_encoding() {
 }
 
 #[test]
-fn truncated_notifications_are_ignored_and_complete_frames_are_decoded() {
+fn legacy_notification_parser_ignores_truncated_frames_and_decodes_complete_frames() {
     assert_eq!(parse_notification(&[0x01]), None);
     assert_eq!(parse_notification(&[0x10]), None);
     assert_eq!(parse_notification(&[0x20, 1, 2]), None);
