@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandMessage, displayPreferenceFrom, dispatchMenuActionValue, dispatchMenuChoice, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, parseActionValue, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandAwareMovementStatus, commandMessage, displayPreferenceFrom, dispatchMenuActionValue, dispatchMenuChoice, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, parseActionValue, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
 import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, DashboardState, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
 
 type CommandTarget = RefreshTarget & {
@@ -398,6 +398,16 @@ test('command messages distinguish acknowledgement and uncertain outcomes',()=>{
  assert.match(commandMessage({status:'connection_failed',retryable:true})[0],/no command was sent/i);
  assert.match(commandMessage({status:'connection_failed',failure_stage:'command_validation'})[0],/no bluetooth write was attempted/i);
  assert.match(commandMessage({status:'deferred'})[0],/cooldown/i);
+});
+
+test('Stop commands expose queued and stopping states without overruling acknowledged telemetry',()=>{
+ assert.equal(commandAwareMovementStatus('opening',{action:'stop',status:'queued'}),'stop_queued');
+ assert.equal(commandAwareMovementStatus('opening',{action:'stop',status:'connecting'}),'stopping');
+ assert.equal(commandAwareMovementStatus('opening',{action:'stop',status:'write_acknowledged'}),'opening');
+ assert.equal(commandAwareMovementStatus('opening',{action:'open',status:'connecting'}),'opening');
+ assert.match(commandMessage({action:'stop',status:'queued'})[0],/stop queued/i);
+ assert.match(commandMessage({action:'stop',status:'connecting'})[0],/sending stop command/i);
+ assert.match(commandMessage({action:'stop',status:'write_acknowledged'})[0],/stop command acknowledged.*position will update/i);
 });
 
 test('physical command payloads carry the label from the current managed-device snapshot',()=>{

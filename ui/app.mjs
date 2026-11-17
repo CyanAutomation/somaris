@@ -1,4 +1,4 @@
-import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderMotorSpeedControl, renderCalibrationControls, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
+import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderAddDeviceEmptyState, renderHomeContent, renderDisclosure, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
 import { SnackbarQueue } from './snackbar.mjs';
 export { escapeHtml };
 const displayModes = new Set(DISPLAY_MODE_OPTIONS.map(([value]) => value));
@@ -70,10 +70,12 @@ function storedDisplayPreference() {
 }
 export function commandMessage(command) {
     switch (command.status) {
-        case 'queued': return ['Queued. Waiting for the blind…', ''];
-        case 'connecting': return ['Sending command to the blind…', ''];
+        case 'queued': return command.action === 'stop' ? ['Stop queued. Waiting for the blind…', ''] : ['Queued. Waiting for the blind…', ''];
+        case 'connecting': return command.action === 'stop' ? ['Sending stop command to the blind…', ''] : ['Sending command to the blind…', ''];
         case 'deferred': return ['Movement paused by the Bluetooth cooldown. Stop remains available.', 'warn'];
-        case 'write_acknowledged': return ['Command acknowledged. Movement is shown when reported by the blind.', ''];
+        case 'write_acknowledged': return command.action === 'stop'
+            ? ['Stop command acknowledged. Position will update when reported by the blind.', '']
+            : ['Command acknowledged. Movement is shown when reported by the blind.', ''];
         case 'outcome_unknown':
         case 'write_failed': return ['The outcome is uncertain. Check the reported position before trying again.', 'warn'];
         case 'connection_failed':
@@ -84,6 +86,15 @@ export function commandMessage(command) {
         case 'cancelled': return ['The command was cancelled.', 'warn'];
         default: return ['Checking command status…', ''];
     }
+}
+export function commandAwareMovementStatus(observed, command) {
+    if (command?.action !== 'stop')
+        return observed;
+    if (command.status === 'queued')
+        return 'stop_queued';
+    if (command.status === 'connecting')
+        return 'stopping';
+    return observed;
 }
 export function activityMessage(activity) {
     const subject = activity.subject || 'Somaris';
@@ -539,11 +550,12 @@ export function renderManagedDeviceCard(device, dashboard, panelMode, now = Date
     });
     let messageMarkup = cardMessageMarkup(panelMode, message, msgTone, availabilityDetail, cooldownDetail, calibrationDetail);
     const footerMarkup = `${batteryDisplay(o?.battery, e.id)}${renderIconLinkButton({ label: `View details for ${blindLabel}`, action: `details:${e.id}`, icon: 'info' })}`;
+    const command = dashboard.commands[e.id];
     return renderBlindCard({
         id: e.id, label: blindLabel, isSimulated: e.is_simulated, room: e.room, lastSeen: relativeAt(device.last_seen_at, now),
         availabilityLabel: label, availabilityTone: tone,
         availabilityStatus: device.availability,
-        positionPercent: p, movementStatus: o?.movement_status ?? 'unavailable', blindLines: lines,
+        positionPercent: p, movementStatus: commandAwareMovementStatus(o?.movement_status ?? 'unavailable', command), blindLines: lines,
         controlsMarkup, messageMarkup, footerMarkup, panelMode,
         supportsPosition: device.capabilities?.set_position === true,
     });
@@ -568,8 +580,8 @@ function home() {
     const panelMode = document.documentElement.dataset.displayMode === 'panel';
     const hero = panelMode || heroDismissed ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${renderDismissButton({ label: 'Dismiss introduction', action: 'hero-dismiss', variant: 'hero-dismiss' })}</section>`;
     const empty = panelMode
-        ? `<div class="panel empty"><h3>No blinds yet</h3><p>Add a nearby blind to see its status and controls here.</p></div>`
-        : `<div class="panel empty"><div class="empty-icon empty-illustration">${renderIcon('home')}</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p>${renderIconButton({ label: 'Add a blind', action: 'add', icon: 'add' })}</div>`;
+        ? renderEmptyState({ title: 'No blinds yet', description: 'Add a nearby blind to see its status and controls here.' })
+        : renderEmptyState({ title: 'Let’s bring your blinds in.', description: 'When a blind is nearby and discovered, add it here to see its status and control it.', icon: 'home', actionMarkup: renderIconButton({ label: 'Add a blind', action: 'add', icon: 'add' }) });
     const batchControls = renderBatchControls({
         blindCount: state.managed.length,
         eligibleCount: batchEligibleCount(state.managed),
@@ -591,7 +603,7 @@ function home() {
         activityMarkup: panelMode ? '' : activityPanel(),
         serviceMarkup: panelMode ? '' : serviceMarkup,
     });
-    return `${hero}${demoHint}${listMarkup}${supportingSections}`;
+    return renderHomeContent({ deviceListMarkup: listMarkup, heroMarkup: hero, demoHintMarkup: demoHint, supportingMarkup: supportingSections });
 }
 function scannerSummary() { const s = state.diagnostics?.scanner; if (state.demoMode)
     return state.diagnostics?.simulator_ready ? 'Demo ready · Simulated devices' : 'Demo simulator unavailable'; if (!s)
@@ -599,12 +611,14 @@ function scannerSummary() { const s = state.diagnostics?.scanner; if (state.demo
 function back() { return `<div class="back-navigation">${renderIconLinkButton({ label: 'Back to your blinds', action: 'home', icon: 'back' })}</div>`; }
 function addPage() {
     const available = state.observations.filter(o => !state.managed.some(m => m.enrollment.logical_id === o.logical_id && !!m.enrollment.is_simulated === !!o.is_simulated));
-    return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">Choose a recently discovered blind to make it available for control.</p><div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div>${available.length ? `<div class="stack">${available.map(o => {
+    const intro = state.demoMode ? 'This demo lists simulated blinds only; Bluetooth discovery is unavailable here.' : 'Choose a recently discovered blind to make it available for control.';
+    const nearby = available.length ? `<div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div><div class="stack">${available.map(o => {
         const deviceName = o.advertised_name || o.device_name || 'Unnamed blind';
         const fieldId = `display-name-${encodeURIComponent(o.id)}`;
         const errorId = `${fieldId}-error`;
         return `<form class="panel device-row" data-enroll="${esc(o.id)}" novalidate><div><h3>${esc(deviceName)}</h3><p class="subtle">${o.is_simulated ? 'Simulator · ' : ''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field" for="${esc(fieldId)}">Display name<input id="${esc(fieldId)}" name="label" maxlength="64" required value="${esc(o.advertised_name || o.device_name || 'Blind')}" aria-describedby="${esc(errorId)}" aria-invalid="false" data-display-name><span class="field-error" id="${esc(errorId)}" hidden role="alert"></span></label></div>${renderButton({ label: 'Add blind', accessibleLabel: `Add ${deviceName}`, title: `Add ${deviceName}`, type: 'submit', icon: 'add', iconOnly: true, variant: 'secondary', disabled: o.freshness !== 'fresh' })}</form>`;
-    }).join('')}</div>` : `<div class="panel empty"><div class="empty-icon empty-illustration">${renderIcon('home')}</div><h3>No new blinds found</h3><p>${state.diagnostics?.scanner?.adapter_available ? 'Keep your blind nearby and refresh in a moment.' : 'The Bluetooth adapter is unavailable. Check the service status and try again.'}</p>${renderIconButton({ label: 'Refresh devices', action: 'refresh', icon: 'refresh', variant: 'secondary' })}</div>`}`;
+    }).join('')}</div>` : state.demoMode ? renderAddDeviceEmptyState({ demoMode: true, adapterAvailable: false }) : `<div class="section-heading"><h2>Nearby devices</h2><span class="count">0 found</span></div>${renderAddDeviceEmptyState({ demoMode: false, adapterAvailable: state.diagnostics?.scanner?.adapter_available === true })}`;
+    return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">${intro}</p>${nearby}`;
 }
 export function deviceDetailFields(device, observation, now = Date.now()) {
     const fields = [
@@ -670,7 +684,7 @@ function detailPage(id) {
     const detailFields = deviceDetailFields(device, observation);
     const fields = renderInfoGrid(detailFields.filter(field => !field.advanced));
     const advancedFields = detailFields.filter(field => field.advanced);
-    const advanced = advancedFields.length ? `<details class="advanced-disclosure"><summary aria-label="Advanced device diagnostics" title="Advanced device diagnostics">${renderIcon('info')}</summary><h2>Advanced diagnostics</h2>${renderInfoGrid(advancedFields)}</details>` : '';
+    const advanced = advancedFields.length ? renderDisclosure({ label: 'Advanced device diagnostics', variant: 'advanced-disclosure', contentMarkup: `<h2>Advanced diagnostics</h2>${renderInfoGrid(advancedFields)}` }) : '';
     const motorSettings = device.capabilities?.set_motor_speed
         ? renderMotorSpeedControl({ deviceId: id, busy, calibrationActive: device.calibration_mode_active === true })
         : '';
@@ -1264,7 +1278,7 @@ async function sendCommand(id, action, positionClosedPercent, motorSpeedPercent)
     const token = Symbol();
     state.busy.add(id);
     state.tokens[id] = token;
-    state.commands[id] = { status: 'queued' };
+    state.commands[id] = { action, status: 'queued' };
     render();
     try {
         const key = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
