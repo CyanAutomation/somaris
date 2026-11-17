@@ -58,20 +58,7 @@ html[data-display-mode="mobile"] footer{margin-top:55px}
 .blind-art[data-movement="closing"] i{animation:slat-closing 900ms ease-in-out infinite alternate}
 @keyframes slat-opening{to{transform:translateX(6px);opacity:.58}}
 @keyframes slat-closing{to{transform:translateX(-5px);opacity:1}}
-.position-presets{grid-column:1/-1;display:flex;justify-content:space-between;gap:4px}
-.position-preset{display:grid;place-items:center;width:44px;min-width:44px;height:44px;min-height:44px;padding:8px;border:1px solid var(--color-border);border-radius:12px;background:var(--color-raised);color:var(--color-text)}
-.position-preset .ui-icon{width:24px;height:24px}
-.position-preset:hover{border-color:var(--color-accent);color:var(--color-accent)}
-.command-progress{display:grid;grid-template-columns:32px 1fr;align-items:center;gap:9px;margin:12px 0 0;padding:8px 10px;border-radius:10px;background:var(--color-raised)}
-.command-progress[hidden]{display:none}
-.command-progress__icon{display:grid;place-items:center;width:30px;height:30px;color:var(--color-accent)}
-.command-progress__icon .ui-icon{width:22px;height:22px}
-.command-progress--warn .command-progress__icon{color:var(--color-warn)}
-.command-progress__track{grid-column:2;height:4px;overflow:hidden;border-radius:99px;background:var(--color-border)}
-.command-progress__track i{display:block;width:var(--progress,30%);height:100%;border-radius:inherit;background:var(--color-accent);transition:width 500ms ease}
-.command-progress--warn .command-progress__track i{background:var(--color-warn)}
 .card-messages{display:contents}
-.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .display-picker{position:relative;display:grid;place-items:center}
 .display-menu{position:absolute;z-index:30;right:0;top:calc(100% + 10px);display:grid;gap:8px;width:max-content;min-width:220px;padding:10px;border:1px solid var(--color-border);border-radius:16px;background:var(--color-surface);box-shadow:0 12px 34px var(--token-shadow-heavy)}
 .display-menu[hidden]{display:none}
@@ -112,7 +99,7 @@ html[data-display-mode="mobile"] footer{margin-top:55px}
  .blind-art{width:118px;height:136px}.status-indicator{width:30px;min-width:30px;height:30px}
  .hero{padding:26px 0 18px;flex-direction:row;align-items:flex-start}.hero h1{font-size:34px}.hero .button.hero-dismiss{width:44px;min-width:44px}
  .demo-banner .button.icon-action{width:44px;min-width:44px;align-self:flex-end}
- .room-group{margin-bottom:22px}.position-presets{gap:3px}.position-preset{width:44px;min-width:44px}
+ .room-group{margin-bottom:22px}
  .display-menu{right:-8px}
 }
 html[data-display-mode="mobile"] .mobile-tabs{display:grid}
@@ -123,7 +110,6 @@ html[data-display-mode="panel"] .mobile-tabs{display:none!important}
 html[data-display-mode="panel"] .blind-art{display:none}
 html[data-display-mode="panel"] .room-group{margin:0}
 html[data-display-mode="panel"] .room-heading{display:none}
-html[data-display-mode="panel"] .command-progress{display:none}
 html[data-display-mode="panel"] .position-control{display:none}
 html[data-display-mode="panel"] .skeleton-grid{grid-template-columns:repeat(2,minmax(0,1fr));padding:8px;gap:8px}
 html[data-display-mode="panel"] .skeleton-card{min-height:90px;padding:10px;border-radius:14px}
@@ -132,7 +118,7 @@ html[data-display-mode="panel"] .icon-button{width:44px;min-width:44px;height:44
 html[data-display-mode="panel"] .topbar-add{width:44px;min-width:44px;height:44px;min-height:44px}
 html[data-display-mode="panel"] .device-card-header .status-indicator{width:28px;min-width:28px;height:28px}
 html[data-display-mode="panel"] .card-messages{display:contents}
-@media(prefers-reduced-motion:reduce){.blind-art i,.command-progress__track i,.activity-toggle{animation:none!important;transition:none!important}.skeleton-card>*{animation:none;background:var(--color-raised)}}
+@media(prefers-reduced-motion:reduce){.blind-art i,.activity-toggle{animation:none!important;transition:none!important}.skeleton-card>*{animation:none;background:var(--color-raised)}}
 html[data-display-mode="mobile"] .service-status{gap:0}
 html[data-display-mode="mobile"] .top-actions{gap:4px}
 html[data-display-mode="mobile"] .brand{gap:8px;font-size:24px}
