@@ -151,6 +151,42 @@ export function renderIconButton({ label, action, icon, variant = '', disabled =
         iconOnly: true,
     });
 }
+export function renderUtilityIconButton({ label, action, icon, variant = '', disabled = false }) {
+    return renderIconButton({
+        label,
+        action,
+        icon,
+        variant: ['utility-icon-button', variant].filter(Boolean).join(' '),
+        disabled,
+    });
+}
+export function renderDismissButton({ label, action, variant = '', disabled = false }) {
+    return renderUtilityIconButton({
+        label,
+        action,
+        icon: 'close_small',
+        variant: ['dismiss-button', variant].filter(Boolean).join(' '),
+        disabled,
+    });
+}
+export function renderServiceSummary(summary) {
+    const action = renderButton({
+        label: 'View service status',
+        action: 'service',
+        icon: 'service',
+        variant: 'secondary service-status-action',
+    });
+    return `<div class="section-heading service-summary"><h2>Somaris service</h2>${action}</div><p class="subtle">${escapeHtml(summary)}</p>`;
+}
+export function renderDemoBanner() {
+    const reset = renderButton({
+        label: 'Reset demo',
+        action: 'demo-reset',
+        icon: 'reset',
+        variant: 'secondary demo-banner__reset',
+    });
+    return `<section class="demo-banner" aria-label="Somaris demonstration"><div><p class="eyebrow">Somaris Demo</p><p>Explore a simulated smart home. Your changes only affect this demonstration.</p></div>${reset}</section>`;
+}
 export function renderIconLinkButton({ label, action, icon, disabled = false }) {
     return renderButton({
         label,
@@ -207,6 +243,31 @@ export function renderAddBlindButton({ variant = '' } = {}) {
         icon: 'add',
     });
 }
+export function renderRoomGroup({ room, cardsMarkup }) {
+    return `<section class="room-group"><h3 class="room-heading">${escapeHtml(room)}</h3><div class="grid room-group__grid">${cardsMarkup}</div></section>`;
+}
+export function renderPositionPreset({ deviceId, blindLabel, position, selectedPosition, disabled = false }) {
+    const label = `Move ${blindLabel} to ${position}% closed`;
+    const encodedId = encodeURIComponent(deviceId);
+    const markup = renderButton({
+        label: `${position}%`,
+        accessibleLabel: label,
+        title: label,
+        action: `position:${encodedId}:${position}`,
+        variant: 'position-preset',
+        disabled,
+    });
+    return markup
+        .replace('<button ', `<button aria-pressed="${position === selectedPosition}" `)
+        .replace(' data-action=', ` data-position-preset="${escapeHtml(encodedId)}:${position}" data-action=`);
+}
+export function renderPositionControl({ deviceId, blindLabel, positionClosedPercent, disabled = false }) {
+    const id = escapeHtml(deviceId);
+    const presets = [0, 25, 50, 75, 100]
+        .map(position => renderPositionPreset({ deviceId, blindLabel, position, selectedPosition: positionClosedPercent, disabled }))
+        .join('');
+    return `<div class="position-control" role="group" aria-label="Set position for ${escapeHtml(blindLabel)}"><div class="position-control__label"><label for="position-${id}">Set position</label><span><output data-position-output="${id}">${escapeHtml(positionClosedPercent)}%</output> closed</span></div><input id="position-${id}" type="range" min="0" max="100" step="1" value="${escapeHtml(positionClosedPercent)}" data-position-input="${id}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent closed"${disabled ? ' disabled' : ''}><div class="position-presets" role="group" aria-label="Position presets for ${escapeHtml(blindLabel)}">${presets}</div></div>`;
+}
 export function renderTopbarActions({ blindCount = 0, panelMode = false, demoMode = false, displayPreference = 'auto', serviceLabel = 'Connecting', serviceTone = '', themePreference = 'auto', route = 'home', } = {}) {
     const count = Number.isInteger(blindCount) && blindCount >= 0 ? blindCount : 0;
     const countLabel = `${count} ${count === 1 ? 'blind' : 'blinds'}`;
@@ -232,7 +293,9 @@ export function renderBlindActions({ deviceId, blindLabel, panelMode = false, di
         ['close', 'Close', 'secondary'],
     ];
     const disabledPosition = disabled || movementDisabled || busy;
-    const positionControls = supportsPosition && !panelMode ? `<div class="position-control"><label for="position-${escapeHtml(deviceId)}">Target position <output data-position-output="${escapeHtml(deviceId)}">${escapeHtml(positionClosedPercent)}%</output> closed</label><input id="position-${escapeHtml(deviceId)}" type="range" min="0" max="100" step="1" value="${escapeHtml(positionClosedPercent)}" data-position-input="${escapeHtml(deviceId)}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent closed"${disabledPosition ? ' disabled' : ''}><div class="position-presets" role="group" aria-label="Position presets for ${escapeHtml(blindLabel)}">${[0, 25, 50, 75, 100].map((position, index) => renderButton({ label: `Move ${blindLabel} to ${position}% closed`, accessibleLabel: `Move ${blindLabel} to ${position}% closed`, title: `Move to ${position}% closed`, action: `position:${deviceId}:${position}`, variant: 'position-preset', disabled: disabledPosition, icon: `position${index}`, iconOnly: true }).replace(' data-action=', ` data-position-preset="${escapeHtml(deviceId)}:${position}" data-action=`)).join('')}</div></div>` : '';
+    const positionControls = supportsPosition && !panelMode
+        ? renderPositionControl({ deviceId, blindLabel, positionClosedPercent, disabled: disabledPosition })
+        : '';
     return `<div class="controls" role="group" aria-label="${escapeHtml(blindLabel)} controls">${actions.map(([action, label, variant]) => {
         const accessibleLabel = `${label} ${blindLabel}`;
         return renderButton({
@@ -265,7 +328,7 @@ export function renderBatchControls({ blindCount = 0, eligibleCount = 0, disable
         : '';
     return `${controls}${blindCount < 1 ? renderBatchFeedback(batch) : ''}`;
 }
-export function renderBlindCard({ id, label, isSimulated, room, lastSeen, availabilityLabel, availabilityTone = '', availabilityStatus = 'unavailable', positionPercent, movementStatus, blindLines = 0, controlsMarkup, messageMarkup = '', footerMarkup = '', panelMode = false, supportsPosition = false, progressMarkup = '', }) {
+export function renderBlindCard({ id, label, isSimulated, room, lastSeen, availabilityLabel, availabilityTone = '', availabilityStatus = 'unavailable', positionPercent, movementStatus, blindLines = 0, controlsMarkup, messageMarkup = '', footerMarkup = '', panelMode = false, supportsPosition = false, }) {
     const slats = '<i></i>'.repeat(Math.max(0, Math.min(11, blindLines)));
     const fill = `<span class="blind-art__fill" style="--blind-fill:${Math.max(0, Math.min(100, positionPercent ?? 0))}%">${slats}</span>`;
     const cardVariant = panelMode ? ' card--panel' : '';
@@ -275,5 +338,5 @@ export function renderBlindCard({ id, label, isSimulated, room, lastSeen, availa
     const graphic = supportsPosition && !panelMode
         ? `<div class="blind-art blind-art--interactive" data-position-graphic="${escapeHtml(id)}" role="slider" tabindex="0" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeHtml(positionPercent ?? 0)}" aria-label="Blind position for ${escapeHtml(label)}, percent closed" data-movement="${escapeHtml(movementStatus)}">${fill}</div>`
         : `<div class="blind-art" data-movement="${escapeHtml(movementStatus)}" aria-hidden="true">${fill}</div>`;
-    return `<article class="card${cardVariant}" data-device-card="${escapeHtml(id)}" data-room="${escapeHtml(room || '')}">${header}<div class="blind-display${displayVariant}">${status}${graphic}</div>${controlsMarkup}${progressMarkup}<div class="card-messages" data-card-messages="${escapeHtml(id)}">${messageMarkup}</div><div class="card-foot">${footerMarkup}</div></article>`;
+    return `<article class="card${cardVariant}" data-device-card="${escapeHtml(id)}" data-room="${escapeHtml(room || '')}">${header}<div class="blind-display${displayVariant}">${status}${graphic}</div>${controlsMarkup}<div class="card-messages" data-card-messages="${escapeHtml(id)}">${messageMarkup}</div><div class="card-foot">${footerMarkup}</div></article>`;
 }

@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandMessage, displayPreferenceFrom, dispatchMenuChoice, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, parseActionValue, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
 import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, DashboardState, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
 
 type CommandTarget = RefreshTarget & {
@@ -224,6 +224,16 @@ test('action data parsing preserves encoded identifiers and ignores extra segmen
  assert.deepEqual(parseActionValue('remove:blind-1:ignored'), ['remove','blind-1','ignored']);
 });
 
+test('display and theme menu actions dispatch the selected option value', () => {
+ const [displayAction,displayOperation,displayValue]=parseActionValue('display:set:panel');
+ const [themeAction,themeOperation,themeValue]=parseActionValue('theme:set:light');
+ const choices:Array<[string,string]>=[];
+ assert.equal(dispatchMenuChoice(displayAction,displayOperation,displayValue,(kind,value)=>choices.push([kind,value])),true);
+ assert.equal(dispatchMenuChoice(themeAction,themeOperation,themeValue,(kind,value)=>choices.push([kind,value])),true);
+ assert.equal(dispatchMenuChoice('display','set','unknown',()=>{}),false);
+ assert.deepEqual(choices,[['display','panel'],['theme','light']]);
+});
+
 test('command dispatch decodes the device ID before sending the command', async () => {
  const {dispatchBlindCommand} = await import('../app.mjs');
  const calls: Array<[string,string]> = [];
@@ -316,6 +326,14 @@ test('managed device cards preserve targets, status details, and panel safety st
  assert.match(regular,/data-position-preset="blind-1:50"/);
  assert.match(regular,/Battery ~80%/);
  assert.match(regular,/Last heard from 1 min ago/);
+
+ dashboard.commands['blind-1']={status:'connecting'};
+ const connecting=renderManagedDeviceCard(device,dashboard,false,now);
+ assert.match(connecting,/Sending command to the blind/);
+ assert.doesNotMatch(connecting,/command-progress|data-command-progress/);
+ delete dashboard.commands['blind-1'];
+ const reached=renderManagedDeviceCard({...device,motion_feedback:{status:'target_reached'}},dashboard,false,now);
+ assert.doesNotMatch(reached,/command-progress|Motor reports the target position/);
 
  dashboard.commands['blind-1']={status:'outcome_unknown'};
  const panel=renderManagedDeviceCard({
