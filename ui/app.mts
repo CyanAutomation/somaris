@@ -6,6 +6,10 @@ import {
   renderIcon,
   renderButton,
   renderIconButton,
+  renderDismissButton,
+  renderDemoBanner,
+  renderRoomGroup,
+  renderServiceSummary,
   renderIconLinkButton,
   renderDestructiveButton,
   renderConfirmationPanel,
@@ -51,6 +55,7 @@ import type {
 
 export {escapeHtml};
 const displayModes = new Set<DisplayPreference>(DISPLAY_MODE_OPTIONS.map(([value]) => value));
+const themeModes = new Set(['auto','dark','light','high-contrast']);
 const displayPreferenceCycle: DisplayPreference[] = DISPLAY_MODE_OPTIONS.map(([value]) => value);
 export function nextDisplayPreference(preference: string): DisplayPreference {
   const index = displayPreferenceCycle.indexOf(preference as DisplayPreference);
@@ -68,6 +73,20 @@ export function displayPreferenceFrom(search: string | null | undefined, saved: 
   const requested = new URLSearchParams(search || '').get('view');
   if (requested && displayModes.has(requested as DisplayPreference)) return requested as DisplayPreference;
   return saved && displayModes.has(saved as DisplayPreference) ? saved as DisplayPreference : 'auto';
+}
+function menuChoicePreference(action: string, operation: string, value: string): string | null {
+ if(operation!=='set')return null;
+ if(action==='display'&&displayModes.has(value as DisplayPreference))return value;
+ if(action==='theme'&&themeModes.has(value))return value;
+ return null;
+}
+export function dispatchMenuChoice(action: string, operation: string, value: string, apply: (kind:'display'|'theme', preference:string)=>void): boolean {
+ const preference=menuChoicePreference(action,operation,value);
+ if(!preference)return false;
+ if(action==='display')apply('display',preference);
+ else if(action==='theme')apply('theme',preference);
+ else return false;
+ return true;
 }
 export function resolveActionFocus({
   focusedAction = null,
@@ -566,22 +585,6 @@ export function renderManagedDeviceCard(
  });
  let messageMarkup=cardMessageMarkup(panelMode,message,msgTone,availabilityDetail,cooldownDetail,calibrationDetail);
  const footerMarkup=`${batteryDisplay(o?.battery,e.id)}${renderIconLinkButton({label:`View details for ${blindLabel}`,action:`details:${e.id}`,icon:'info'})}`;
- const feedback=device.motion_feedback?.status;
- const progressStatus=dashboard.commands[e.id]?.status;
- let progressCopy='';
- let progressIcon='spinner';
- let progressPercent=28;
- let progressTone='';
- if(progressStatus==='queued'){progressCopy='Command queued. Waiting for the blind.';progressPercent=20;}
- else if(progressStatus==='connecting'){progressCopy='Sending command to the blind.';progressPercent=55;}
- else if(progressStatus==='write_acknowledged'){progressCopy='Command acknowledged. Movement is shown when reported by the blind.';progressIcon='check';progressPercent=70;}
- else if(['outcome_unknown','write_failed'].includes(progressStatus||'')){progressCopy=commandMessage(dashboard.commands[e.id]!)[0];progressIcon='warning';progressTone='warn';progressPercent=38;}
- else if(feedback==='awaiting_progress'){progressCopy=motionFeedbackLabel(device.motion_feedback);progressPercent=35;}
- else if(feedback==='progress_observed'){progressCopy=motionFeedbackLabel(device.motion_feedback);progressIcon='check';progressPercent=72;}
- else if(feedback==='stalled'){progressCopy=motionFeedbackLabel(device.motion_feedback);progressIcon='warning';progressTone='warn';progressPercent=48;}
- else if(feedback==='target_reached'){progressCopy=motionFeedbackLabel(device.motion_feedback);progressIcon='check';progressPercent=100;}
- const progressMarkup=progressCopy?`<div class="command-progress command-progress--${progressTone||'active'}" data-command-progress="${esc(e.id)}" role="status" aria-label="${esc(progressCopy)}" title="${esc(progressCopy)}"><span class="command-progress__icon" role="img" aria-label="${esc(progressCopy)}">${renderIcon(progressIcon)}</span><span class="command-progress__track" aria-hidden="true"><i style="--progress:${progressPercent}%"></i></span><span class="sr-only" aria-live="polite">${esc(progressCopy)}</span></div>`:'';
- if(progressCopy&&!panelMode)messageMarkup=regularCardMessageMarkup('',msgTone,availabilityDetail,cooldownDetail,calibrationDetail);
  return renderBlindCard({
   id:e.id, label:blindLabel, isSimulated:e.is_simulated, room:e.room, lastSeen:relativeAt(device.last_seen_at,now),
   availabilityLabel:label, availabilityTone:tone,
@@ -589,7 +592,6 @@ export function renderManagedDeviceCard(
   positionPercent:p, movementStatus:o?.movement_status ?? 'unavailable', blindLines:lines,
   controlsMarkup, messageMarkup, footerMarkup, panelMode,
   supportsPosition:device.capabilities?.set_position===true,
-  progressMarkup,
  });
 }
 function card(device: ManagedDevice): string {
@@ -610,7 +612,7 @@ function activityPanel() {
 }
 function home() {
  const panelMode = document.documentElement.dataset.displayMode === 'panel';
- const hero = panelMode || heroDismissed ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${renderIconButton({label:'Dismiss introduction',action:'hero-dismiss',icon:'close_small',variant:'hero-dismiss'})}</section>`;
+ const hero = panelMode || heroDismissed ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${renderDismissButton({label:'Dismiss introduction',action:'hero-dismiss',variant:'hero-dismiss'})}</section>`;
  const empty = panelMode
   ? `<div class="panel empty"><h3>No blinds yet</h3><p>Add a nearby blind to see its status and controls here.</p></div>`
   : `<div class="panel empty"><div class="empty-icon empty-illustration">${renderIcon('home')}</div><h3>Let’s bring your blinds in.</h3><p>When a blind is nearby and discovered, add it here to see its status and control it.</p>${renderIconButton({label:'Add a blind',action:'add',icon:'add'})}</div>`;
@@ -626,10 +628,10 @@ function home() {
  const listMarkup=renderDeviceList({
   count:state.managed.length, panelMode,
   cardsMarkup:state.managed.map(card).join(''), emptyMarkup:loadingError||empty, toolbarMarkup:batchControls,
-  groupsMarkup:!panelMode&&state.managed.some(device=>device.enrollment.room)?[...new Set(state.managed.map(device=>device.enrollment.room||'Other'))].map(room=>`<section class="room-group"><h3 class="room-heading">${esc(room)}</h3><div class="grid">${state.managed.filter(device=>(device.enrollment.room||'Other')===room).map(card).join('')}</div></section>`).join(''):'' ,
+  groupsMarkup:!panelMode&&state.managed.some(device=>device.enrollment.room)?[...new Set(state.managed.map(device=>device.enrollment.room||'Other'))].map(room=>renderRoomGroup({room,cardsMarkup:state.managed.filter(device=>(device.enrollment.room||'Other')===room).map(card).join('')})).join(''):'' ,
  });
- const serviceMarkup=`<div class="section-heading service-summary"><h2>Somaris service</h2>${renderIconButton({label:'View service status',action:'service',icon:'service'})}</div><p class="subtle">${esc(scannerSummary())}</p>`;
- const demoHint=state.demoMode&&!hintDismissed&&!panelMode?`<aside class="demo-hint"><span>${renderIcon('open')}${renderIcon('stop')}${renderIcon('close')} Try the blind controls to explore the demo.</span>${renderIconButton({label:'Dismiss demo hint',action:'demo-hint-dismiss',icon:'close_small'})}</aside>`:'';
+ const serviceMarkup=renderServiceSummary(scannerSummary());
+ const demoHint=state.demoMode&&!hintDismissed&&!panelMode?`<aside class="demo-hint"><span>${renderIcon('open')}${renderIcon('stop')}${renderIcon('close')} Try the blind controls to explore the demo.</span>${renderDismissButton({label:'Dismiss demo hint',action:'demo-hint-dismiss',variant:'demo-hint-dismiss'})}</aside>`:'';
  const supportingSections=renderHomeSupportingSections({
   panelMode,
   activityMarkup:panelMode?'':activityPanel(),
@@ -786,9 +788,6 @@ function servicePageIntro(): string {
 function simulatorControlsForMode(): string {
  return state.demoMode?'':simulatorControls();
 }
-function demoBanner(): string {
- return `<section class="demo-banner" aria-label="Somaris demonstration"><div><p class="eyebrow">Somaris Demo</p><p>Explore a simulated smart home. Your changes only affect this demonstration.</p></div>${renderIconButton({label:'Reset demo',action:'demo-reset',icon:'reset',variant:'secondary'})}</section>`;
-}
 function page(): string {return location.hash.slice(1)||'home'}
 function pageContent(route: string): string {
  if(route==='add')return addPage();
@@ -856,7 +855,7 @@ function render(): void {
  document.documentElement.dataset.theme=themePreference;
  app.removeAttribute('aria-busy');
  app.removeAttribute('aria-label');
- app.innerHTML=`${state.demoMode?demoBanner():''}${content}${document.documentElement.dataset.displayMode==='panel'?'':renderMobileTabs(page())}`;
+ app.innerHTML=`${state.demoMode?renderDemoBanner():''}${content}${document.documentElement.dataset.displayMode==='panel'?'':renderMobileTabs(page())}`;
  for(const popover of app.querySelectorAll<HTMLElement>('[popover]'))popover.addEventListener('toggle',()=>{
   const trigger=app?.querySelector<HTMLButtonElement>(`[aria-controls="${CSS.escape(popover.id)}"]`);
   trigger?.setAttribute('aria-expanded',String(popover.matches(':popover-open')));
@@ -1199,14 +1198,6 @@ function patchCards(): void {
   const oldMessages=current.querySelector<HTMLElement>('[data-card-messages]');
   const newMessages=next.querySelector<HTMLElement>('[data-card-messages]');
   if(oldMessages&&newMessages)oldMessages.innerHTML=newMessages.innerHTML;
-  const oldProgress=current.querySelector<HTMLElement>('[data-command-progress]');
-  const newProgress=next.querySelector<HTMLElement>('[data-command-progress]');
-  if(oldProgress&&newProgress)oldProgress.replaceWith(newProgress.cloneNode(true));
-  else if(oldProgress&&!newProgress)oldProgress.remove();
-  else if(!oldProgress&&newProgress){
-   const controls=current.querySelector('.controls');
-   controls?.after(newProgress.cloneNode(true));
-  }
   const oldControls=[...current.querySelectorAll<HTMLButtonElement>('.controls button')];
   const newControls=[...next.querySelectorAll<HTMLButtonElement>('.controls button')];
   for(const oldControl of oldControls){
@@ -1357,6 +1348,13 @@ export function parseActionValue(value: string | undefined): [string, string, st
  return [action, argument, id];
 }
 
+export function dispatchMenuActionValue(value: string | undefined, apply: (kind:'display'|'theme', preference:string)=>void): boolean {
+ const [action,operation,preference]=parseActionValue(value);
+ if(action!=='display'&&action!=='theme')return false;
+ dispatchMenuChoice(action,operation,preference,apply);
+ return true;
+}
+
 function isBlindAction(action: string | undefined): action is import('./types.mjs').BlindAction {
  return action !== undefined && [
   'open','close','stop','toggle','set_position','set_motor_speed',
@@ -1387,7 +1385,7 @@ function changeDisplayMode(preference: string, applyDisplayMode: () => boolean):
 }
 
 function changeTheme(preference: string): void {
- if(!['auto','dark','light','high-contrast'].includes(preference))return;
+ if(!themeModes.has(preference))return;
  themePreference=preference;
  try { globalThis.localStorage?.setItem('somaris-theme',themePreference); } catch { /* Current selection still applies for this page. */ }
  render();
@@ -1469,8 +1467,6 @@ type ClickActionHandler = (
 const clickActionHandlers: Record<string, ClickActionHandler> = {
  'snackbar-dismiss':(_argument,_id,deviceId)=>{snackbarQueue.dismiss(deviceId);return true;},
  'display-menu-toggle':()=>{toggleDisplayMenu();return true;},
- display:(argument,_id,deviceId,applyDisplayMode)=>{if(argument==='set')changeDisplayMode(deviceId,applyDisplayMode);closeDisplayMenu();return true;},
- theme:(argument,_id,deviceId)=>{if(argument==='set')changeTheme(deviceId);closeDisplayMenu();return true;},
  command:(argument,id)=>dispatchBlindCommand(argument,id),
  batch:argument=>handleBatchClick(argument),
  position:(_argument,id,deviceId)=>handlePositionClick(deviceId,id),
@@ -1627,7 +1623,15 @@ if(app){
  actionRoot.addEventListener('click', (event: MouseEvent)=>{
   const target=closestHtmlElement(event.target,'[data-action]');
   if(!target)return;
-  const [action,argument,id]=parseActionValue(target.dataset.action);
+  const actionValue=target.dataset.action;
+  if(dispatchMenuActionValue(actionValue,(kind,preference)=>{
+   if(kind==='display')changeDisplayMode(preference,applyDisplayMode);
+   else changeTheme(preference);
+  })){
+   closeDisplayMenu();
+   return;
+  }
+  const [action,argument,id]=parseActionValue(actionValue);
   dispatchClickAction(action,argument,id,applyDisplayMode);
  });
  actionRoot.addEventListener('pointerdown',(event:PointerEvent)=>{
