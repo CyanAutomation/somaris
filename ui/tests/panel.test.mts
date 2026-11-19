@@ -11,6 +11,7 @@ import {
   renderTopbarActions,
   renderRoomGroup,
 } from '../components.mjs';
+import {renderClock} from '../clock.mjs';
 
 const styles = [
   'style.css',
@@ -57,8 +58,9 @@ function panelMarkup({longLabels = false, notices = false}: {longLabels?: boolea
   const toolbar = renderBatchControls({blindCount:4, eligibleCount:4, panelMode:true});
   const devices = renderDeviceList({count:4, panelMode:true, cardsMarkup:cards, toolbarMarkup:toolbar});
   const topbar = renderTopbarActions({blindCount:4, panelMode:true, displayPreference:'panel', demoMode:true});
+  const clock = renderClock(new Date(2026, 10, 19, 17, 42));
 
-  return `<!doctype html><html lang="en" data-display-mode="panel"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><a class="brand" href="#home">somaris.</a><div class="top-actions">${topbar}</div></header><main id="app"><section class="demo-banner"><span>Explore a simulated smart home.</span><button class="icon-button">Reset</button></section>${devices}</main></div></body></html>`;
+  return `<!doctype html><html lang="en" data-display-mode="panel"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><div class="topbar-brand"><a class="brand" href="#home">somaris.</a><span id="header-clock-slot">${clock}</span></div><div class="top-actions">${topbar}</div></header><main id="app"><section class="demo-banner"><span>Explore a simulated smart home.</span><button class="icon-button">Reset</button></section>${devices}</main></div></body></html>`;
 }
 
 async function openPanel(width: number, height: number, options: {longLabels?: boolean; notices?: boolean} = {}): Promise<Page> {
@@ -80,7 +82,8 @@ async function openMobile(width: number): Promise<Page> {
     controlsMarkup:controls,
   });
   const toolbar = renderTopbarActions({blindCount:1, displayPreference:'mobile'});
-  await page.setContent(`<!doctype html><html lang="en" data-display-mode="mobile"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><a class="brand" href="#home"><span class="brand-mark"><i></i><i></i><i></i></span><span>somaris<span class="brand-dot">.</span></span></a><div class="top-actions">${toolbar}</div></header><main id="app"><section class="demo-banner"><div>Demo</div><button class="button icon-button icon-action">↻</button></section><section class="hero"><div>Welcome</div><button class="button icon-button hero-dismiss icon-action">×</button></section><section class="device-list"><div class="grid">${card}</div></section></main></div></body></html>`);
+  const clock = renderClock(new Date(2026, 10, 19, 17, 42));
+  await page.setContent(`<!doctype html><html lang="en" data-display-mode="mobile"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><div class="topbar-brand"><a class="brand" href="#home"><span class="brand-mark"><i></i><i></i><i></i></span><span>somaris<span class="brand-dot">.</span></span></a><span id="header-clock-slot">${clock}</span></div><div class="top-actions">${toolbar}</div></header><main id="app"><section class="demo-banner"><div>Demo</div><button class="button icon-button icon-action">↻</button></section><section class="hero"><div>Welcome</div><button class="button icon-button hero-dismiss icon-action">×</button></section><section class="device-list"><div class="grid">${card}</div></section></main></div></body></html>`);
   return page;
 }
 
@@ -334,10 +337,16 @@ test('mobile cards and topbar fit at 360px and 390px with direct-position preset
         const shell = document.querySelector('.app-shell')!;
         const shellRect = shell.getBoundingClientRect();
         const shellStyle = getComputedStyle(shell);
+        const clock = document.querySelector('.header-clock')!.getBoundingClientRect();
+        const actions = document.querySelector('.top-actions')!.getBoundingClientRect();
         return {
           viewport:innerWidth,
           document:document.documentElement.scrollWidth,
           topbarRight:document.querySelector('.topbar')!.getBoundingClientRect().right,
+          clockLeft:clock.left,
+          clockRight:clock.right,
+          clockWidth:clock.width,
+          actionsLeft:actions.left,
           actionsRight:document.querySelector('.top-actions')!.getBoundingClientRect().right,
           shellContentRight:shellRect.right - parseFloat(shellStyle.paddingRight),
           presetsWidth:document.querySelector('.position-presets')!.getBoundingClientRect().width,
@@ -348,6 +357,8 @@ test('mobile cards and topbar fit at 360px and 390px with direct-position preset
       });
       assert.ok(layout.document <= layout.viewport);
       assert.ok(layout.topbarRight <= layout.viewport);
+      assert.ok(layout.clockWidth > 0, `${width}px header clock should be visible`);
+      assert.ok(layout.clockRight <= layout.actionsLeft, `${width}px header clock overlaps topbar actions`);
       assert.ok(layout.actionsRight <= layout.shellContentRight, `${width}px topbar actions end at ${layout.actionsRight}px, beyond shell content at ${layout.shellContentRight}px`);
       assert.ok(layout.presetsWidth > layout.cardWidth / 2);
       assert.ok(layout.heroDismissWidth <= 56);

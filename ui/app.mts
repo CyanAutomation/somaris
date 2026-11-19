@@ -32,6 +32,7 @@ import {
   renderSnackbarRegion,
 } from './components.mjs';
 import {SnackbarQueue} from './snackbar.mjs';
+import {mountClock} from './clock.mjs';
 import type {
   ActivityEntry,
   ApiError,
@@ -1588,6 +1589,8 @@ async function handleFormSubmit(event: SubmitEvent): Promise<void> {
 if(app){
  const actionRoot=document.querySelector<HTMLElement>('.app-shell');
  if(actionRoot){
+ const clockSlot=document.querySelector<HTMLElement>('#header-clock-slot');
+ if(clockSlot)mountClock(clockSlot);
  const applyDisplayMode = () => {
   const previous = document.documentElement.dataset.displayMode;
   document.documentElement.dataset.displayMode = resolveDisplayMode(displayPreference, window.innerWidth, window.innerHeight);

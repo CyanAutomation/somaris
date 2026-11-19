@@ -1,5 +1,6 @@
 import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderAddDeviceEmptyState, renderHomeContent, renderDisclosure, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
 import { SnackbarQueue } from './snackbar.mjs';
+import { mountClock } from './clock.mjs';
 export { escapeHtml };
 const displayModes = new Set(DISPLAY_MODE_OPTIONS.map(([value]) => value));
 const themeModes = new Set(['auto', 'dark', 'light', 'high-contrast']);
@@ -1666,6 +1667,9 @@ async function handleFormSubmit(event) {
 if (app) {
     const actionRoot = document.querySelector('.app-shell');
     if (actionRoot) {
+        const clockSlot = document.querySelector('#header-clock-slot');
+        if (clockSlot)
+            mountClock(clockSlot);
         const applyDisplayMode = () => {
             const previous = document.documentElement.dataset.displayMode;
             document.documentElement.dataset.displayMode = resolveDisplayMode(displayPreference, window.innerWidth, window.innerHeight);

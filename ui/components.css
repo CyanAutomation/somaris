@@ -1,4 +1,7 @@
 .ui-icon{display:block;width:1.2em;height:1.2em;flex:none;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.topbar-brand{display:flex;align-items:center;gap:18px;min-width:0}
+#header-clock-slot{display:flex;align-items:center}
+.header-clock{color:var(--color-muted);font-size:14px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums;white-space:nowrap}
 .add-icon-button{display:inline-grid;place-items:center;width:56px;min-width:56px;height:56px;min-height:56px;padding:0;border-radius:50%;flex:none}
 .add-icon-button .ui-icon{width:28px;height:28px}
 .topbar-add{width:42px;min-width:42px;height:42px;min-height:42px;padding:0;border-radius:50%;flex:none}
@@ -110,6 +113,9 @@
 .snackbar-action:focus-visible,.snackbar-dismiss:focus-visible{outline:3px solid var(--token-focus);outline-offset:2px}
 @keyframes snackbar-rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
 @media(max-width:600px){
+ .topbar-brand{display:grid;grid-template-columns:minmax(0,1fr);justify-items:start;gap:3px}
+ #header-clock-slot{padding-inline-start:36px}
+ .header-clock{font-size:11px}
  .snackbar-region{bottom:max(12px, env(safe-area-inset-bottom));width:calc(100vw - 20px)}
  .snackbar{gap:6px;padding:9px 10px;font-size:13px}
  .snackbar-action{padding:7px}
