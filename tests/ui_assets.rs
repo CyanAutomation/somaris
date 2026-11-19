@@ -17,6 +17,7 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
         ),
         ("/sw.js", "text/javascript", "precache-manifest"),
         ("/ui/app.mjs", "text/javascript", "resolveDisplayMode"),
+        ("/ui/clock.mjs", "text/javascript", "formatClockTime"),
         (
             "/ui/api-docs.mjs",
             "text/javascript",
@@ -50,6 +51,11 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
             String::from_utf8_lossy(&body).contains(marker),
             "{path} did not contain expected marker {marker}"
         );
+        if path == "/" {
+            let html = String::from_utf8_lossy(&body);
+            assert!(html.contains("class=\"topbar-brand\""));
+            assert!(html.contains("id=\"header-clock-slot\""));
+        }
     }
 }
 
@@ -70,6 +76,7 @@ async fn service_worker_is_allowed_to_control_the_root_scope_and_skips_api_respo
     let worker = String::from_utf8_lossy(&body);
     assert!(worker.contains("url.pathname.startsWith('/api/')"));
     assert!(worker.contains("precache-manifest"));
+    assert!(worker.contains("'/ui/clock.mjs'"));
 }
 
 #[tokio::test]
