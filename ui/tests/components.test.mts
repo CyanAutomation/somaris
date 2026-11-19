@@ -47,6 +47,17 @@ function parseMarkup(markup: string) {
     .document.querySelector('#fixture')!;
 }
 
+test('Somaris keeps the original orange stacked-bar brand glyph', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const styles = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
+  const mark = html.match(/<span class="brand-mark"[^>]*>[\s\S]*?<\/span>/)?.[0] || '';
+
+  assert.equal((mark.match(/<i><\/i>/g) || []).length, 3);
+  assert.doesNotMatch(mark, /cord/);
+  assert.match(styles, /\.brand-mark\{width:32px;height:32px;background:var\(--color-accent\);border-radius:10px;/);
+  assert.match(styles, /\.brand-mark i\{height:3px;border-radius:3px;background:var\(--token-brand-ink\)\}/);
+});
+
 test('blind state prioritizes reported movement and otherwise describes current position', () => {
   assert.deepEqual(blindState(100, 'opening'), {label:'Opening…', percentOpen:0});
   assert.deepEqual(blindState(0, 'closing'), {label:'Closing…', percentOpen:100});
