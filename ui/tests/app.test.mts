@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, commandAwareMovementStatus, commandMessage, displayPreferenceFrom, dispatchMenuActionValue, dispatchMenuChoice, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, closedPercentFromOpenPercent, commandAwareMovementStatus, commandMessage, displayPreferenceFrom, dispatchMenuActionValue, dispatchMenuChoice, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, openPercentFromClosedPercent, positionCommandMessage, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
 import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, DashboardState, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
 
 type CommandTarget = RefreshTarget & {
@@ -264,7 +264,7 @@ test('card notices retain full accessible details and escape regular-view text',
  assert.doesNotMatch(regular, /<Blind>/);
 });
 
-test('device detail fields retain cached telemetry and only show active cooldowns', async () => {
+test('device detail fields show cached telemetry age without jargon and only active cooldowns', async () => {
  const {deviceDetailFields} = await import('../app.mjs');
  const now = Date.parse('2026-11-15T17:00:00Z');
  const device: ManagedDevice = {
@@ -283,7 +283,7 @@ test('device detail fields retain cached telemetry and only show active cooldown
  const observation = {
   movement_status:'closing' as const,
   rssi_dbm:-65,
-  battery:{voltage_mv:4000,status:'cached'},
+  battery:{percent_estimate:80,voltage_mv:4000,status:'cached',observed_at:'2026-11-15T15:00:00Z'},
  };
  const fields = deviceDetailFields(device,observation,now);
  assert.deepEqual(fields.map(field=>field.label),[
@@ -291,7 +291,9 @@ test('device detail fields retain cached telemetry and only show active cooldown
   'Learned travel rate','Signal strength','Battery','Battery voltage','Source','Room','Last GATT command',
   'Transport evidence','Last command attempt','Last acknowledged GATT write','Movement cooldown until','Latest failure',
  ]);
- assert.equal(fields.find(field=>field.label==='Battery voltage')?.value,'4000 mV (cached)');
+ assert.equal(fields.find(field=>field.label==='Battery')?.value,'~80% · Last reading 2 h ago');
+ assert.equal(fields.find(field=>field.label==='Battery voltage')?.value,'4000 mV · Last reading 2 h ago');
+ assert.doesNotMatch(String(fields.find(field=>field.label==='Battery voltage')?.value),/cached/i);
  assert.equal(fields.find(field=>field.label==='Battery voltage')?.advanced,true);
  assert.equal(fields.find(field=>field.label==='Availability')?.value,'Online');
  assert.notEqual(fields.find(field=>field.label==='Signal strength')?.advanced,true);
@@ -319,16 +321,21 @@ test('managed device cards preserve targets, status details, and panel safety st
   availability:'ready',position:{current_closed_percent:42,target_closed_percent:60},
   last_seen_at:'2026-11-15T16:59:00Z',capabilities:{set_position:true},
  };
+ const secondDevice:ManagedDevice={...device,enrollment:{...device.enrollment,id:'blind-2',logical_id:'logical-2',label:'Bedroom shade'}};
+ dashboard.managed=[device,secondDevice];
  dashboard.observations=[{
   id:'observation-1',logical_id:'logical-1',advertised_name:'Study shade',is_simulated:true,
   movement_status:'closing',battery:{percent_estimate:80,voltage_mv:4000,status:'observed'},
  }];
  const regular=renderManagedDeviceCard(device,dashboard,false,now);
  assert.match(regular,/Study shade/);
+ assert.match(regular,/Drag the blind to set position/);
  assert.match(regular,/blind-state__label">Closing/);
  assert.match(regular,/data-position-preset="blind-1:50"/);
- assert.match(regular,/Battery ~80%/);
- assert.match(regular,/Last heard from 1 min ago/);
+ assert.match(regular,/data-icon="battery"/);
+ assert.match(regular,/>~80%<\/span>/);
+ assert.doesNotMatch(regular,/Last heard from/);
+ assert.doesNotMatch(renderManagedDeviceCard(secondDevice,dashboard,false,now),/Drag the blind to set position/);
 
  dashboard.commands['blind-1']={status:'connecting'};
  const connecting=renderManagedDeviceCard(device,dashboard,false,now);
@@ -410,6 +417,16 @@ test('physical command payloads carry the label from the current managed-device 
  assert.deepEqual(buildCommandRequestBody(device,'set_position',2),{action:'set_position',expected_label:'Hallway Blinds',position_closed_percent:2});
  assert.deepEqual(buildCommandRequestBody(device,'set_motor_speed',undefined,37),{action:'set_motor_speed',expected_label:'Hallway Blinds',motor_speed_percent:37});
  assert.throws(()=>buildCommandRequestBody({enrollment:{id:'blind-1'}} as ManagedDevice,'close'),/Refresh the device list/);
+});
+
+test('percent-open controls convert to the unchanged percent-closed command contract',()=>{
+ assert.equal(openPercentFromClosedPercent(0),100);
+ assert.equal(openPercentFromClosedPercent(25),75);
+ assert.equal(openPercentFromClosedPercent(100),0);
+ assert.equal(closedPercentFromOpenPercent(0),100);
+ assert.equal(closedPercentFromOpenPercent(25),75);
+ assert.equal(closedPercentFromOpenPercent(100),0);
+ assert.equal(positionCommandMessage(50),'Moving to 50% open…');
 });
 test('command poll failure refreshes position before movement controls unlock', async()=>{
  const id='blind-1';
@@ -645,16 +662,18 @@ test('enrollment errors notify in context and successful enrollment reports comp
  assert.match(notices[1].message,/Hallway.*added/i);
 });
 
-test('battery display shows estimated percentage and retains cached and unavailable states', async () => {
+test('battery display shows estimated percentage and the age of the last reading', async () => {
  const {batteryDisplay} = await import('../app.mjs');
- const observed = batteryDisplay({status:'observed', percent_estimate:76, voltage_mv:3980});
- assert.match(observed, /Battery ~76%/);
- assert.match(observed, /Battery voltage: 3980 mV/);
- assert.match(observed, /aria-haspopup="dialog"/);
- assert.match(observed, /class="battery-popover"[^>]*popover/);
+ const observed = batteryDisplay({status:'observed', percent_estimate:76, voltage_mv:3980, observed_at:'2026-11-19T10:00:00.000Z'},Date.parse('2026-11-19T12:00:00.000Z'));
+ assert.match(observed, />~76%<\/span>/);
+ assert.match(observed, /Last reading/);
+ assert.match(observed, /2 h ago/);
+ assert.match(observed, /data-icon="battery"/);
+ assert.doesNotMatch(observed, /popover|aria-haspopup|cached/i);
  assert.doesNotMatch(observed, /cached/);
- assert.match(batteryDisplay({status:'unavailable', percent_estimate:0, voltage_mv:3600}), /Battery ~0% · cached/);
- assert.match(batteryDisplay({status:'observed', percent_estimate:100}), /Battery ~100%/);
+ assert.match(batteryDisplay({status:'unavailable', percent_estimate:0, voltage_mv:3600}), />~0%<\/span>/);
+ assert.doesNotMatch(batteryDisplay({status:'unavailable', percent_estimate:0, voltage_mv:3600}), /cached/i);
+ assert.match(batteryDisplay({status:'observed', percent_estimate:100}), />~100%<\/span>/);
  assert.match(batteryDisplay({status:'observed', voltage_mv:4120}), /Battery unavailable/);
  assert.match(batteryDisplay(null), /Battery unavailable/);
 });

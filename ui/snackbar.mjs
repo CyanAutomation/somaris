@@ -1,4 +1,4 @@
-const durations = { info: 5500, success: 5500, warning: 8000, error: 8000 };
+const durations = { info: 8000, success: 8000, warning: 10000, error: 10000 };
 let nextSnackbarId = 0;
 function defaultScheduler() {
     return {
@@ -47,6 +47,25 @@ export class SnackbarQueue {
         this.#syncTimers();
         this.#emit();
         return item.id;
+    }
+    updateByKey(key, update) {
+        if (!key)
+            return false;
+        const item = this.#items.find(candidate => candidate.key === key);
+        if (!item)
+            return false;
+        if (typeof update.message === 'string' && update.message.trim())
+            item.message = update.message;
+        if (update.tone && Object.hasOwn(durations, update.tone))
+            item.tone = update.tone;
+        if (Object.hasOwn(update, 'action'))
+            item.action = update.action && typeof update.action.label === 'string' && typeof update.action.action === 'string' ? { ...update.action } : null;
+        if (typeof update.duration === 'number' && Number.isFinite(update.duration))
+            item.duration = Math.max(0, update.duration);
+        this.#clearTimer(item.id);
+        this.#syncTimers();
+        this.#emit();
+        return true;
     }
     pause(id, reason = 'interaction') {
         const timer = this.#timers.get(id);

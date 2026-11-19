@@ -1,4 +1,4 @@
-import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderAddDeviceEmptyState, renderHomeContent, renderDisclosure, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
+import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderBatteryReading, renderRelativeTime, relativeTimeLabel, renderActivitySection, renderServiceHealthSummary, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderAddDeviceEmptyState, renderHomeContent, renderDisclosure, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
 import { SnackbarQueue } from './snackbar.mjs';
 import { mountClock } from './clock.mjs';
 export { escapeHtml };
@@ -116,16 +116,8 @@ export function observationFor(managed, observations) {
     const matches = observations.filter(o => o.logical_id === e.logical_id && o.advertised_name === e.advertised_name && !!o.is_simulated === !!e.is_simulated);
     return matches.length === 1 ? matches[0] ?? null : null;
 }
-export function batteryDisplay(battery, deviceId = 'blind') {
-    const percentage = battery?.percent_estimate;
-    if (!battery || typeof percentage !== 'number' || !Number.isInteger(percentage) || percentage < 0 || percentage > 100)
-        return '<span class="subtle">Battery unavailable</span>';
-    const cached = battery.status !== 'observed' ? ' · cached' : '';
-    const voltageMv = battery.voltage_mv;
-    const voltage = typeof voltageMv === 'number' && Number.isInteger(voltageMv) && voltageMv > 0 ? `Battery voltage: ${voltageMv} mV. ` : '';
-    const popoverId = `battery-info-${encodeURIComponent(deviceId)}`;
-    const trigger = renderIconButton({ label: 'Battery information', action: `battery-info:${encodeURIComponent(deviceId)}`, icon: 'info', variant: 'battery-info-button' }).replace('<button ', `<button aria-haspopup="dialog" aria-expanded="false" aria-controls="${esc(popoverId)}" `);
-    return `<div class="battery-reading subtle">Battery ~${percentage}%${cached}${trigger}<div class="battery-popover" id="${esc(popoverId)}" popover role="dialog" aria-label="Battery information">${voltage}Percentage is an estimate based on voltage.</div></div>`;
+export function batteryDisplay(battery, now = Date.now()) {
+    return renderBatteryReading({ battery, now });
 }
 const terminal = new Set(['write_acknowledged', 'connection_failed', 'write_failed', 'outcome_unknown', 'expired', 'cancelled', 'deferred']);
 const app = typeof document === 'undefined' ? null : document.querySelector('#app');
@@ -152,14 +144,15 @@ function storedFlag(key) {
     }
 }
 let themePreference = storedPreference('somaris-theme', 'auto');
-let heroDismissed = storedFlag('somaris-hero-dismissed');
 let hintDismissed = storedFlag('somaris-demo-hint-dismissed');
+let positionCueDismissed = storedFlag('somaris-position-cue-dismissed');
 let activityCollapsedByUser = null;
 let positionInteraction = false;
 const positionStartValues = new Map();
 let positionInteractionId = null;
 const lastPositionCommit = new Map();
 let positionUndo = null;
+const positionFeedback = new Map();
 let batchUndo = null;
 let lastRenderedRoute = typeof location === 'undefined' ? 'home' : location.hash.slice(1) || 'home';
 const routeScrollPositions = new Map();
@@ -177,6 +170,15 @@ export function relativeAt(date, now) {
     if (seconds < 86400)
         return `Last heard from ${Math.floor(seconds / 3600)} hr ago`;
     return `Last heard from ${Math.floor(seconds / 86400)} days ago`;
+}
+export function openPercentFromClosedPercent(value) {
+    return 100 - Math.max(0, Math.min(100, Math.round(value)));
+}
+export function closedPercentFromOpenPercent(value) {
+    return 100 - Math.max(0, Math.min(100, Math.round(value)));
+}
+export function positionCommandMessage(openPercent) {
+    return `Moving to ${Math.max(0, Math.min(100, Math.round(openPercent)))}% open…`;
 }
 const relative = (date) => relativeAt(date, Date.now());
 function isRecord(value) {
@@ -548,17 +550,21 @@ export function renderManagedDeviceCard(device, dashboard, panelMode, now = Date
         movementDisabled: !!cooldownDetail || device.calibration_mode_active === true || blindBatchIsLocked(dashboard.batch),
         supportsPosition: device.capabilities?.set_position === true,
         positionClosedPercent: targetPercent,
+        currentClosedPercent: p,
+        currentPositionFresh: device.position_freshness === 'fresh',
     });
     let messageMarkup = cardMessageMarkup(panelMode, message, msgTone, availabilityDetail, cooldownDetail, calibrationDetail);
-    const footerMarkup = `${batteryDisplay(o?.battery, e.id)}${renderIconLinkButton({ label: `View details for ${blindLabel}`, action: `details:${e.id}`, icon: 'info' })}`;
+    const detailsButton = renderButton({ label: 'Details ›', accessibleLabel: `View details for ${blindLabel}`, action: `details:${e.id}`, variant: 'details-link-button' });
+    const footerMarkup = `${batteryDisplay(o?.battery, now)}${detailsButton}`;
     const command = dashboard.commands[e.id];
     return renderBlindCard({
-        id: e.id, label: blindLabel, isSimulated: e.is_simulated, room: e.room, lastSeen: relativeAt(device.last_seen_at, now),
+        id: e.id, label: blindLabel, isSimulated: e.is_simulated, room: e.room, lastSeen: device.availability === 'ready' ? '' : relativeAt(device.last_seen_at, now),
         availabilityLabel: label, availabilityTone: tone,
         availabilityStatus: device.availability,
         positionPercent: p, movementStatus: commandAwareMovementStatus(o?.movement_status ?? 'unavailable', command), blindLines: lines,
         controlsMarkup, messageMarkup, footerMarkup, panelMode,
         supportsPosition: device.capabilities?.set_position === true,
+        showPositionCue: !positionCueDismissed && dashboard.managed.find(item => item.capabilities?.set_position === true)?.enrollment.id === e.id,
     });
 }
 function card(device) {
@@ -569,17 +575,14 @@ function activityPanel() {
     const list = entries.length
         ? `<ol class="activity-list">${entries.map(entry => {
             const occurredAt = entry.completed_at || entry.occurred_at;
-            const occurredLabel = occurredAt ? new Date(occurredAt).toLocaleString() : 'Time unavailable';
-            return `<li class="activity-item"><span class="activity-copy">${esc(activityMessage(entry))}${entry.detail && entry.kind !== 'simulator_settings_changed' && entry.kind !== 'simulator_reset' ? `<span class="subtle">${esc(entry.detail)}</span>` : ''}</span><time datetime="${esc(occurredAt ?? '')}">${esc(occurredLabel)}</time></li>`;
+            return `<li class="activity-item"><span class="activity-copy">${esc(activityMessage(entry))}${entry.detail && entry.kind !== 'simulator_settings_changed' && entry.kind !== 'simulator_reset' ? `<span class="subtle">${esc(entry.detail)}</span>` : ''}</span>${renderRelativeTime(occurredAt, Date.now())}</li>`;
         }).join('')}</ol>`
-        : '<div class="panel activity-empty"><p>No changes recorded yet.</p></div>';
+        : '<div class="panel activity-empty"><p>Changes you make will show up here.</p></div>';
     const expanded = activityCollapsedByUser ?? document.documentElement.dataset.displayMode !== 'mobile';
-    const collapsed = !expanded;
-    return `<section class="activity-section" id="activity"><div class="section-heading"><h2>Recent activity</h2><div class="activity-actions"><span class="count">${entries.length} of 30 changes</span>${renderButton({ label: 'Toggle recent activity', accessibleLabel: 'Toggle recent activity', title: 'Toggle recent activity', action: 'activity-toggle', icon: 'chevron', iconOnly: true, variant: `activity-toggle${collapsed ? ' is-collapsed' : ''}` }).replace(' aria-label=', ` aria-expanded="${!collapsed}" aria-controls="activity-list" aria-label=`)}</div></div><div id="activity-list"${collapsed ? ' hidden' : ''}>${list}</div></section>`;
+    return renderActivitySection({ count: entries.length, expanded, listMarkup: list });
 }
 function home() {
     const panelMode = document.documentElement.dataset.displayMode === 'panel';
-    const hero = panelMode || heroDismissed ? '' : `<section class="hero"><div><p class="eyebrow">A little more light</p><h1>Your space, your way.</h1><p>A quieter way to keep your blinds just where you like them.</p></div>${renderDismissButton({ label: 'Dismiss introduction', action: 'hero-dismiss', variant: 'hero-dismiss' })}</section>`;
     const empty = panelMode
         ? renderEmptyState({ title: 'No blinds yet', description: 'Add a nearby blind to see its status and controls here.' })
         : renderEmptyState({ title: 'Let’s bring your blinds in.', description: 'When a blind is nearby and discovered, add it here to see its status and control it.', icon: 'home', actionMarkup: renderIconButton({ label: 'Add a blind', action: 'add', icon: 'add' }) });
@@ -598,18 +601,18 @@ function home() {
         groupsMarkup: !panelMode && state.managed.some(device => device.enrollment.room) ? [...new Set(state.managed.map(device => device.enrollment.room || 'Other'))].map(room => renderRoomGroup({ room, cardsMarkup: state.managed.filter(device => (device.enrollment.room || 'Other') === room).map(card).join('') })).join('') : '',
     });
     const serviceMarkup = renderServiceSummary(scannerSummary());
-    const demoHint = state.demoMode && !hintDismissed && !panelMode ? `<aside class="demo-hint"><span>${renderIcon('open')}${renderIcon('stop')}${renderIcon('close')} Try the blind controls to explore the demo.</span>${renderDismissButton({ label: 'Dismiss demo hint', action: 'demo-hint-dismiss', variant: 'demo-hint-dismiss' })}</aside>` : '';
+    const demoHint = state.demoMode && !hintDismissed && !panelMode ? `<aside class="demo-hint"><span>${renderIcon('target')} Drag a blind graphic to set its position, or use Open, Stop, and Close for quick moves.</span>${renderDismissButton({ label: 'Dismiss demo hint', action: 'demo-hint-dismiss', variant: 'demo-hint-dismiss' })}</aside>` : '';
     const supportingSections = renderHomeSupportingSections({
         panelMode,
         activityMarkup: panelMode ? '' : activityPanel(),
         serviceMarkup: panelMode ? '' : serviceMarkup,
     });
-    return renderHomeContent({ deviceListMarkup: listMarkup, heroMarkup: hero, demoHintMarkup: demoHint, supportingMarkup: supportingSections });
+    return renderHomeContent({ deviceListMarkup: listMarkup, demoHintMarkup: demoHint, supportingMarkup: supportingSections });
 }
 function scannerSummary() { const s = state.diagnostics?.scanner; if (state.demoMode)
-    return state.diagnostics?.simulator_ready ? 'Demo ready · Simulated devices' : 'Demo simulator unavailable'; if (!s)
+    return state.diagnostics?.simulator_ready ? 'Everything is working' : 'Simulator unavailable'; if (!s)
     return 'Service status unavailable'; return s.adapter_available ? (s.scan_active ? 'Bluetooth adapter available · scanning' : 'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
-function back() { return `<div class="back-navigation">${renderIconLinkButton({ label: 'Back to your blinds', action: 'home', icon: 'back' })}</div>`; }
+function back() { return `<div class="back-navigation">${renderButton({ label: 'Back to blinds', action: 'home', icon: 'back', variant: 'back-button' })}</div>`; }
 function addPage() {
     const available = state.observations.filter(o => !state.managed.some(m => m.enrollment.logical_id === o.logical_id && !!m.enrollment.is_simulated === !!o.is_simulated));
     const intro = state.demoMode ? 'This demo lists simulated blinds only; Bluetooth discovery is unavailable here.' : 'Choose a recently discovered blind to make it available for control.';
@@ -634,7 +637,7 @@ export function deviceDetailFields(device, observation, now = Date.now()) {
     if (typeof travelRate === 'number' && Number.isFinite(travelRate)) {
         fields.push({ label: 'Learned travel rate', value: `${travelRate.toFixed(2)}% per second`, advanced: true });
     }
-    fields.push({ label: 'Signal strength', value: observation?.rssi_dbm != null ? `${observation.rssi_dbm} dBm` : 'Unavailable' }, { label: 'Battery', value: observation?.battery?.percent_estimate != null ? `~${observation.battery.percent_estimate}%${observation.battery.status !== 'observed' ? ' (cached)' : ''}` : 'Unavailable' }, { label: 'Battery voltage', value: observation?.battery?.voltage_mv != null ? `${observation.battery.voltage_mv} mV${observation.battery.status !== 'observed' ? ' (cached)' : ''}` : 'Unavailable', advanced: true }, { label: 'Source', value: device.enrollment.is_simulated ? 'Simulator' : 'Bluetooth' });
+    fields.push({ label: 'Signal strength', value: observation?.rssi_dbm != null ? `${observation.rssi_dbm} dBm` : 'Unavailable' }, { label: 'Battery', value: observation?.battery?.percent_estimate != null ? `~${observation.battery.percent_estimate}%${observation.battery.observed_at ? ` · Last reading ${relativeTimeLabel(observation.battery.observed_at, now)}` : ''}` : 'Unavailable' }, { label: 'Battery voltage', value: observation?.battery?.voltage_mv != null ? `${observation.battery.voltage_mv} mV${observation.battery.observed_at ? ` · Last reading ${relativeTimeLabel(observation.battery.observed_at, now)}` : ''}` : 'Unavailable', advanced: true }, { label: 'Source', value: device.enrollment.is_simulated ? 'Simulator' : 'Bluetooth' });
     if (device.enrollment.room)
         fields.push({ label: 'Room', value: device.enrollment.room });
     if (device.gatt_readiness)
@@ -709,47 +712,39 @@ function simulatorControls() {
 }
 function serviceStatusFields() {
     const scanner = state.diagnostics?.scanner;
-    return [
-        { label: 'Service', value: serviceConnectionLabel() },
-        { label: 'Bluetooth adapter', value: serviceBooleanLabel(state.demoMode, 'Not used in demo', scanner?.adapter_available, 'Available', 'Unavailable') },
-        { label: 'Scanner', value: serviceTextLabel(state.demoMode, 'Disabled in demo', scanner?.status, 'Unavailable') },
-        { label: 'Advertisements seen', value: serviceDataLabel(state.demoMode, 'Not collected', scanner?.soma_advertisements_seen, '—') },
-        { label: 'Last scanner error', value: serviceTextLabel(state.demoMode, 'Not applicable', scanner?.last_error_code, 'None reported') },
-        { label: 'Telemetry history', value: state.diagnostics?.history_enabled ? 'Enabled' : 'Not enabled' },
-        { label: 'Simulators', value: state.simulators?.length ?? 'Unavailable or disabled' },
-    ];
+    if (state.demoMode) {
+        return {
+            fields: [{ label: 'Simulated blinds', value: state.simulators?.length ?? state.managed.length }],
+            notUsed: [
+                { label: 'Bluetooth adapter', value: 'Not used here' },
+                { label: 'Scanner', value: 'Not used here' },
+                { label: 'Blind signals found', value: 'Not collected' },
+                { label: 'Scanner errors', value: 'Not applicable' },
+                { label: 'Telemetry history', value: state.diagnostics?.history_enabled ? 'Enabled' : 'Not used here' },
+            ],
+        };
+    }
+    return { fields: [
+            { label: 'Bluetooth adapter', value: scanner?.adapter_available ? 'Available' : 'Unavailable' },
+            { label: 'Scanner', value: scanner?.status || 'Unavailable' },
+            { label: 'Blind signals found', value: scanner?.soma_advertisements_seen ?? '—' },
+            { label: 'Last scan issue', value: scanner?.last_error_code || 'None reported' },
+            { label: 'Telemetry history', value: state.diagnostics?.history_enabled ? 'Enabled' : 'Not enabled' },
+            { label: 'Simulators', value: state.simulators?.length ?? 'Unavailable' },
+        ], notUsed: [] };
 }
-function serviceBooleanLabel(demoMode, demoLabel, value, active, inactive) {
-    if (demoMode)
-        return demoLabel;
-    return value ? active : inactive;
-}
-function serviceTextLabel(demoMode, demoLabel, value, fallback) {
-    if (demoMode)
-        return demoLabel;
-    return value || fallback;
-}
-function serviceDataLabel(demoMode, demoLabel, value, fallback) {
-    if (demoMode)
-        return demoLabel;
-    return value ?? fallback;
-}
-function serviceConnectionLabel() {
+function serviceStatusSummary() {
     if (state.serviceError)
-        return 'Connection problem';
-    if (!state.demoMode)
-        return 'Connected';
-    return state.diagnostics?.simulator_ready ? 'Demo ready · Simulated devices' : 'Simulator unavailable';
+        return 'The service connection needs attention';
+    if (state.demoMode)
+        return state.diagnostics?.simulator_ready ? 'Everything is working' : 'The simulator is unavailable';
+    return state.diagnostics?.scanner?.adapter_available ? 'Everything is working' : 'Bluetooth scanning is unavailable';
 }
 function servicePage() {
-    const intro = servicePageIntro();
+    const data = serviceStatusFields();
     const simulatorSection = simulatorControlsForMode();
-    return `${back()}<h1 class="page-title">Service status</h1><p class="page-intro">${intro}</p>${renderInfoGrid(serviceStatusFields())}${simulatorSection}`;
-}
-function servicePageIntro() {
-    if (state.demoMode)
-        return 'A closer look at the Somaris service and simulated devices. The Bluetooth scanner is disabled for this demo.';
-    return 'A closer look at the Somaris service and Bluetooth scanner.';
+    const notUsedMarkup = state.demoMode ? renderInfoGrid(data.notUsed) : '';
+    return `${back()}<h1 class="page-title">Service status</h1>${renderServiceHealthSummary({ summary: serviceStatusSummary(), fields: data.fields, notUsedMarkup })}${simulatorSection}`;
 }
 function simulatorControlsForMode() {
     return state.demoMode ? '' : simulatorControls();
@@ -767,17 +762,17 @@ function pageContent(route) {
 function topbarStatus() {
     const diagnostics = state.diagnostics;
     if (globalThis.navigator?.onLine === false)
-        return { serviceLabel: 'Disconnected', serviceTone: 'bad' };
+        return { serviceLabel: 'Disconnected', serviceShortLabel: 'Offline', serviceTone: 'bad' };
     if (state.serviceError)
-        return { serviceLabel: 'Disconnected', serviceTone: 'bad' };
+        return { serviceLabel: 'Disconnected', serviceShortLabel: 'Offline', serviceTone: 'bad' };
     if (!diagnostics)
-        return { serviceLabel: 'Connecting', serviceTone: '' };
+        return { serviceLabel: 'Connecting', serviceShortLabel: 'Loading', serviceTone: '' };
     if (diagnostics.demo_mode && diagnostics.simulator_ready) {
-        return { serviceLabel: 'Demo ready · Simulated devices', serviceTone: 'good' };
+        return { serviceLabel: 'Connected', serviceShortLabel: 'Ready', serviceTone: 'good' };
     }
     if (diagnostics.scanner?.adapter_available)
-        return { serviceLabel: 'Connected', serviceTone: 'good' };
-    return { serviceLabel: 'Service degraded', serviceTone: '' };
+        return { serviceLabel: 'Connected', serviceShortLabel: 'Ready', serviceTone: 'good' };
+    return { serviceLabel: 'Service degraded', serviceShortLabel: 'Degraded', serviceTone: '' };
 }
 function updateTopbar() {
     const topActions = document.querySelector('#top-actions');
@@ -1040,27 +1035,30 @@ async function refresh(quiet = false) {
     if (quiet && (shouldPauseRefresh({ dragging: positionInteraction, focusedTag: active?.tagName || '', confirmationOpen: !!state.confirmingRemovalId }) || active instanceof HTMLElement && active.matches('button,a,summary,[role="slider"]')))
         return;
     await refreshService(state, api);
+    updatePositionFeedback();
     if (quiet)
         patchCards();
     else
         render();
 }
 function beginPositionInteraction(id, initial) {
+    dismissPositionCue();
     positionInteraction = true;
     positionInteractionId = id;
     positionStartValues.set(id, initial);
 }
 function previewPosition(id, value) {
     const position = Math.max(0, Math.min(100, Math.round(value)));
+    const positionClosedPercent = closedPercentFromOpenPercent(position);
     const output = app?.querySelector(`[data-position-output="${CSS.escape(id)}"]`);
     if (output)
         output.value = `${position}%`;
     const graphic = app?.querySelector(`[data-position-graphic="${CSS.escape(id)}"]`);
     if (graphic) {
         graphic.setAttribute('aria-valuenow', String(position));
-        graphic.setAttribute('aria-valuetext', `${position}% closed`);
+        graphic.setAttribute('aria-valuetext', `${position}% open`);
         graphic.dataset.preview = String(position);
-        graphic.querySelector('.blind-art__fill')?.style.setProperty('--blind-fill', `${position}%`);
+        graphic.querySelector('.blind-art__fill')?.style.setProperty('--blind-fill', `${positionClosedPercent}%`);
     }
     const range = app?.querySelector(`[data-position-input="${CSS.escape(id)}"]`);
     if (range && document.activeElement !== range)
@@ -1081,7 +1079,7 @@ function commitPosition(id, value) {
     const device = state.managed.find(item => item.enrollment.id === id);
     if (!device || device.capabilities?.set_position !== true || state.serviceError || device.availability !== 'ready')
         return;
-    void sendCommand(id, 'set_position', position);
+    void sendCommand(id, 'set_position', closedPercentFromOpenPercent(position));
 }
 function cancelPositionInteraction(id) {
     const previous = positionStartValues.get(id);
@@ -1093,9 +1091,25 @@ function cancelPositionInteraction(id) {
 }
 function graphicValueFromPointer(graphic, clientY) {
     const rect = graphic.getBoundingClientRect();
-    return rect.height > 0 ? Math.round(Math.max(0, Math.min(1, (clientY - rect.top) / rect.height)) * 100) : 0;
+    return rect.height > 0 ? Math.round((1 - Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))) * 100) : 100;
+}
+function dismissPositionCue() {
+    if (positionCueDismissed)
+        return;
+    positionCueDismissed = true;
+    try {
+        globalThis.localStorage?.setItem('somaris-position-cue-dismissed', 'true');
+    }
+    catch { }
+    for (const cue of app?.querySelectorAll('.position-cue') || [])
+        cue.hidden = true;
 }
 function invalidateUndoFor(id) {
+    const feedback = positionFeedback.get(id);
+    if (feedback) {
+        positionFeedback.delete(id);
+        snackbarQueue.dismissByKey(feedback.key);
+    }
     if (positionUndo?.id === id) {
         positionUndo = null;
         const button = document.querySelector(`[data-action^="undo-position:${CSS.escape(encodeURIComponent(id))}:"]`);
@@ -1247,12 +1261,38 @@ function patchCards() {
 }
 function notifyCommandResult(id, command) {
     const [message] = commandMessage(command);
-    const label = state.managed.find(device => device.enrollment.id === id)?.enrollment.label;
+    const target = state.managed.find(device => device.enrollment.id === id);
+    const label = target?.enrollment.label;
     const tone = command.status === 'write_acknowledged' ? 'success' : ['connection_failed', 'expired'].includes(command.status) ? 'error' : 'warning';
+    const feedback = positionFeedback.get(id);
+    if (command.action === 'set_position' && feedback) {
+        if (command.status === 'write_acknowledged') {
+            snackbarQueue.updateByKey(feedback.key, { message: 'Command sent. Waiting for position feedback…', tone: 'info', duration: 0 });
+        }
+        else {
+            snackbarQueue.updateByKey(feedback.key, { message: label ? `${label}: ${message}` : message, tone, duration: 10000, action: ['outcome_unknown', 'write_failed'].includes(command.status) ? { label: 'Refresh position', action: 'refresh' } : null });
+            positionFeedback.delete(id);
+        }
+        return;
+    }
     const notification = { key: `command:${command.id || id}:${command.status}`, message: label ? `${label}: ${message}` : message, tone };
     if (['outcome_unknown', 'write_failed'].includes(command.status))
         notification.action = { label: 'Refresh position', action: 'refresh' };
     snackbarQueue.push(notification);
+}
+function updatePositionFeedback() {
+    for (const [id, feedback] of positionFeedback) {
+        const device = state.managed.find(item => item.enrollment.id === id);
+        const observedAt = Date.parse(device?.position_observed_at || '');
+        if (!device || device.position_freshness !== 'fresh' || !Number.isFinite(observedAt) || observedAt < feedback.acceptedAt)
+            continue;
+        if (device.position?.current_closed_percent !== feedback.targetClosedPercent)
+            continue;
+        snackbarQueue.updateByKey(feedback.key, { message: `${feedback.label} reached ${feedback.openPercent}% open`, tone: 'success', duration: 10000 });
+        if (positionUndo?.id === id)
+            positionUndo.expires = Date.now() + 10000;
+        positionFeedback.delete(id);
+    }
 }
 export function buildCommandRequestBody(device, action, positionClosedPercent, motorSpeedPercent) {
     const expectedLabel = device.enrollment.label;
@@ -1275,6 +1315,7 @@ async function sendCommand(id, action, positionClosedPercent, motorSpeedPercent)
         return;
     }
     const previousTarget = target.position?.target_closed_percent ?? target.position?.current_closed_percent;
+    const requestStartedAt = Date.now();
     invalidateUndoFor(id);
     const token = Symbol();
     state.busy.add(id);
@@ -1290,10 +1331,17 @@ async function sendCommand(id, action, positionClosedPercent, motorSpeedPercent)
         if (state.tokens[id] !== token)
             return;
         state.commands[id] = command;
-        if (action === 'set_position' && typeof previousTarget === 'number' && Number.isInteger(previousTarget) && previousTarget >= 0 && previousTarget <= 100) {
-            const expires = Date.now() + 5500;
-            positionUndo = { id, previous: previousTarget, commandToken: token, expires };
-            snackbarQueue.push({ message: `Target set to ${positionClosedPercent}% closed. The reported position updates when the blind responds.`, tone: 'info', duration: 5500, action: { label: `Undo position for ${target.enrollment.label}`, action: `undo-position:${encodeURIComponent(id)}:${previousTarget}`, icon: 'undo' } });
+        if (action === 'set_position' && typeof positionClosedPercent === 'number') {
+            const openPercent = openPercentFromClosedPercent(positionClosedPercent);
+            const key = `position-feedback:${id}`;
+            const acceptedAt = Date.parse(command.accepted_at || '') || requestStartedAt;
+            positionFeedback.set(id, { key, targetClosedPercent: positionClosedPercent, openPercent, label: target.enrollment.label, acceptedAt });
+            const canUndo = typeof previousTarget === 'number' && Number.isInteger(previousTarget) && previousTarget >= 0 && previousTarget <= 100;
+            const expires = Date.now() + 10000;
+            if (canUndo)
+                positionUndo = { id, previous: previousTarget, commandToken: token, expires };
+            snackbarQueue.push({ key, message: positionCommandMessage(openPercent), tone: 'info', duration: 0, action: canUndo ? { label: `Undo position for ${target.enrollment.label}`, action: `undo-position:${encodeURIComponent(id)}:${previousTarget}`, icon: 'undo' } : null });
+            updatePositionFeedback();
         }
         render();
         pollCommand(id, command.id, token);
@@ -1391,9 +1439,9 @@ function completeBatchUndo(batch) {
     const previous = new Map([...batchUndo.previous].filter(([id]) => acknowledged.has(id)));
     if (!previous.size)
         return;
-    const expires = Date.now() + 5500;
+    const expires = Date.now() + 10000;
     batchUndo = { id: batch.id || 'batch', previous, expires };
-    state.notify({ key: `batch-undo:${batch.id || 'last'}`, message: `${batch.action === 'open' ? 'Open' : 'Close'} all finished. Restore the previous targets?`, tone: 'success', duration: 5500, action: { label: 'Undo all-blinds command', action: 'undo-batch', icon: 'undo' } });
+    state.notify({ key: `batch-undo:${batch.id || 'last'}`, message: `${batch.action === 'open' ? 'Open' : 'Close'} all finished. Restore the previous targets?`, tone: 'success', duration: 10000, action: { label: 'Undo all-blinds command', action: 'undo-batch', icon: 'undo' } });
 }
 async function simulatorReset(id) { try {
     await api(`/api/dev/simulators/${encodeURIComponent(id)}/reset`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ position_closed_percent: 100 }) });
@@ -1455,7 +1503,7 @@ function changeDisplayMode(preference, applyDisplayMode) {
     catch { /* The current selection still applies until the page reloads. */ }
     applyDisplayMode();
     render();
-    document.getElementById('display-mode-toggle')?.focus({ preventScroll: true });
+    document.getElementById('layout-mode-toggle')?.focus({ preventScroll: true });
 }
 function changeTheme(preference) {
     if (!themeModes.has(preference))
@@ -1466,46 +1514,51 @@ function changeTheme(preference) {
     }
     catch { /* Current selection still applies for this page. */ }
     render();
-    document.getElementById('display-mode-toggle')?.focus({ preventScroll: true });
+    document.getElementById('theme-toggle')?.focus({ preventScroll: true });
 }
 function closeDisplayMenu(returnFocus = false) {
-    const menu = document.querySelector('#display-menu');
-    const trigger = document.querySelector('#display-mode-toggle');
-    if (menu)
-        menu.hidden = true;
-    trigger?.setAttribute('aria-expanded', 'false');
-    if (returnFocus)
-        trigger?.focus({ preventScroll: true });
+    for (const [menuId, triggerId] of [['layout-menu', 'layout-mode-toggle'], ['theme-menu', 'theme-menu-toggle']]) {
+        const menu = document.getElementById(menuId);
+        const trigger = document.getElementById(triggerId);
+        if (menu instanceof HTMLElement)
+            menu.hidden = true;
+        trigger?.setAttribute('aria-expanded', 'false');
+    }
+    if (returnFocus) {
+        const trigger = document.getElementById('layout-mode-toggle');
+        const themeTrigger = document.getElementById('theme-menu-toggle');
+        (themeTrigger?.dataset.wasOpen === 'true' ? themeTrigger : trigger)?.focus({ preventScroll: true });
+        if (themeTrigger)
+            delete themeTrigger.dataset.wasOpen;
+    }
 }
 function toggleDisplayMenu() {
-    const menu = document.querySelector('#display-menu');
-    const trigger = document.querySelector('#display-mode-toggle');
+    const menu = document.querySelector('#layout-menu');
+    const trigger = document.querySelector('#layout-mode-toggle');
     if (!menu || !trigger)
         return;
-    menu.hidden = !menu.hidden;
+    const wasOpen = !menu.hidden;
+    closeDisplayMenu();
+    menu.hidden = wasOpen;
     trigger.setAttribute('aria-expanded', String(!menu.hidden));
     if (!menu.hidden)
         menu.querySelector('[aria-checked="true"]')?.focus({ preventScroll: true });
 }
-function toggleBatteryPopover(encodedId) {
-    const id = `battery-info-${encodedId}`;
-    const popover = document.getElementById(id);
-    const trigger = document.querySelector(`[aria-controls="${CSS.escape(id)}"]`);
-    if (!popover || !trigger)
+function toggleThemeMenu() {
+    const menu = document.querySelector('#theme-menu');
+    const trigger = document.querySelector('#theme-menu-toggle');
+    if (!menu || !trigger)
         return;
-    if (popover.matches(':popover-open')) {
-        popover.hidePopover?.();
-        trigger.setAttribute('aria-expanded', 'false');
-        return;
-    }
-    popover.showPopover?.();
-    const rect = trigger.getBoundingClientRect();
-    const bounds = popover.getBoundingClientRect();
-    const left = Math.max(12, Math.min(window.innerWidth - bounds.width - 12, rect.left + bounds.width > window.innerWidth ? rect.right - bounds.width : rect.left));
-    const above = rect.top - bounds.height - 8;
-    popover.style.left = `${left}px`;
-    popover.style.top = `${above >= 8 ? above : Math.min(window.innerHeight - bounds.height - 8, rect.bottom + 8)}px`;
-    trigger.setAttribute('aria-expanded', 'true');
+    const wasOpen = !menu.hidden;
+    closeDisplayMenu();
+    menu.hidden = wasOpen;
+    trigger.dataset.wasOpen = String(!menu.hidden);
+    trigger.setAttribute('aria-expanded', String(!menu.hidden));
+    if (!menu.hidden)
+        menu.querySelector('[aria-checked="true"]')?.focus({ preventScroll: true });
+}
+function toggleTheme() {
+    changeTheme(themePreference === 'dark' ? 'light' : 'dark');
 }
 function handleBatchClick(argument) {
     if (argument === 'check')
@@ -1518,8 +1571,10 @@ function handlePositionClick(argument, id) {
     if (document.documentElement.dataset.displayMode === 'panel')
         return false;
     const position = Number(id);
-    if (Number.isInteger(position) && position >= 0 && position <= 100)
-        void sendCommand(argument, 'set_position', position);
+    if (Number.isInteger(position) && position >= 0 && position <= 100) {
+        dismissPositionCue();
+        void sendCommand(argument, 'set_position', closedPercentFromOpenPercent(position));
+    }
     return true;
 }
 function handleRemovalClick(action, deviceId) {
@@ -1542,15 +1597,13 @@ function handleRemovalClick(action, deviceId) {
 }
 const clickActionHandlers = {
     'snackbar-dismiss': (_argument, _id, deviceId) => { snackbarQueue.dismiss(deviceId); return true; },
-    'display-menu-toggle': () => { toggleDisplayMenu(); return true; },
+    'layout-menu-toggle': () => { toggleDisplayMenu(); return true; },
+    'theme-menu-toggle': () => { toggleThemeMenu(); return true; },
+    'theme-toggle': () => { toggleTheme(); return true; },
     command: (argument, id) => dispatchBlindCommand(argument, id),
     batch: argument => handleBatchClick(argument),
     position: (_argument, id, deviceId) => handlePositionClick(deviceId, id),
     'activity-toggle': () => { const expanded = activityCollapsedByUser ?? document.documentElement.dataset.displayMode !== 'mobile'; activityCollapsedByUser = !expanded; render(); return true; },
-    'hero-dismiss': () => { heroDismissed = true; try {
-        globalThis.localStorage?.setItem('somaris-hero-dismissed', 'true');
-    }
-    catch { } render(); return true; },
     'demo-hint-dismiss': () => { hintDismissed = true; try {
         globalThis.localStorage?.setItem('somaris-demo-hint-dismissed', 'true');
     }
@@ -1559,7 +1612,6 @@ const clickActionHandlers = {
         void sendCommand(deviceId, 'set_position', position); return true; },
     'undo-batch': () => { void undoBatchTargets(); return true; },
     'pwa-update': () => { void activateWaitingWorker(); return true; },
-    'battery-info': argument => { toggleBatteryPopover(argument); return true; },
     details: argument => {
         if (!argument)
             return false;
@@ -1692,7 +1744,9 @@ if (app) {
         window.addEventListener('offline', () => { serviceFailure(state, new Error('Network unavailable')); render(); });
         window.addEventListener('online', () => { void refresh(); });
         document.addEventListener('keydown', (event) => {
-            if (event.key === 'Escape' && !document.querySelector('#display-menu')?.hidden) {
+            const layoutMenu = document.querySelector('#layout-menu');
+            const themeMenu = document.querySelector('#theme-menu');
+            if (event.key === 'Escape' && ((layoutMenu && !layoutMenu.hidden) || (themeMenu && !themeMenu.hidden))) {
                 event.preventDefault();
                 closeDisplayMenu(true);
             }
@@ -1720,6 +1774,8 @@ if (app) {
             else
                 return;
             event.preventDefault();
+            if (graphic)
+                dismissPositionCue();
             if (!positionInteraction)
                 beginPositionInteraction(id, current);
             if (graphic)
@@ -1740,8 +1796,10 @@ if (app) {
             }
         });
         document.addEventListener('pointerdown', (event) => {
-            const picker = document.querySelector('.display-picker');
-            if (picker && !picker.contains(event.target))
+            const layout = document.querySelector('.layout-picker');
+            const theme = document.querySelector('.theme-picker');
+            const within = layout?.contains(event.target) || theme?.contains(event.target);
+            if (!within)
                 closeDisplayMenu();
         });
         actionRoot.addEventListener('click', (event) => {
@@ -1767,6 +1825,7 @@ if (app) {
             if (graphic) {
                 const id = graphic.dataset.positionGraphic || '';
                 const value = Number(graphic.getAttribute('aria-valuenow') || 0);
+                dismissPositionCue();
                 beginPositionInteraction(id, value);
                 graphic.setPointerCapture?.(event.pointerId);
                 previewPosition(id, graphicValueFromPointer(graphic, event.clientY));
@@ -1774,8 +1833,9 @@ if (app) {
             else if (range instanceof HTMLInputElement) {
                 const id = range.dataset.positionInput || '';
                 const device = state.managed.find(item => item.enrollment.id === id);
+                const closed = device?.position?.target_closed_percent ?? device?.position?.current_closed_percent;
                 range.setPointerCapture?.(event.pointerId);
-                beginPositionInteraction(id, device?.position?.target_closed_percent ?? Number(range.value));
+                beginPositionInteraction(id, typeof closed === 'number' ? openPercentFromClosedPercent(closed) : Number(range.value));
             }
         });
         actionRoot.addEventListener('pointermove', (event) => {
@@ -1844,7 +1904,8 @@ if (app) {
             const id = range.dataset.positionInput || '';
             if (!positionInteraction) {
                 const device = state.managed.find(item => item.enrollment.id === id);
-                beginPositionInteraction(id, device?.position?.target_closed_percent ?? Number(range.value));
+                const closed = device?.position?.target_closed_percent ?? device?.position?.current_closed_percent;
+                beginPositionInteraction(id, typeof closed === 'number' ? openPercentFromClosedPercent(closed) : Number(range.value));
             }
             previewPosition(id, Number(range.value));
         });

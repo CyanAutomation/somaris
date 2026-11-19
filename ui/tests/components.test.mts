@@ -36,6 +36,10 @@ import {
   renderTopbarActions,
   renderHomeSupportingSections,
   renderInfoGrid,
+  renderBatteryReading,
+  renderRelativeTime,
+  renderActivitySection,
+  renderServiceHealthSummary,
 } from '../components.mjs';
 
 function parseMarkup(markup: string) {
@@ -43,28 +47,41 @@ function parseMarkup(markup: string) {
     .document.querySelector('#fixture')!;
 }
 
-test('blind state prioritizes reported movement and otherwise describes current position', () => {
-  assert.deepEqual(blindState(100, 'opening'), {label:'Opening', percentClosed:100});
-  assert.deepEqual(blindState(0, 'closing'), {label:'Closing', percentClosed:0});
-  assert.deepEqual(blindState(0, 'at_target'), {label:'Open', percentClosed:0});
-  assert.deepEqual(blindState(100, 'at_target'), {label:'Closed', percentClosed:100});
-  assert.deepEqual(blindState(42, 'at_target'), {label:'Partially open', percentClosed:42});
-  assert.deepEqual(blindState(null, 'unavailable'), {label:'Position unavailable', percentClosed:null});
-  assert.deepEqual(blindState(101, 'at_target'), {label:'Position unavailable', percentClosed:null});
+test('Somaris keeps the original orange stacked-bar brand glyph', () => {
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const styles = readFileSync(new URL('../style.css', import.meta.url), 'utf8');
+  const mark = html.match(/<span class="brand-mark"[^>]*>[\s\S]*?<\/span>/)?.[0] || '';
+
+  assert.equal((mark.match(/<i><\/i>/g) || []).length, 3);
+  assert.doesNotMatch(mark, /cord/);
+  assert.match(styles, /\.brand-mark\{width:32px;height:32px;background:var\(--color-accent\);border-radius:10px;/);
+  assert.match(styles, /\.brand-mark i\{height:3px;border-radius:3px;background:var\(--token-brand-ink\)\}/);
 });
 
-test('movement direction follows the current and target closed percentages', () => {
+test('blind state prioritizes reported movement and otherwise describes current position', () => {
+  assert.deepEqual(blindState(100, 'opening'), {label:'Opening…', percentOpen:0});
+  assert.deepEqual(blindState(0, 'closing'), {label:'Closing…', percentOpen:100});
+  assert.deepEqual(blindState(0, 'at_target'), {label:'Open', percentOpen:100});
+  assert.deepEqual(blindState(100, 'at_target'), {label:'Closed', percentOpen:0});
+  assert.deepEqual(blindState(42, 'at_target'), {label:'Partially open', percentOpen:58});
+  assert.deepEqual(blindState(null, 'unavailable'), {label:'Position unavailable', percentOpen:null});
+  assert.deepEqual(blindState(101, 'at_target'), {label:'Position unavailable', percentOpen:null});
+});
+
+test('movement direction follows the unchanged current and target closed percentages', () => {
   assert.equal(movementStatusFromPositions(20, 80), 'closing');
   assert.equal(movementStatusFromPositions(80, 20), 'opening');
   assert.equal(movementStatusFromPositions(40, 40), 'at_target');
   assert.equal(movementStatusFromPositions(null, 40), 'unavailable');
 });
 
-test('blind status renders state before secondary percentage', () => {
+test('blind status renders the state and percentage-open progress', () => {
   const markup = renderBlindStatus({positionPercent:42, movementStatus:'at_target'});
   assert.match(markup, /blind-state__label">Partially open/);
-  assert.match(markup, /blind-state__percent">42% closed/);
-  assert.ok(markup.indexOf('Partially open') < markup.indexOf('42% closed'));
+  assert.match(markup, /blind-state__percent">58% open/);
+  assert.ok(markup.indexOf('Partially open') < markup.indexOf('58% open'));
+  assert.match(renderBlindStatus({positionPercent:40,movementStatus:'opening'}),/Opening… 60%/);
+  assert.match(renderBlindStatus({positionPercent:40,movementStatus:'opening'}),/role="progressbar"[^>]*aria-valuenow="60"/);
   assert.doesNotMatch(renderBlindStatus({positionPercent:null, movementStatus:'unavailable'}), /% closed/);
   assert.match(renderBlindStatus({positionPercent:50,movementStatus:'stop_queued'}), /Stop queued/);
   assert.match(renderBlindStatus({positionPercent:50,movementStatus:'stopping'}), /Stopping/);
@@ -90,14 +107,13 @@ test('shared empty states explain demo enrollment and reuse icon actions', () =>
   assert.equal(normal.querySelector('[data-action="refresh"]')?.getAttribute('aria-label'), 'Refresh devices');
 });
 
-test('home composition places blind controls before introduction and demo hints', () => {
+test('home composition puts the demo guidance before the blinds and omits the duplicated hero', () => {
   const root = parseMarkup(renderHomeContent({
     deviceListMarkup:'<section id="devices"></section>',
-    heroMarkup:'<section id="hero"></section>',
     demoHintMarkup:'<aside id="hint"></aside>',
     supportingMarkup:'<section id="supporting"></section>',
   }));
-  assert.deepEqual([...root.children].map(child => child.id), ['devices','hero','hint','supporting']);
+  assert.deepEqual([...root.children].map(child => child.id), ['hint','devices','supporting']);
 });
 
 test('icon-only blind actions have named controls, visible glyphs and disabled states', () => {
@@ -126,16 +142,29 @@ test('movement cooldown disables Open and Close while leaving Stop available', (
   assert.doesNotMatch(controls, /data-action="command:stop:blind-1"[^>]*disabled/);
 });
 
-test('percentage-position control reflects the observed target and has an accessible label', () => {
+test('fully open or closed blinds mute the redundant action and emphasize the next action', () => {
+  const open = parseMarkup(renderBlindActions({deviceId:'blind-1',blindLabel:'Hallway',currentClosedPercent:0,currentPositionFresh:true}));
+  assert.equal(open.querySelector('[data-action="command:open:blind-1"]')?.hasAttribute('disabled'), true);
+  assert.match(open.querySelector('[data-action="command:close:blind-1"]')?.getAttribute('class')||'', /button--primary/);
+  const closed = parseMarkup(renderBlindActions({deviceId:'blind-1',blindLabel:'Hallway',currentClosedPercent:100,currentPositionFresh:true}));
+  assert.equal(closed.querySelector('[data-action="command:close:blind-1"]')?.hasAttribute('disabled'), true);
+  assert.match(closed.querySelector('[data-action="command:open:blind-1"]')?.getAttribute('class')||'', /button--primary/);
+  const stale = parseMarkup(renderBlindActions({deviceId:'blind-1',blindLabel:'Hallway',currentClosedPercent:100}));
+  assert.equal(stale.querySelector('[data-action="command:close:blind-1"]')?.hasAttribute('disabled'), false);
+});
+
+test('percentage-position control consistently uses percent open while preserving the closed API boundary', () => {
   const controls = renderBlindActions({
     deviceId:'blind-1', blindLabel:'Hallway', supportsPosition:true,
     positionClosedPercent:47,
   });
-  assert.match(controls, /type="range" min="0" max="100" step="1" value="47"/);
-  assert.match(controls, /aria-label="Target position for Hallway in percent closed"/);
-  assert.match(controls, /data-position-output="blind-1">47%/);
+  assert.match(controls, /type="range" min="0" max="100" step="1" value="53"/);
+  assert.match(controls, /aria-label="Target position for Hallway in percent open"/);
+  assert.match(controls, /data-position-output="blind-1">53%/);
+  assert.match(controls, /<span class="position-end position-end--closed">Closed<\/span>/);
+  assert.match(controls, /<span class="position-end position-end--open">Open<\/span>/);
   assert.match(controls, /data-position-preset="blind-1:50"/);
-  assert.match(controls, /aria-label="Move Hallway to 50% closed"/);
+  assert.match(controls, /aria-label="Move Hallway to 50% open"/);
   assert.doesNotMatch(controls, /position-submit|Move to selected position/);
   assert.deepEqual(
     [...parseMarkup(controls).querySelectorAll('.position-preset .button-label')].map(label=>label.textContent),
@@ -167,8 +196,7 @@ test('demo banner exposes a named reset action', () => {
   const banner = parseMarkup(renderDemoBanner());
   const reset = banner.querySelector('[data-action="demo-reset"]');
   assert.equal(reset?.getAttribute('aria-label'), 'Reset demo');
-  assert.equal(reset?.getAttribute('title'), 'Reset demo');
-  assert.equal(reset?.textContent, '');
+  assert.equal(reset?.textContent, 'Reset demo');
   assert.equal(reset?.querySelector('svg')?.getAttribute('data-icon'), 'reset');
 });
 
@@ -178,7 +206,7 @@ test('position presets expose the selected target and its accessible action', ()
     deviceId:'blind-1', blindLabel:'Hallway', position:50, selectedPosition:50,
   })).querySelector('button');
   assert.equal(selected?.textContent, '50%');
-  assert.equal(selected?.getAttribute('aria-label'), 'Move Hallway to 50% closed');
+  assert.equal(selected?.getAttribute('aria-label'), 'Move Hallway to 50% open');
   assert.equal(selected?.getAttribute('aria-pressed'), 'true');
   assert.equal(selected?.getAttribute('data-action'), 'position:blind-1:50');
 
@@ -189,15 +217,17 @@ test('position presets expose the selected target and its accessible action', ()
   assert.equal(disabled?.hasAttribute('disabled'), true);
 });
 
-test('direct blind graphic is a keyboard accessible position slider outside panel mode', () => {
+test('direct blind graphic is a keyboard accessible percent-open slider with a drag cue', () => {
   const regular = renderBlindCard({
     id:'blind-1', label:'Hallway', availabilityLabel:'Online', availabilityStatus:'ready',
     positionPercent:42, movementStatus:'at_target', supportsPosition:true,
+    showPositionCue:true,
     controlsMarkup:renderBlindActions({deviceId:'blind-1',blindLabel:'Hallway',supportsPosition:true}),
   });
   assert.match(regular, /class="blind-art[^\"]*"[^>]*role="slider"/);
-  assert.match(regular, /aria-valuemin="0" aria-valuemax="100" aria-valuenow="42"/);
-  assert.match(regular, /aria-label="Blind position for Hallway, percent closed"/);
+  assert.match(regular, /aria-valuemin="0" aria-valuemax="100" aria-valuenow="58"/);
+  assert.match(regular, /aria-label="Blind position for Hallway, percent open"/);
+  assert.match(regular, /Drag the blind to set position/);
 
   const panel = renderBlindCard({
     id:'blind-1', label:'Hallway', availabilityLabel:'Online', availabilityStatus:'ready',
@@ -207,15 +237,13 @@ test('direct blind graphic is a keyboard accessible position slider outside pane
   assert.doesNotMatch(panel, /role="slider"/);
 });
 
-test('mobile tabs expose icon-only navigation and the current route', () => {
+test('mobile tabs show labels below their icons and expose the current route', () => {
   const root = parseMarkup(renderMobileTabs('activity'));
   const tabs = [...root.querySelectorAll('.mobile-tab')];
   assert.equal(tabs.length, 3);
   assert.deepEqual(tabs.map(tab => tab.getAttribute('aria-label')), ['Blinds', 'Activity', 'Service status']);
   assert.equal(tabs[1]?.getAttribute('aria-current'), 'page');
-  assert.ok(tabs.every(tab => tab.getAttribute('title')));
-  assert.ok(tabs.every(tab => tab.getAttribute('data-tooltip')));
-  assert.ok(tabs.every(tab => tab.textContent === ''));
+  assert.deepEqual(tabs.map(tab => tab.querySelector('.mobile-tab__label')?.textContent), ['Blinds', 'Activity', 'Service status']);
 });
 
 test('panel blind controls omit percentage positioning while other views retain it', () => {
@@ -417,13 +445,12 @@ test('compact panel notice shows a short label and retains full accessible detai
   assert.equal(notice?.getAttribute('role'), 'status');
 });
 
-test('add-blind action is a plus-only button with an accessible name and tooltip', () => {
+test('add-blind action shows its label and has an accessible name', () => {
   const markup = renderAddBlindButton({variant:'secondary panel-add'});
   assert.match(markup, /aria-label="Add a blind"/);
-  assert.match(markup, /title="Add a blind"/);
   assert.match(markup, /data-action="add"/);
   assert.match(markup, /data-icon="add"/);
-  assert.doesNotMatch(markup, /class="button-label"/);
+  assert.match(markup, /class="button-label">Add a blind<\/span>/);
 });
 
 test('device cards expose blind identity, reported status, and named actions in both views', () => {
@@ -439,8 +466,8 @@ test('device cards expose blind identity, reported status, and named actions in 
 
     assert.equal(card.querySelector('article h3 button')?.textContent, 'Bedroom Left');
     assert.equal(card.querySelector('article h3 button')?.getAttribute('aria-label'), 'View details for Bedroom Left');
-    assert.equal(card.querySelector('.blind-state__label')?.textContent, 'Opening');
-    assert.equal(card.querySelector('.blind-state__percent')?.textContent, '100% closed');
+    assert.equal(card.querySelector('.blind-state__label')?.textContent, 'Opening… 0%');
+    assert.equal(card.querySelector('.blind-state__percent')?.textContent, '0% open');
     assert.equal(card.querySelector('.status-indicator[role="img"]')?.getAttribute('aria-label'), 'Online');
     assert.deepEqual([...card.querySelectorAll('.controls button')]
       .map(button => button.getAttribute('aria-label')),
@@ -564,17 +591,55 @@ test('undo snackbar actions are icon-only and remain named',()=>{
  assert.equal(action?.querySelector('svg')?.getAttribute('data-icon'),'undo');
 });
 
-test('display menu lists icon-only display and theme choices with checked states',()=>{
+test('layout and theme have separate labelled controls and show their current choice',()=>{
  const root=parseMarkup(renderTopbarActions({panelMode:false,displayPreference:'panel',themePreference:'light'}));
- const menu=root.querySelector('[role="menu"]');
- assert.ok(menu);
- const items=[...menu.querySelectorAll('[role="menuitemradio"]')];
- assert.equal(items.length,8);
- assert.equal(items.find(item=>item.getAttribute('aria-label')==='Panel')?.getAttribute('aria-checked'),'true');
- assert.equal(items.find(item=>item.getAttribute('aria-label')==='Light theme')?.getAttribute('aria-checked'),'true');
- assert.ok(items.every(item=>item.getAttribute('title')));
- assert.ok(items.every(item=>item.textContent===''));
+ const layout=root.querySelector('#layout-menu');
+ const theme=root.querySelector('#theme-menu');
+ assert.ok(layout);
+ assert.ok(theme);
+ assert.equal(layout.getAttribute('aria-label'),'Layout');
+ assert.equal(theme.getAttribute('aria-label'),'Theme options');
+ const layouts=[...layout.querySelectorAll('[role="menuitemradio"]')];
+ assert.equal(layouts.length,4);
+ assert.equal(layouts.find(item=>item.getAttribute('aria-label')==='Compact')?.getAttribute('aria-checked'),'true');
+ assert.match(root.querySelector('#layout-mode-toggle')?.textContent||'',/Compact/);
+ assert.match(root.querySelector('#theme-toggle')?.getAttribute('aria-label')||'',/Switch to dark theme/i);
+ assert.match(root.querySelector('#theme-toggle')?.textContent||'',/Light/);
+ assert.equal(root.querySelector('#theme-toggle')?.querySelector('svg')?.getAttribute('data-icon'),'moon');
+ assert.equal(theme.querySelectorAll('[role="menuitemradio"]').length,4);
  assert.match(root.toString(),/data-action="service"/);
+});
+
+test('battery and relative-time primitives show the last reading without cached jargon or duplicate info controls',()=>{
+ const now=Date.parse('2026-11-19T12:00:00.000Z');
+ const battery=parseMarkup(renderBatteryReading({battery:{status:'unavailable',percent_estimate:76,voltage_mv:3980,observed_at:'2026-11-19T10:00:00.000Z'},now}));
+ assert.equal(battery.querySelector('[data-icon="battery"]')!==null,true);
+ assert.match(battery.textContent||'',/76%/);
+ assert.match(battery.textContent||'',/Last reading 2 h ago/);
+ assert.equal(battery.querySelector('button'),null);
+ assert.equal(battery.querySelector('[popover]'),null);
+ assert.doesNotMatch(battery.textContent||'',/cached/i);
+ const time=parseMarkup(renderRelativeTime('2026-11-19T11:58:00.000Z',now)).querySelector('time');
+ assert.equal(time?.textContent,'2 min ago');
+ assert.ok(time?.getAttribute('title'));
+});
+
+test('activity section describes the retained window, hides the empty count, and labels its utility toggle',()=>{
+ const empty=parseMarkup(renderActivitySection({count:0,expanded:true,listMarkup:'<p>Changes you make will show up here.</p>'}));
+ assert.equal(empty.querySelector('h2')?.textContent,'Last 30 changes');
+ assert.equal(empty.querySelector('.count'),null);
+ assert.equal(empty.querySelector('p')?.textContent,'Changes you make will show up here.');
+ assert.equal(empty.querySelector('[data-action="activity-toggle"]')?.textContent?.trim(),'Hide');
+ const filled=parseMarkup(renderActivitySection({count:4,expanded:false,listMarkup:'<ol></ol>'}));
+ assert.equal(filled.querySelector('.count')?.textContent,'4 changes');
+ assert.equal(filled.querySelector('[data-action="activity-toggle"]')?.textContent?.trim(),'Show');
+});
+
+test('service health summary has a plain-language lead and demo-only details can be grouped',()=>{
+ const page=parseMarkup(renderServiceHealthSummary({summary:'Everything is working',fields:[{label:'Simulated blinds',value:4}],notUsedMarkup:renderInfoGrid([{label:'Bluetooth adapter',value:'Not used in demo'}])}));
+ assert.equal(page.querySelector('.service-health__summary')?.textContent,'Everything is working');
+ assert.equal(page.querySelector('.service-health__details .info-item strong')?.textContent,'4');
+ assert.equal(page.querySelector('details summary')?.textContent,'Not used in demo');
 });
 
 test('dark muted and footer token colors exceed AA text contrast',()=>{
@@ -590,53 +655,66 @@ test('dark muted and footer token colors exceed AA text contrast',()=>{
  assert.ok(ratio(token('--token-footer'),background)>=4.5);
 });
 
-test('topbar composes the plus-only add action beside a named mode toggle and refresh controls', () => {
+test('shared control tokens replace invalid slider CSS and panel size patches',()=>{
+ const style=readFileSync(new URL('../style.css',import.meta.url),'utf8');
+ const components=readFileSync(new URL('../components.css',import.meta.url),'utf8');
+ const panel=readFileSync(new URL('../panel.css',import.meta.url),'utf8');
+ assert.match(style,/--control-target-size:44px/);
+ assert.match(style,/--status-indicator-size:32px/);
+ assert.doesNotMatch(style,/aria-valuenow\s*:/);
+ assert.match(components,/\.icon-button,\.topbar-icon-button\{width:var\(--control-target-size\)/);
+ assert.doesNotMatch(panel,/\.icon-button\s*\{\s*(?:width|height):|\.topbar-add\s*\{[^}]*\b(?:width|height):|\.status-indicator\s*\{[^}]*\b(?:width|height):/);
+ assert.match(components,/\.snackbar--info/);
+});
+
+test('topbar uses reusable labelled actions for service, add, layout, theme, and refresh', () => {
   const panel = renderTopbarActions({blindCount:3, panelMode:true, displayPreference:'panel'});
   assert.match(panel, /class="topbar-device-count">3 blinds<\/span>/);
   assert.match(panel, /data-action="add"[^>]*aria-label="Add a blind"/);
   assert.match(panel, /data-icon="add"/);
-  assert.match(panel, /id="display-mode-toggle"/);
-  assert.match(panel, /aria-label="Display and theme settings/);
-  assert.match(panel, /data-action="display-menu-toggle"/);
-  assert.match(panel, /data-icon="display"/);
-  assert.match(panel, /class="display-menu"/);
+  assert.match(panel, /id="layout-mode-toggle"/);
+  assert.match(panel, /data-action="layout-menu-toggle"/);
+  assert.match(panel, /id="theme-toggle"/);
+  assert.match(panel, /id="layout-menu"/);
+  assert.match(panel, /id="theme-menu"/);
   assert.match(panel, /data-action="refresh"[^>]*aria-label="Refresh"/);
   assert.match(panel, /data-icon="refresh"/);
-  assert.ok(panel.indexOf('data-action="add"') < panel.indexOf('data-action="display-menu-toggle"'));
-  assert.ok(panel.indexOf('data-action="display-menu-toggle"') < panel.indexOf('data-action="refresh"'));
-  assert.doesNotMatch(panel, />Add a blind</);
+  assert.match(panel, />Add a blind<\/span>/);
+  assert.match(panel, />Refresh<\/span>/);
 
   for (const displayPreference of ['mobile', 'desktop']) {
     const regular = renderTopbarActions({blindCount:3, panelMode:false, displayPreference});
     assert.doesNotMatch(regular, /topbar-device-count/);
     assert.match(regular, /data-action="add"/);
     assert.match(regular, /data-icon="add"/);
-    assert.doesNotMatch(regular, />Add a blind</);
+    assert.match(regular, />Add a blind<\/span>/);
   }
 });
 
-test('panel topbar keeps a demo reset icon when the demo banner is compacted away', () => {
+test('panel topbar keeps a visibly labelled demo reset button when the banner is compacted away', () => {
   const panel = renderTopbarActions({panelMode:true, demoMode:true});
   const reset = parseMarkup(panel).querySelector('[data-action="demo-reset"]');
   assert.ok(reset);
   assert.equal(reset.getAttribute('aria-label'),'Reset demo');
-  assert.equal(reset.getAttribute('title'),'Reset demo');
-  assert.equal(reset.textContent,'');
+  assert.equal(reset.textContent,'Reset demo');
   assert.equal(reset.querySelector('svg')?.getAttribute('data-icon'),'reset');
 });
 
-test('demo device cards show room metadata and the shared movement controls', () => {
+test('grouped demo cards strip duplicated room names and keep stale time out of fresh cards', () => {
   // Contract: UI-ROOM-01 in docs/test-contracts.md.
   const markup = renderBlindCard({
     id:'demo-living', label:'Living Room — Main Window', room:'Living Room', isSimulated:true,
-    lastSeen:'Last heard from just now', availabilityLabel:'Online', positionPercent:75,
+    lastSeen:'', availabilityLabel:'Online', positionPercent:75,
     movementStatus:'at_target', controlsMarkup:renderBlindActions({
       deviceId:'demo-living', blindLabel:'Living Room — Main Window',
     }),
   });
   const card = parseMarkup(markup);
-  assert.equal(card.querySelector('.card-title')?.textContent, 'Living Room — Main Window');
-  assert.equal(card.querySelector('.room-label')?.textContent, 'Living Room');
+  assert.equal(card.querySelector('.card-title')?.textContent, 'Main Window');
+  assert.equal(card.querySelector('.room-label'), null);
+  assert.equal(card.querySelector('.device-kind'), null);
+  assert.equal(card.querySelector('.last-seen'), null);
+  assert.ok(card.querySelector('.card-title-chevron'));
   assert.equal(card.querySelector('.blind-state__label')?.textContent, 'Partially open');
   assert.deepEqual(
     [...card.querySelectorAll('.controls button')].map(button => [
@@ -666,6 +744,6 @@ test('info grid component supports both escaped values and reusable position mar
   assert.match(markup, /Availability/);
   assert.match(markup, /Ready/);
   assert.match(markup, /Partially open/);
-  assert.match(markup, /25% closed/);
+  assert.match(markup, /75% open/);
   assert.match(renderInfoGrid([{label:'Name', value:'<Hallway>'}]), /&lt;Hallway&gt;/);
 });

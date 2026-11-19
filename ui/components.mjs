@@ -1,5 +1,6 @@
 import { escapeHtml } from './escape.mjs';
 import { renderBatchFeedbackMarkup } from './batch-feedback.mjs';
+import { renderInfoGrid } from './page-components.mjs';
 export { escapeHtml };
 export { renderDeviceList, renderHomeSupportingSections, renderInfoGrid } from './page-components.mjs';
 export { renderSnackbar, renderSnackbarRegion } from './snackbar-components.mjs';
@@ -28,6 +29,8 @@ const icons = {
     back: '<path d="M19 12H5m7 7-7-7 7-7"/>',
     display: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/>',
     info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/>',
+    battery: '<rect x="3" y="7" width="17" height="10" rx="2"/><path d="M22 10v4M7 10v4m4-4v4m4-4v4"/>',
+    chevron_right: '<path d="m9 18 6-6-6-6"/>',
     observed: '<circle cx="12" cy="12" r="8.5"/><path d="m8.5 12 2.3 2.3 4.8-5"/>',
     clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3 2"/>',
     stale: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3 2"/>',
@@ -46,7 +49,7 @@ const availabilityIcons = { ready: 'observed', stale: 'stale', not_seen: 'not_se
 export const DISPLAY_MODE_OPTIONS = [
     ['auto', 'Auto'],
     ['mobile', 'Mobile'],
-    ['panel', 'Panel'],
+    ['panel', 'Compact'],
     ['desktop', 'Desktop'],
 ];
 function iconMarkup(name) {
@@ -62,21 +65,22 @@ export function blindState(positionPercent, movementStatus) {
     const percentClosed = isPercent(positionPercent)
         ? positionPercent
         : null;
+    const percentOpen = percentClosed === null ? null : 100 - percentClosed;
     if (movementStatus === 'opening')
-        return { label: 'Opening', percentClosed };
+        return { label: 'Opening…', percentOpen };
     if (movementStatus === 'closing')
-        return { label: 'Closing', percentClosed };
+        return { label: 'Closing…', percentOpen };
     if (movementStatus === 'stop_queued')
-        return { label: 'Stop queued', percentClosed };
+        return { label: 'Stop queued', percentOpen };
     if (movementStatus === 'stopping')
-        return { label: 'Stopping', percentClosed };
-    if (percentClosed === null)
-        return { label: 'Position unavailable', percentClosed: null };
-    if (percentClosed === 0)
-        return { label: 'Open', percentClosed };
-    if (percentClosed === 100)
-        return { label: 'Closed', percentClosed };
-    return { label: 'Partially open', percentClosed };
+        return { label: 'Stopping', percentOpen };
+    if (percentOpen === null)
+        return { label: 'Position unavailable', percentOpen: null };
+    if (percentOpen === 100)
+        return { label: 'Open', percentOpen };
+    if (percentOpen === 0)
+        return { label: 'Closed', percentOpen };
+    return { label: 'Partially open', percentOpen };
 }
 export function movementStatusFromPositions(currentPercent, targetPercent) {
     const validCurrent = isPercent(currentPercent);
@@ -91,9 +95,12 @@ function isPercent(value) {
     return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 100;
 }
 export function renderBlindStatus({ positionPercent, movementStatus, compact = false, panelMode = false }) {
-    const { label, percentClosed } = blindState(positionPercent, movementStatus);
+    const { label, percentOpen } = blindState(positionPercent, movementStatus);
     const variants = [compact && 'blind-state--compact', panelMode && 'blind-state--panel'].filter(Boolean).join(' ');
-    return `<div class="blind-state${variants ? ` ${variants}` : ''}"><strong class="blind-state__label">${escapeHtml(label)}</strong>${percentClosed === null ? '' : `<span class="blind-state__percent">${percentClosed}% closed</span>`}</div>`;
+    const moving = movementStatus === 'opening' || movementStatus === 'closing';
+    const progress = percentOpen !== null && moving ? `<div class="blind-progress" role="progressbar" aria-label="${escapeHtml(label)} ${percentOpen}% open" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percentOpen}"><span style="--progress:${percentOpen}%"></span></div>` : '';
+    const percent = percentOpen === null ? '' : `<span class="blind-state__percent">${percentOpen}% open</span>`;
+    return `<div class="blind-state${variants ? ` ${variants}` : ''}"><strong class="blind-state__label">${escapeHtml(label)}${moving && percentOpen !== null ? ` ${percentOpen}%` : ''}</strong>${percent}${progress}</div>`;
 }
 export function renderPanelNotice({ label, details, tone = 'warn' }) {
     const safeTone = tone === 'bad' || tone === 'error' ? 'bad' : tone === 'good' || tone === 'success' ? 'good' : 'warn';
@@ -110,37 +117,75 @@ export function renderStatusIndicator({ label, tone = '', status = 'unavailable'
     const name = escapeHtml(label || 'Availability unavailable');
     return `<span class="status-indicator${toneClass}" role="img" aria-label="${name}" title="${name}">${iconMarkup(icon)}</span>`;
 }
-function renderDisplayModeToggle({ displayPreference = 'auto', themePreference = 'auto' } = {}) {
+export function relativeTimeLabel(date, now = Date.now()) {
+    if (!date || !Number.isFinite(Date.parse(date)))
+        return 'Time unavailable';
+    const timestamp = Date.parse(date);
+    const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
+    return seconds < 60 ? 'just now' : seconds < 3600 ? `${Math.floor(seconds / 60)} min ago` : seconds < 86400 ? `${Math.floor(seconds / 3600)} h ago` : `${Math.floor(seconds / 86400)} days ago`;
+}
+export function renderRelativeTime(date, now = Date.now()) {
+    if (!date || !Number.isFinite(Date.parse(date)))
+        return '<time>Time unavailable</time>';
+    const timestamp = Date.parse(date);
+    const label = relativeTimeLabel(date, now);
+    const absolute = new Date(timestamp).toLocaleString();
+    return `<time datetime="${escapeHtml(new Date(timestamp).toISOString())}" title="${escapeHtml(absolute)}">${label}</time>`;
+}
+export function renderBatteryReading({ battery, now = Date.now() }) {
+    const percentage = battery?.percent_estimate;
+    if (typeof percentage !== 'number' || !Number.isInteger(percentage) || percentage < 0 || percentage > 100)
+        return '<span class="battery-reading subtle">Battery unavailable</span>';
+    const reading = battery?.observed_at ? `<span class="battery-reading__age">Last reading ${renderRelativeTime(battery.observed_at, now)}</span>` : '';
+    return `<div class="battery-reading" aria-label="Estimated battery ${percentage}%"><span class="battery-reading__icon">${iconMarkup('battery')}</span><span class="battery-reading__value">~${percentage}%</span>${reading}</div>`;
+}
+function renderChoiceMenu({ id, label, choices, selected, kind }) {
+    const items = choices.map(([value, name, icon]) => renderButton({ label: name, accessibleLabel: name, title: name, action: `${kind}:set:${value}`, icon, variant: 'choice-menu__item' }).replace('<button ', `<button role="menuitemradio" aria-checked="${value === selected}" `)).join('');
+    const kindClass = id === 'layout-menu' ? 'layout-menu' : 'theme-menu';
+    return `<div class="choice-menu ${kindClass}" id="${escapeHtml(id)}" role="menu" aria-label="${escapeHtml(label)}" hidden>${items}</div>`;
+}
+function renderLayoutControl({ displayPreference = 'auto' } = {}) {
     const selectedIndex = DISPLAY_MODE_OPTIONS.findIndex(([value]) => value === displayPreference);
     const safeIndex = selectedIndex < 0 ? 0 : selectedIndex;
     const [, currentLabel] = DISPLAY_MODE_OPTIONS[safeIndex] ?? DISPLAY_MODE_OPTIONS[0];
-    const accessibleName = `Display and theme settings. Current display: ${currentLabel}. Current theme: ${themePreference}.`;
     const modeIcons = { auto: 'display', mobile: 'mobile', panel: 'panel', desktop: 'desktop' };
-    const modeChoices = DISPLAY_MODE_OPTIONS.map(([value, label]) => renderButton({
-        label, accessibleLabel: label, title: label, action: `display:set:${value}`, icon: modeIcons[value], iconOnly: true,
-        variant: 'display-menu-choice',
-    }).replace('<button ', `<button role="menuitemradio" aria-checked="${value === DISPLAY_MODE_OPTIONS[safeIndex]?.[0]}" `)).join('');
-    const themeChoices = [['auto', 'Automatic', 'display'], ['dark', 'Dark', 'moon'], ['light', 'Light', 'sun'], ['high-contrast', 'High contrast', 'contrast']].map(([value, label, icon]) => renderButton({
-        label, accessibleLabel: `${label} theme`, title: `${label} theme`, action: `theme:set:${value}`, icon, iconOnly: true,
-        variant: 'display-menu-choice',
-    }).replace('<button ', `<button role="menuitemradio" aria-checked="${value === themePreference}" `)).join('');
-    return `<div class="display-picker"><button type="button" id="display-mode-toggle" class="icon-button display-mode-button" data-action="display-menu-toggle" aria-label="${escapeHtml(accessibleName)}" title="${escapeHtml(accessibleName)}" data-tooltip="${escapeHtml(accessibleName)}" aria-haspopup="menu" aria-expanded="false" aria-controls="display-menu">${iconMarkup('display')}</button><div class="display-menu" id="display-menu" role="menu" aria-label="Display and theme settings" hidden><div class="display-menu__section" aria-label="Display mode">${modeChoices}</div><div class="display-menu__section" aria-label="Theme">${themeChoices}</div></div></div>`;
+    const modeChoices = DISPLAY_MODE_OPTIONS.map(([value, label]) => [value, label, modeIcons[value]]);
+    const toggle = renderButton({ label: currentLabel, accessibleLabel: `Layout: ${currentLabel}`, action: 'layout-menu-toggle', icon: 'display', variant: 'topbar-action layout-mode-toggle' }).replace('<button ', `<button id="layout-mode-toggle" aria-haspopup="menu" aria-expanded="false" aria-controls="layout-menu" `);
+    return `<div class="layout-picker">${toggle}${renderChoiceMenu({ id: 'layout-menu', label: 'Layout', choices: modeChoices, selected: DISPLAY_MODE_OPTIONS[safeIndex]?.[0] || 'auto', kind: 'display' })}</div>`;
+}
+function renderThemeControl({ themePreference = 'auto' } = {}) {
+    const isDark = themePreference === 'dark';
+    const nextLabel = isDark ? 'Light' : 'Dark';
+    const icon = isDark ? 'sun' : 'moon';
+    const currentLabel = isDark ? 'Dark' : themePreference === 'high-contrast' ? 'High contrast' : themePreference === 'light' ? 'Light' : 'Auto';
+    const toggle = renderButton({ label: currentLabel, accessibleLabel: `Switch to ${nextLabel.toLowerCase()} theme`, action: 'theme-toggle', icon, variant: 'topbar-action theme-toggle' }).replace('<button ', `<button id="theme-toggle" `);
+    const choices = [['auto', 'Automatic', 'display'], ['dark', 'Dark', 'moon'], ['light', 'Light', 'sun'], ['high-contrast', 'High contrast', 'contrast']];
+    const options = renderButton({ label: 'More themes', accessibleLabel: 'More theme options', action: 'theme-menu-toggle', icon: 'chevron', variant: 'theme-menu-toggle' }).replace('<button ', `<button id="theme-menu-toggle" aria-haspopup="menu" aria-expanded="false" aria-controls="theme-menu" `);
+    return `<div class="theme-picker">${toggle}${options}${renderChoiceMenu({ id: 'theme-menu', label: 'Theme options', choices, selected: themePreference, kind: 'theme' })}</div>`;
 }
 export function renderFreshnessIndicator(label) {
     const name = escapeHtml(label || 'Last heard time unavailable');
     return `<span class="freshness-indicator" role="img" aria-label="${name}" title="${name}">${iconMarkup('clock')}</span>`;
 }
-export function renderDeviceCardHeader({ id, label, availabilityLabel, availabilityTone = '', availabilityStatus = 'unavailable', isSimulated = false, room, lastSeen = '', panelMode = false }) {
+function cardDisplayName(label, room) {
+    if (!room || !label.startsWith(room))
+        return label;
+    const suffix = label.slice(room.length);
+    const match = suffix.match(/^\s*(?:[:—–-])\s*(.+)$/);
+    return match?.[1]?.trim() || label;
+}
+export function renderDeviceCardHeader({ id, label, availabilityLabel, availabilityTone = '', availabilityStatus = 'unavailable', room, lastSeen = '', panelMode = false }) {
     const escapedId = escapeHtml(id);
     const escapedLabel = escapeHtml(label);
-    const kind = isSimulated ? 'SIMULATED BLIND' : 'YOUR BLIND';
-    const freshness = lastSeen ? panelMode ? renderFreshnessIndicator(lastSeen) : `<div class="subtle">${escapeHtml(lastSeen)}</div>` : '';
-    return `<div class="card-top device-card-header"><div class="device-card-heading"><div class="subtle">${kind}</div><h3><button type="button" class="card-title" data-action="details:${escapedId}" aria-label="View details for ${escapedLabel}">${escapedLabel}</button></h3>${room ? `<div class="subtle room-label">${escapeHtml(room)}</div>` : ''}${!panelMode && freshness ? freshness : ''}</div><div class="device-card-indicators">${panelMode && freshness ? freshness : ''}${renderStatusIndicator({ label: availabilityLabel, tone: availabilityTone, status: availabilityStatus })}</div></div>`;
+    const title = escapeHtml(cardDisplayName(label, room));
+    const freshness = lastSeen ? panelMode ? renderFreshnessIndicator(lastSeen) : `<div class="subtle last-seen">${escapeHtml(lastSeen)}</div>` : '';
+    return `<div class="card-top device-card-header"><div class="device-card-heading"><h3><button type="button" class="card-title" data-action="details:${escapedId}" aria-label="View details for ${escapedLabel}"><span>${title}</span><span class="card-title-chevron">${iconMarkup('chevron_right')}</span></button></h3>${!panelMode && freshness ? freshness : ''}</div><div class="device-card-indicators">${panelMode && freshness ? freshness : ''}${renderStatusIndicator({ label: availabilityLabel, tone: availabilityTone, status: availabilityStatus })}</div></div>`;
 }
-export function renderButton({ label, action, type = 'button', variant = '', disabled = false, icon = null, iconOnly = false, accessibleLabel = label, title = '', }) {
+export function renderButton({ label, action, type = 'button', variant = '', disabled = false, icon = null, iconOnly = false, accessibleLabel, title = '', }) {
     const classes = ['button', variant, iconOnly ? 'icon-action' : ''].filter(Boolean).map(escapeHtml).join(' ');
-    const accessibility = iconOnly || accessibleLabel !== label ? ` aria-label="${escapeHtml(accessibleLabel)}"` : '';
-    const tooltipLabel = title || (iconOnly ? accessibleLabel : '');
+    const a11yName = accessibleLabel || label;
+    const accessibility = iconOnly || accessibleLabel ? ` aria-label="${escapeHtml(a11yName)}"` : '';
+    const tooltipLabel = title || (iconOnly ? a11yName : '');
     const titleAttribute = tooltipLabel
         ? ` title="${escapeHtml(tooltipLabel)}"`
         : '';
@@ -191,14 +236,26 @@ export function renderServiceSummary(summary) {
     });
     return `<div class="section-heading service-summary"><h2>Somaris service</h2>${action}</div><p class="subtle">${escapeHtml(summary)}</p>`;
 }
+export function renderServiceHealthSummary({ summary, fields, notUsedMarkup = '' }) {
+    const unused = notUsedMarkup ? `<details class="service-unused"><summary>Not used in demo</summary>${notUsedMarkup}</details>` : '';
+    return `<section class="service-health"><h2 class="service-health__summary">${escapeHtml(summary)}</h2><div class="service-health__details">${renderInfoGrid(fields)}</div>${unused}</section>`;
+}
+export function renderActivitySection({ count, expanded, listMarkup }) {
+    const collapsed = !expanded;
+    const countMarkup = count > 0 ? `<span class="count">${count} changes</span>` : '';
+    const label = collapsed ? 'Show' : 'Hide';
+    const toggle = renderButton({ label, accessibleLabel: `${collapsed ? 'Show' : 'Hide'} recent activity`, action: 'activity-toggle', icon: 'chevron', variant: `utility-button activity-toggle${collapsed ? ' is-collapsed' : ''}` }).replace('<button ', `<button aria-expanded="${!collapsed}" aria-controls="activity-list" `);
+    return `<section class="activity-section" id="activity"><div class="section-heading"><h2>Last 30 changes</h2><div class="activity-actions">${countMarkup}${toggle}</div></div><div id="activity-list"${collapsed ? ' hidden' : ''}>${listMarkup}</div></section>`;
+}
 export function renderDemoBanner() {
-    const reset = renderIconButton({
+    const reset = renderButton({
         label: 'Reset demo',
+        accessibleLabel: 'Reset demo',
         action: 'demo-reset',
         icon: 'reset',
         variant: 'secondary demo-banner__reset',
     });
-    return `<section class="demo-banner" aria-label="Somaris demonstration"><div><p class="eyebrow">Somaris Demo</p><p>Explore a simulated smart home. Your changes only affect this demonstration.</p></div>${reset}</section>`;
+    return `<section class="demo-banner" aria-label="Demo"><div><p class="eyebrow">Demo</p><p>Explore four simulated blinds. Changes stay in this session.</p></div>${reset}</section>`;
 }
 export function renderIconLinkButton({ label, action, icon, disabled = false }) {
     return renderButton({
@@ -249,10 +306,10 @@ export function renderConfirmationPanel({ title, message, confirmLabel = 'Confir
     return `<section class="confirmation-panel panel" role="group" aria-label="${escapeHtml(title)}"><div class="confirmation-copy"><h2>${escapeHtml(title)}</h2><p>${escapeHtml(message)}</p></div><div class="confirmation-actions">${renderButton({ label: 'Cancel', action: cancelAction, variant: 'secondary', disabled })}${renderDestructiveButton({ label: confirmLabel, action: confirmAction, disabled })}</div></section>`;
 }
 export function renderAddBlindButton({ variant = '' } = {}) {
-    return renderIconButton({
-        label: 'Add a blind',
+    return renderButton({
+        label: 'Add a blind', accessibleLabel: 'Add a blind',
         action: 'add',
-        variant: ['add-icon-button', 'topbar-add', variant].filter(Boolean).join(' '),
+        variant: ['topbar-action', 'topbar-add', variant].filter(Boolean).join(' '),
         icon: 'add',
     });
 }
@@ -260,7 +317,7 @@ export function renderRoomGroup({ room, cardsMarkup }) {
     return `<section class="room-group"><h3 class="room-heading">${escapeHtml(room)}</h3><div class="grid room-group__grid">${cardsMarkup}</div></section>`;
 }
 export function renderPositionPreset({ deviceId, blindLabel, position, selectedPosition, disabled = false }) {
-    const label = `Move ${blindLabel} to ${position}% closed`;
+    const label = `Move ${blindLabel} to ${position}% open`;
     const encodedId = encodeURIComponent(deviceId);
     const markup = renderButton({
         label: `${position}%`,
@@ -276,28 +333,31 @@ export function renderPositionPreset({ deviceId, blindLabel, position, selectedP
 }
 export function renderPositionControl({ deviceId, blindLabel, positionClosedPercent, disabled = false }) {
     const id = escapeHtml(deviceId);
+    const positionOpenPercent = 100 - positionClosedPercent;
     const presets = [0, 25, 50, 75, 100]
-        .map(position => renderPositionPreset({ deviceId, blindLabel, position, selectedPosition: positionClosedPercent, disabled }))
+        .map(position => renderPositionPreset({ deviceId, blindLabel, position, selectedPosition: positionOpenPercent, disabled }))
         .join('');
-    return `<div class="position-control" role="group" aria-label="Set position for ${escapeHtml(blindLabel)}"><div class="position-control__label"><label for="position-${id}">Set position</label><span><output data-position-output="${id}">${escapeHtml(positionClosedPercent)}%</output> closed</span></div><input id="position-${id}" type="range" min="0" max="100" step="1" value="${escapeHtml(positionClosedPercent)}" data-position-input="${id}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent closed"${disabled ? ' disabled' : ''}><div class="position-presets" role="group" aria-label="Position presets for ${escapeHtml(blindLabel)}">${presets}</div></div>`;
+    return `<div class="position-control" role="group" aria-label="Set position for ${escapeHtml(blindLabel)}"><div class="position-control__label"><label for="position-${id}">Set position</label><span><output data-position-output="${id}">${positionOpenPercent}%</output> open</span></div><div class="position-range"><span class="position-end position-end--closed">Closed</span><input id="position-${id}" type="range" min="0" max="100" step="1" value="${positionOpenPercent}" data-position-input="${id}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent open"${disabled ? ' disabled' : ''}><span class="position-end position-end--open">Open</span></div><div class="position-presets" role="group" aria-label="Position presets for ${escapeHtml(blindLabel)}">${presets}</div></div>`;
 }
-export function renderTopbarActions({ blindCount = 0, panelMode = false, demoMode = false, displayPreference = 'auto', serviceLabel = 'Connecting', serviceTone = '', themePreference = 'auto', route = 'home', } = {}) {
+export function renderTopbarActions({ blindCount = 0, panelMode = false, demoMode = false, displayPreference = 'auto', serviceLabel = 'Connecting', serviceTone = '', themePreference = 'auto', serviceShortLabel, route = 'home', } = {}) {
     const count = Number.isInteger(blindCount) && blindCount >= 0 ? blindCount : 0;
     const countLabel = `${count} ${count === 1 ? 'blind' : 'blinds'}`;
-    const status = `<span id="service-status" class="service-status"><span class="status-dot${serviceTone ? ` ${escapeHtml(serviceTone)}` : ''}"></span> ${escapeHtml(serviceLabel)}</span>`;
+    const shortLabel = serviceShortLabel || (serviceTone === 'good' ? 'Ready' : serviceTone === 'bad' ? 'Offline' : 'Check');
+    const status = `<span id="service-status" class="service-status"><span class="status-dot${serviceTone ? ` ${escapeHtml(serviceTone)}` : ''}" aria-hidden="true"></span><span class="service-status__full">${escapeHtml(serviceLabel)}</span><span class="service-status__short">${escapeHtml(shortLabel)}</span></span>`;
     const panelCount = panelMode ? `<span class="topbar-device-count">${escapeHtml(countLabel)}</span>` : '';
-    const displayToggle = renderDisplayModeToggle({ displayPreference, themePreference });
-    const refreshButton = renderIconButton({ label: 'Refresh', action: 'refresh', icon: 'refresh', variant: 'topbar-icon-button' });
-    const serviceButton = !panelMode ? renderIconButton({ label: 'Service status', action: 'service', icon: 'service', variant: 'topbar-icon-button' }) : '';
-    const demoReset = panelMode && demoMode ? renderIconButton({ label: 'Reset demo', action: 'demo-reset', icon: 'reset', variant: 'topbar-icon-button' }) : '';
-    return `${status}${panelCount}${serviceButton}${demoReset}${renderAddBlindButton()}${displayToggle}${refreshButton}`;
+    const layoutControl = renderLayoutControl({ displayPreference });
+    const themeControl = renderThemeControl({ themePreference });
+    const refreshButton = renderButton({ label: 'Refresh', accessibleLabel: 'Refresh', action: 'refresh', icon: 'refresh', variant: 'topbar-action topbar-icon-button topbar-action--compact-label' });
+    const serviceButton = !panelMode ? renderButton({ label: 'Service status', accessibleLabel: 'Service status', action: 'service', icon: 'service', variant: 'topbar-action topbar-icon-button topbar-action--compact-label' }) : '';
+    const demoReset = panelMode && demoMode ? renderButton({ label: 'Reset demo', accessibleLabel: 'Reset demo', action: 'demo-reset', icon: 'reset', variant: 'topbar-action topbar-icon-button' }) : '';
+    return `${status}${panelCount}${serviceButton}${demoReset}${renderAddBlindButton()}${layoutControl}${themeControl}${refreshButton}`;
 }
 export function renderMobileTabs(route = 'home') {
     const active = route.startsWith('details/') || route === 'add' ? 'home' : route;
     const tabs = [
         ['home', 'Blinds', 'home'], ['activity', 'Activity', 'activity'], ['service', 'Service status', 'service'],
     ];
-    return `<nav class="mobile-tabs" aria-label="Main navigation">${tabs.map(([id, label, icon]) => `<a class="mobile-tab" href="#${id}" aria-label="${label}" title="${label}" data-tooltip="${label}"${active === id ? ' aria-current="page"' : ''}>${iconMarkup(icon)}</a>`).join('')}</nav>`;
+    return `<nav class="mobile-tabs" aria-label="Main navigation">${tabs.map(([id, label, icon]) => `<a class="mobile-tab" href="#${id}" aria-label="${label}"${active === id ? ' aria-current="page"' : ''}>${iconMarkup(icon)}<span class="mobile-tab__label">${escapeHtml(label)}</span></a>`).join('')}</nav>`;
 }
 export function renderEmptyState({ title, description, icon = null, actionMarkup = '' }) {
     const illustration = icon ? `<div class="empty-icon empty-illustration">${iconMarkup(icon)}</div>` : '';
@@ -321,32 +381,35 @@ export function renderAddDeviceEmptyState({ demoMode, adapterAvailable }) {
         actionMarkup: renderIconButton({ label: 'Refresh devices', action: 'refresh', icon: 'refresh', variant: 'secondary' }),
     });
 }
-export function renderHomeContent({ deviceListMarkup, heroMarkup = '', demoHintMarkup = '', supportingMarkup = '' }) {
-    return `${deviceListMarkup}${heroMarkup}${demoHintMarkup}${supportingMarkup}`;
+export function renderHomeContent({ deviceListMarkup, demoHintMarkup = '', supportingMarkup = '' }) {
+    return `${demoHintMarkup}${deviceListMarkup}${supportingMarkup}`;
 }
 export function renderDisclosure({ label, contentMarkup, variant = '' }) {
     const classes = ['disclosure', variant].filter(Boolean).map(escapeHtml).join(' ');
     const name = escapeHtml(label);
     return `<details class="${classes}"><summary class="disclosure__trigger" aria-label="${name}" title="${name}" data-tooltip="${name}">${iconMarkup('chevron')}</summary><div class="disclosure__content">${contentMarkup}</div></details>`;
 }
-export function renderBlindActions({ deviceId, blindLabel, panelMode = false, disabled = false, busy = false, movementDisabled = false, supportsPosition = false, positionClosedPercent = 100 }) {
+export function renderBlindActions({ deviceId, blindLabel, panelMode = false, disabled = false, busy = false, movementDisabled = false, supportsPosition = false, positionClosedPercent = 100, currentClosedPercent, currentPositionFresh = false }) {
+    const redundantAction = currentPositionFresh && currentClosedPercent === 0 ? 'open' : currentPositionFresh && currentClosedPercent === 100 ? 'close' : null;
+    const primaryAction = busy || movementDisabled ? 'stop' : currentPositionFresh && currentClosedPercent === 0 ? 'close' : 'open';
     const actions = [
-        ['open', 'Open', ''],
-        ['stop', 'Stop', 'secondary'],
-        ['close', 'Close', 'secondary'],
+        ['open', 'Open'],
+        ['stop', 'Stop'],
+        ['close', 'Close'],
     ];
     const disabledPosition = disabled || movementDisabled || busy;
     const positionControls = supportsPosition && !panelMode
         ? renderPositionControl({ deviceId, blindLabel, positionClosedPercent, disabled: disabledPosition })
         : '';
-    return `<div class="controls" role="group" aria-label="${escapeHtml(blindLabel)} controls">${actions.map(([action, label, variant]) => {
+    return `<div class="controls" role="group" aria-label="${escapeHtml(blindLabel)} controls">${actions.map(([action, label]) => {
         const accessibleLabel = `${label} ${blindLabel}`;
+        const variant = [action === primaryAction ? 'button--primary' : 'secondary', panelMode ? 'panel-target' : ''].filter(Boolean).join(' ');
         return renderButton({
             label,
             accessibleLabel,
             action: `command:${action}:${deviceId}`,
-            variant: [variant, panelMode ? 'panel-target' : ''].filter(Boolean).join(' '),
-            disabled: disabled || (movementDisabled && action !== 'stop') || (busy && action !== 'stop'),
+            variant,
+            disabled: disabled || action === redundantAction || (movementDisabled && action !== 'stop') || (busy && action !== 'stop'),
             icon: action,
             iconOnly: panelMode,
             title: panelMode ? accessibleLabel : '',
@@ -371,15 +434,16 @@ export function renderBatchControls({ blindCount = 0, eligibleCount = 0, disable
         : '';
     return `${controls}${blindCount < 1 ? renderBatchFeedback(batch) : ''}`;
 }
-export function renderBlindCard({ id, label, isSimulated, room, lastSeen, availabilityLabel, availabilityTone = '', availabilityStatus = 'unavailable', positionPercent, movementStatus, blindLines = 0, controlsMarkup, messageMarkup = '', footerMarkup = '', panelMode = false, supportsPosition = false, }) {
+export function renderBlindCard({ id, label, room, lastSeen, availabilityLabel, availabilityTone = '', availabilityStatus = 'unavailable', positionPercent, movementStatus, blindLines = 0, controlsMarkup, messageMarkup = '', footerMarkup = '', panelMode = false, supportsPosition = false, showPositionCue = false, }) {
     const slats = '<i></i>'.repeat(Math.max(0, Math.min(11, blindLines)));
     const fill = `<span class="blind-art__fill" style="--blind-fill:${Math.max(0, Math.min(100, positionPercent ?? 0))}%">${slats}</span>`;
     const cardVariant = panelMode ? ' card--panel' : '';
     const displayVariant = panelMode ? ' blind-display--panel' : '';
-    const header = renderDeviceCardHeader({ id, label, availabilityLabel, availabilityTone, availabilityStatus, isSimulated, room, lastSeen, panelMode });
+    const header = renderDeviceCardHeader({ id, label, availabilityLabel, availabilityTone, availabilityStatus, room, lastSeen, panelMode });
     const status = renderBlindStatus({ positionPercent, movementStatus, panelMode });
+    const percentOpen = positionPercent === null || positionPercent === undefined ? null : 100 - positionPercent;
     const graphic = supportsPosition && !panelMode
-        ? `<div class="blind-art blind-art--interactive" data-position-graphic="${escapeHtml(id)}" role="slider" tabindex="0" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeHtml(positionPercent ?? 0)}" aria-label="Blind position for ${escapeHtml(label)}, percent closed" data-movement="${escapeHtml(movementStatus)}">${fill}</div>`
+        ? `<div class="blind-art-wrap"><div class="blind-art blind-art--interactive" data-position-graphic="${escapeHtml(id)}" role="slider" tabindex="0" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeHtml(percentOpen ?? 0)}" aria-valuetext="${escapeHtml(percentOpen === null ? 'Position unavailable' : `${percentOpen}% open`)}" aria-label="Blind position for ${escapeHtml(label)}, percent open" data-movement="${escapeHtml(movementStatus)}">${fill}</div>${showPositionCue ? '<span class="position-cue">Drag the blind to set position</span>' : ''}</div>`
         : `<div class="blind-art" data-movement="${escapeHtml(movementStatus)}" aria-hidden="true">${fill}</div>`;
     return `<article class="card${cardVariant}" data-device-card="${escapeHtml(id)}" data-room="${escapeHtml(room || '')}">${header}<div class="blind-display${displayVariant}">${status}${graphic}</div>${controlsMarkup}<div class="card-messages" data-card-messages="${escapeHtml(id)}">${messageMarkup}</div><div class="card-foot">${footerMarkup}</div></article>`;
 }

@@ -94,6 +94,7 @@ export interface BatteryReading {
   percent_estimate?: number | null;
   status?: string;
   voltage_mv?: number | null;
+  observed_at?: string | null;
 }
 
 export interface CommandRecord {
