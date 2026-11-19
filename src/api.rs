@@ -1788,6 +1788,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/components.css", get(ui_components_style))
         .route("/ui/panel.css", get(ui_panel_style))
         .route("/ui/app.mjs", get(ui_app))
+        .route("/ui/clock.mjs", get(ui_clock))
         .route("/ui/api-docs.mjs", get(ui_api_docs))
         .route("/ui/components.mjs", get(ui_components))
         .route("/ui/escape.mjs", get(ui_escape))
@@ -1941,6 +1942,13 @@ async fn ui_app() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../ui/app.mjs"),
+    )
+}
+
+async fn ui_clock() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/clock.mjs"),
     )
 }
 
