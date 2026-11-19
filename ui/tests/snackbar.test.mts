@@ -83,3 +83,20 @@ test('permanent snackbars remain until dismissed and enqueue changes are observa
   assert.deepEqual(changes, [1,0]);
   queue.destroy();
 });
+
+test('a keyed position snackbar can update in place when reported telemetry reaches its target',()=>{
+ const scheduler=fakeScheduler();
+ const queue=new SnackbarQueue({scheduler});
+ const itemId=queue.push({key:'position:blind-1',message:'Moving to 50% open…',tone:'info',duration:0,action:{label:'Undo',action:'undo-position:blind-1:50'}});
+ assert.ok(itemId);
+ assert.equal(queue.updateByKey('position:blind-1',{message:'Hallway reached 50% open',tone:'success',duration:10000}),true);
+ assert.equal(queue.items[0]?.id,itemId);
+ assert.equal(queue.items[0]?.message,'Hallway reached 50% open');
+ assert.equal(queue.items[0]?.tone,'success');
+ assert.equal(queue.items[0]?.duration,10000);
+ scheduler.advance(9999);
+ assert.equal(queue.items.length,1);
+ scheduler.advance(1);
+ assert.equal(queue.items.length,0);
+ queue.destroy();
+});

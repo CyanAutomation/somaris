@@ -194,7 +194,7 @@ test('square desk panel keeps all blind cards and controls visible at 480px', as
     assert.ok(layout.cards.every(card => card.top >= layout.appTop && card.bottom <= layout.appBottom));
     assert.ok(layout.controls.every(control => control.top >= layout.appTop && control.bottom <= layout.appBottom));
     assert.ok(layout.controls.every(control => control.width >= 44 && control.height >= 44));
-    assert.equal(layout.topbarControls.length, 4);
+    assert.equal(layout.topbarControls.length, 5);
     assert.equal(layout.demoBannerHeight, 0);
     assert.equal(layout.demoResetLabel,'Reset demo');
     assert.ok(layout.topbarControls.every(control => control.left >= layout.topbarLeft && control.right <= layout.topbarRight));
@@ -339,15 +339,20 @@ test('mobile cards and topbar fit at 360px and 390px with direct-position preset
         const shellStyle = getComputedStyle(shell);
         const clock = document.querySelector('.header-clock')!.getBoundingClientRect();
         const actions = document.querySelector('.top-actions')!.getBoundingClientRect();
+        const actionRect=document.querySelector('.top-actions')!.getBoundingClientRect();
         return {
           viewport:innerWidth,
           document:document.documentElement.scrollWidth,
           topbarRight:document.querySelector('.topbar')!.getBoundingClientRect().right,
           clockLeft:clock.left,
           clockRight:clock.right,
+          clockTop:clock.top,
+          clockBottom:clock.bottom,
           clockWidth:clock.width,
           actionsLeft:actions.left,
-          actionsRight:document.querySelector('.top-actions')!.getBoundingClientRect().right,
+          actionsTop:actionRect.top,
+          actionsBottom:actionRect.bottom,
+          actionsRight:actionRect.right,
           shellContentRight:shellRect.right - parseFloat(shellStyle.paddingRight),
           presetsWidth:document.querySelector('.position-presets')!.getBoundingClientRect().width,
           cardWidth:document.querySelector('[data-device-card]')!.getBoundingClientRect().width,
@@ -358,7 +363,8 @@ test('mobile cards and topbar fit at 360px and 390px with direct-position preset
       assert.ok(layout.document <= layout.viewport);
       assert.ok(layout.topbarRight <= layout.viewport);
       assert.ok(layout.clockWidth > 0, `${width}px header clock should be visible`);
-      assert.ok(layout.clockRight <= layout.actionsLeft, `${width}px header clock overlaps topbar actions`);
+      const clockAndActionsDisjoint=layout.clockBottom<=layout.actionsTop||layout.clockTop>=layout.actionsBottom||layout.clockRight<=layout.actionsLeft;
+      assert.ok(clockAndActionsDisjoint, `${width}px header clock overlaps topbar actions`);
       assert.ok(layout.actionsRight <= layout.shellContentRight, `${width}px topbar actions end at ${layout.actionsRight}px, beyond shell content at ${layout.shellContentRight}px`);
       assert.ok(layout.presetsWidth > layout.cardWidth / 2);
       assert.ok(layout.heroDismissWidth <= 56);
