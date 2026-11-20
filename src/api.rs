@@ -4556,8 +4556,8 @@ async fn update_device_room(
     let room = requested_room
         .as_deref()
         .map(|room| canonical_room_name(&inner.enrollments, room));
-    let normalization_room = current.room.as_deref().or(room.as_deref());
-    let label = normalization_room
+    let label = room
+        .as_deref()
         .map(|room| strip_room_prefix(&current.label, room))
         .unwrap_or_else(|| current.label.clone());
     let changed = current.room != room || current.label != label;
@@ -4783,7 +4783,7 @@ fn room_key(room: &str) -> String {
 
 fn validate_room_name(room: &str) -> Result<String, ()> {
     let room = room.trim();
-    if room.is_empty() || room.chars().count() > 40 || room.eq_ignore_ascii_case("unassigned") {
+    if room.is_empty() || room.chars().count() > 40 || room_key(room) == "unassigned" {
         return Err(());
     }
     Ok(room.to_owned())
