@@ -1,9 +1,10 @@
-import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderRoomPicker, roomFromChoice, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderBatteryReading, renderRelativeTime, relativeTimeLabel, renderActivitySection, renderServiceHealthSummary, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderAddDeviceEmptyState, renderHomeContent, renderDisclosure, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
+import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderRoomCollection, renderRoomPicker, roomFromChoice, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderBatteryReading, renderRelativeTime, relativeTimeLabel, renderActivitySection, renderBackButton, renderSettingsPage, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderAddDeviceEmptyState, renderHomeContent, renderDisclosure, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
 import { SnackbarQueue } from './snackbar.mjs';
 import { mountClock } from './clock.mjs';
 export { escapeHtml };
 const displayModes = new Set(DISPLAY_MODE_OPTIONS.map(([value]) => value));
 const themeModes = new Set(['auto', 'dark', 'light', 'high-contrast']);
+export function isThemePreference(preference) { return themeModes.has(preference); }
 const displayPreferenceCycle = DISPLAY_MODE_OPTIONS.map(([value]) => value);
 export function nextDisplayPreference(preference) {
     const index = displayPreferenceCycle.indexOf(preference);
@@ -24,27 +25,6 @@ export function displayPreferenceFrom(search, saved) {
     if (requested && displayModes.has(requested))
         return requested;
     return saved && displayModes.has(saved) ? saved : 'auto';
-}
-function menuChoicePreference(action, operation, value) {
-    if (operation !== 'set')
-        return null;
-    if (action === 'display' && displayModes.has(value))
-        return value;
-    if (action === 'theme' && themeModes.has(value))
-        return value;
-    return null;
-}
-export function dispatchMenuChoice(action, operation, value, apply) {
-    const preference = menuChoicePreference(action, operation, value);
-    if (!preference)
-        return false;
-    if (action === 'display')
-        apply('display', preference);
-    else if (action === 'theme')
-        apply('theme', preference);
-    else
-        return false;
-    return true;
 }
 export function resolveActionFocus({ focusedAction = null, pendingConfirmationId = null, confirmingRemovalId = null, availableActions = [], }) {
     if (pendingConfirmationId && pendingConfirmationId === confirmingRemovalId) {
@@ -561,7 +541,7 @@ function regularCardMessageMarkup(message, tone, availability, cooldown, calibra
         calibration ? `<p class="message warn">${esc(calibration)}</p>` : '',
     ].join('');
 }
-export function renderManagedDeviceCard(device, dashboard, panelMode, now = Date.now()) {
+export function renderManagedDeviceCard(device, dashboard, panelMode, now = Date.now(), showRoom = false) {
     const e = device.enrollment, o = observationFor(device, dashboard.observations), [label, tone] = availability(device.availability), p = device.position?.current_closed_percent;
     const blindLabel = e.label ?? 'Blind';
     const cooldownUntil = device.gatt_readiness?.cooldown_until;
@@ -594,10 +574,11 @@ export function renderManagedDeviceCard(device, dashboard, panelMode, now = Date
         controlsMarkup, messageMarkup, footerMarkup, panelMode,
         supportsPosition: device.capabilities?.set_position === true,
         showPositionCue: !positionCueDismissed && dashboard.managed.find(item => item.capabilities?.set_position === true)?.enrollment.id === e.id,
+        showRoom: showRoom && !panelMode,
     });
 }
-function card(device) {
-    return renderManagedDeviceCard(device, state, document.documentElement.dataset.displayMode === 'panel');
+function card(device, showRoom = false) {
+    return renderManagedDeviceCard(device, state, document.documentElement.dataset.displayMode === 'panel', Date.now(), showRoom);
 }
 function roomGroupMarkup(room, devices) {
     const encoded = encodeURIComponent(room);
@@ -612,7 +593,6 @@ function roomGroupMarkup(room, devices) {
     }
     return renderRoomGroup({
         room,
-        cardsMarkup: devices.map(card).join(''),
         actionsMarkup,
         managementMarkup,
     });
@@ -649,12 +629,15 @@ function home() {
             })), {
                 room: 'Unassigned',
                 devices: state.managed.filter(device => !device.enrollment.room),
-            }].filter(group => group.devices.length).map(group => roomGroupMarkup(group.room, group.devices)).join('')
-        : '';
+            }].filter(group => group.devices.length)
+        : [];
+    const roomGroupsMarkup = roomGroups.map(group => roomGroupMarkup(group.room, group.devices)).join('');
+    const roomCardsMarkup = roomGroups.flatMap(group => group.devices).map(device => card(device, true)).join('');
+    const groupsMarkup = roomGroups.length ? renderRoomCollection({ groupsMarkup: roomGroupsMarkup, cardsMarkup: roomCardsMarkup }) : '';
     const listMarkup = renderDeviceList({
         count: state.managed.length, panelMode,
-        cardsMarkup: state.managed.map(card).join(''), emptyMarkup: loadingError || empty, toolbarMarkup: batchControls,
-        groupsMarkup: roomGroups,
+        cardsMarkup: state.managed.map(device => card(device)).join(''), emptyMarkup: loadingError || empty, toolbarMarkup: batchControls,
+        groupsMarkup,
     });
     const serviceMarkup = renderServiceSummary(scannerSummary());
     const demoHint = state.demoMode && !hintDismissed && !panelMode ? `<aside class="demo-hint"><span>${renderIcon('target')} Drag a blind graphic to set its position, or use Open, Stop, and Close for quick moves.</span>${renderDismissButton({ label: 'Dismiss demo hint', action: 'demo-hint-dismiss', variant: 'demo-hint-dismiss' })}</aside>` : '';
@@ -668,7 +651,7 @@ function home() {
 function scannerSummary() { const s = state.diagnostics?.scanner; if (state.demoMode)
     return state.diagnostics?.simulator_ready ? 'Everything is working' : 'Simulator unavailable'; if (!s)
     return 'Service status unavailable'; return s.adapter_available ? (s.scan_active ? 'Bluetooth adapter available · scanning' : 'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
-function back() { return `<div class="back-navigation">${renderButton({ label: 'Back to blinds', action: 'home', icon: 'back', variant: 'back-button' })}</div>`; }
+function back() { return renderBackButton(); }
 function addPage() {
     const available = state.observations.filter(o => !state.managed.some(m => m.enrollment.logical_id === o.logical_id && !!m.enrollment.is_simulated === !!o.is_simulated));
     const intro = state.demoMode ? 'This demo lists simulated blinds only; Bluetooth discovery is unavailable here.' : 'Choose a recently discovered blind to make it available for control.';
@@ -799,11 +782,10 @@ function serviceStatusSummary() {
         return state.diagnostics?.simulator_ready ? 'Everything is working' : 'The simulator is unavailable';
     return state.diagnostics?.scanner?.adapter_available ? 'Everything is working' : 'Bluetooth scanning is unavailable';
 }
-function servicePage() {
+function settingsPage() {
     const data = serviceStatusFields();
-    const simulatorSection = simulatorControlsForMode();
     const notUsedMarkup = state.demoMode ? renderInfoGrid(data.notUsed) : '';
-    return `${back()}<h1 class="page-title">Service status</h1>${renderServiceHealthSummary({ summary: serviceStatusSummary(), fields: data.fields, notUsedMarkup })}${simulatorSection}`;
+    return renderSettingsPage({ themePreference, serviceSummary: serviceStatusSummary(), serviceFields: data.fields, notUsedMarkup, simulatorMarkup: simulatorControlsForMode() });
 }
 function simulatorControlsForMode() {
     return state.demoMode ? '' : simulatorControls();
@@ -812,8 +794,8 @@ function page() { return location.hash.slice(1) || 'home'; }
 function pageContent(route) {
     if (route === 'add')
         return addPage();
-    if (route === 'service')
-        return servicePage();
+    if (route === 'settings' || route === 'service')
+        return settingsPage();
     if (route.startsWith('details/'))
         return detailPage(decodeURIComponent(route.slice(8)));
     return home();
@@ -1579,13 +1561,6 @@ export function parseActionValue(value) {
     const [action = '', argument = '', id = ''] = value?.split(':') ?? [];
     return [action, argument, id];
 }
-export function dispatchMenuActionValue(value, apply) {
-    const [action, operation, preference] = parseActionValue(value);
-    if (action !== 'display' && action !== 'theme')
-        return false;
-    dispatchMenuChoice(action, operation, preference, apply);
-    return true;
-}
 function isBlindAction(action) {
     return action !== undefined && [
         'open', 'close', 'stop', 'toggle', 'set_position', 'set_motor_speed',
@@ -1611,8 +1586,8 @@ function changeDisplayMode(preference, applyDisplayMode) {
     render();
     document.getElementById('layout-mode-toggle')?.focus({ preventScroll: true });
 }
-function changeTheme(preference) {
-    if (!themeModes.has(preference))
+function changeTheme(preference, focusTargetId = 'theme-toggle') {
+    if (!isThemePreference(preference))
         return;
     themePreference = preference;
     try {
@@ -1620,48 +1595,7 @@ function changeTheme(preference) {
     }
     catch { /* Current selection still applies for this page. */ }
     render();
-    document.getElementById('theme-toggle')?.focus({ preventScroll: true });
-}
-function closeDisplayMenu(returnFocus = false) {
-    for (const [menuId, triggerId] of [['layout-menu', 'layout-mode-toggle'], ['theme-menu', 'theme-menu-toggle']]) {
-        const menu = document.getElementById(menuId);
-        const trigger = document.getElementById(triggerId);
-        if (menu instanceof HTMLElement)
-            menu.hidden = true;
-        trigger?.setAttribute('aria-expanded', 'false');
-    }
-    if (returnFocus) {
-        const trigger = document.getElementById('layout-mode-toggle');
-        const themeTrigger = document.getElementById('theme-menu-toggle');
-        (themeTrigger?.dataset.wasOpen === 'true' ? themeTrigger : trigger)?.focus({ preventScroll: true });
-        if (themeTrigger)
-            delete themeTrigger.dataset.wasOpen;
-    }
-}
-function toggleDisplayMenu() {
-    const menu = document.querySelector('#layout-menu');
-    const trigger = document.querySelector('#layout-mode-toggle');
-    if (!menu || !trigger)
-        return;
-    const wasOpen = !menu.hidden;
-    closeDisplayMenu();
-    menu.hidden = wasOpen;
-    trigger.setAttribute('aria-expanded', String(!menu.hidden));
-    if (!menu.hidden)
-        menu.querySelector('[aria-checked="true"]')?.focus({ preventScroll: true });
-}
-function toggleThemeMenu() {
-    const menu = document.querySelector('#theme-menu');
-    const trigger = document.querySelector('#theme-menu-toggle');
-    if (!menu || !trigger)
-        return;
-    const wasOpen = !menu.hidden;
-    closeDisplayMenu();
-    menu.hidden = wasOpen;
-    trigger.dataset.wasOpen = String(!menu.hidden);
-    trigger.setAttribute('aria-expanded', String(!menu.hidden));
-    if (!menu.hidden)
-        menu.querySelector('[aria-checked="true"]')?.focus({ preventScroll: true });
+    document.getElementById(focusTargetId)?.focus({ preventScroll: true });
 }
 function toggleTheme() {
     changeTheme(themePreference === 'dark' ? 'light' : 'dark');
@@ -1716,8 +1650,7 @@ function handleRoomRemovalClick(room, confirm) {
 }
 const clickActionHandlers = {
     'snackbar-dismiss': (_argument, _id, deviceId) => { snackbarQueue.dismiss(deviceId); return true; },
-    'layout-menu-toggle': () => { toggleDisplayMenu(); return true; },
-    'theme-menu-toggle': () => { toggleThemeMenu(); return true; },
+    'layout-cycle': (_argument, _id, _deviceId, applyDisplayMode) => { changeDisplayMode(nextDisplayPreference(displayPreference), applyDisplayMode); return true; },
     'theme-toggle': () => { toggleTheme(); return true; },
     command: (argument, id) => dispatchBlindCommand(argument, id),
     batch: argument => handleBatchClick(argument),
@@ -1954,12 +1887,6 @@ if (app) {
         window.addEventListener('offline', () => { serviceFailure(state, new Error('Network unavailable')); render(); });
         window.addEventListener('online', () => { void refresh(); });
         document.addEventListener('keydown', (event) => {
-            const layoutMenu = document.querySelector('#layout-menu');
-            const themeMenu = document.querySelector('#theme-menu');
-            if (event.key === 'Escape' && ((layoutMenu && !layoutMenu.hidden) || (themeMenu && !themeMenu.hidden))) {
-                event.preventDefault();
-                closeDisplayMenu(true);
-            }
             const graphic = closestHtmlElement(event.target, '[data-position-graphic]');
             const range = closestHtmlElement(event.target, '[data-position-input]');
             if (!graphic && !(range instanceof HTMLInputElement))
@@ -2005,27 +1932,11 @@ if (app) {
                 commitPosition(id, Number(range.value));
             }
         });
-        document.addEventListener('pointerdown', (event) => {
-            const layout = document.querySelector('.layout-picker');
-            const theme = document.querySelector('.theme-picker');
-            const within = layout?.contains(event.target) || theme?.contains(event.target);
-            if (!within)
-                closeDisplayMenu();
-        });
         actionRoot.addEventListener('click', (event) => {
             const target = closestHtmlElement(event.target, '[data-action]');
             if (!target)
                 return;
             const actionValue = target.dataset.action;
-            if (dispatchMenuActionValue(actionValue, (kind, preference) => {
-                if (kind === 'display')
-                    changeDisplayMode(preference, applyDisplayMode);
-                else
-                    changeTheme(preference);
-            })) {
-                closeDisplayMenu();
-                return;
-            }
             const [action, argument, id] = parseActionValue(actionValue);
             dispatchClickAction(action, argument, id, applyDisplayMode);
         });
@@ -2140,6 +2051,11 @@ if (app) {
             previewPosition(id, Number(range.value));
         });
         app.addEventListener('change', (event) => {
+            const themePreferenceControl = closestHtmlElement(event.target, '[data-theme-preference]');
+            if (themePreferenceControl instanceof HTMLSelectElement) {
+                changeTheme(themePreferenceControl.value, themePreferenceControl.id);
+                return;
+            }
             const roomChoice = closestHtmlElement(event.target, '[data-room-choice]');
             if (roomChoice instanceof HTMLSelectElement) {
                 const picker = roomChoice.closest('.room-picker');

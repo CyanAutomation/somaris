@@ -21,6 +21,9 @@ import {
   renderAddBlindButton,
   renderRoomPicker,
   renderRoomGroup,
+  renderRoomCollection,
+  renderThemePreferenceControl,
+  renderSettingsPage,
   renderDemoBanner,
   renderPositionPreset,
   renderServiceSummary,
@@ -56,6 +59,9 @@ test('Somaris keeps the original orange stacked-bar brand glyph', () => {
 
   assert.equal((mark.match(/<i><\/i>/g) || []).length, 3);
   assert.doesNotMatch(mark, /cord/);
+  const brand = html.match(/<div class="topbar-brand">([\s\S]*?)<\/div>/)?.[1] || '';
+  assert.doesNotMatch(brand, /header-clock-slot/);
+  assert.match(html, /<div id="header-clock-slot" class="topbar-clock"><\/div>/);
   assert.match(styles, /\.brand-mark\{width:32px;height:32px;background:var\(--color-accent\);border-radius:10px;/);
   assert.match(styles, /\.brand-mark i\{height:3px;border-radius:3px;background:var\(--token-brand-ink\)\}/);
 });
@@ -188,8 +194,8 @@ test('service summary names its action and renders status as text', () => {
   const summary = parseMarkup(renderServiceSummary('Demo <ready>'));
   const action = summary.querySelector('button');
   assert.equal(summary.querySelector('h2')?.textContent, 'Somaris service');
-  assert.equal(action?.textContent, 'View service status');
-  assert.equal(action?.getAttribute('data-action'), 'service');
+  assert.equal(action?.textContent, 'Open settings');
+  assert.equal(action?.getAttribute('data-action'), 'settings');
   assert.equal(summary.querySelector('.subtle')?.textContent, 'Demo <ready>');
   assert.equal(summary.querySelector('.subtle img'), null);
 });
@@ -198,8 +204,9 @@ test('demo banner exposes a named reset action', () => {
   const banner = parseMarkup(renderDemoBanner());
   const reset = banner.querySelector('[data-action="demo-reset"]');
   assert.equal(reset?.getAttribute('aria-label'), 'Reset demo');
-  assert.equal(reset?.textContent, 'Reset demo');
+  assert.equal(reset?.textContent, '');
   assert.equal(reset?.querySelector('svg')?.getAttribute('data-icon'), 'reset');
+  assert.equal(reset?.getAttribute('title'), 'Reset demo');
 });
 
 test('position presets expose the selected target and its accessible action', () => {
@@ -240,12 +247,13 @@ test('direct blind graphic is a keyboard accessible percent-open slider with a d
 });
 
 test('mobile tabs show labels below their icons and expose the current route', () => {
-  const root = parseMarkup(renderMobileTabs('activity'));
+  const root = parseMarkup(renderMobileTabs('service'));
   const tabs = [...root.querySelectorAll('.mobile-tab')];
   assert.equal(tabs.length, 3);
-  assert.deepEqual(tabs.map(tab => tab.getAttribute('aria-label')), ['Blinds', 'Activity', 'Service status']);
-  assert.equal(tabs[1]?.getAttribute('aria-current'), 'page');
-  assert.deepEqual(tabs.map(tab => tab.querySelector('.mobile-tab__label')?.textContent), ['Blinds', 'Activity', 'Service status']);
+  assert.deepEqual(tabs.map(tab => tab.getAttribute('aria-label')), ['Blinds', 'Activity', 'Settings']);
+  assert.equal(tabs[2]?.getAttribute('aria-current'), 'page');
+  assert.deepEqual(tabs.map(tab => tab.querySelector('.mobile-tab__label')?.textContent), ['Blinds', 'Activity', 'Settings']);
+  assert.equal(tabs[2]?.getAttribute('href'),'#settings');
 });
 
 test('panel blind controls omit percentage positioning while other views retain it', () => {
@@ -593,23 +601,49 @@ test('undo snackbar actions are icon-only and remain named',()=>{
  assert.equal(action?.querySelector('svg')?.getAttribute('data-icon'),'undo');
 });
 
-test('layout and theme have separate labelled controls and show their current choice',()=>{
- const root=parseMarkup(renderTopbarActions({panelMode:false,displayPreference:'panel',themePreference:'light'}));
- const layout=root.querySelector('#layout-menu');
- const theme=root.querySelector('#theme-menu');
- assert.ok(layout);
- assert.ok(theme);
- assert.equal(layout.getAttribute('aria-label'),'Layout');
- assert.equal(theme.getAttribute('aria-label'),'Theme options');
- const layouts=[...layout.querySelectorAll('[role="menuitemradio"]')];
- assert.equal(layouts.length,4);
- assert.equal(layouts.find(item=>item.getAttribute('aria-label')==='Compact')?.getAttribute('aria-checked'),'true');
- assert.match(root.querySelector('#layout-mode-toggle')?.textContent||'',/Compact/);
- assert.match(root.querySelector('#theme-toggle')?.getAttribute('aria-label')||'',/Switch to dark theme/i);
- assert.match(root.querySelector('#theme-toggle')?.textContent||'',/Light/);
- assert.equal(root.querySelector('#theme-toggle')?.querySelector('svg')?.getAttribute('data-icon'),'moon');
- assert.equal(theme.querySelectorAll('[role="menuitemradio"]').length,4);
- assert.match(root.toString(),/data-action="service"/);
+test('layout and theme controls are named stateful icon buttons without redundant menus',()=>{
+ const root=parseMarkup(renderTopbarActions({panelMode:false,displayPreference:'panel',themePreference:'dark'}));
+ const layout=root.querySelector('#layout-mode-toggle');
+ const theme=root.querySelector('#theme-toggle');
+ assert.equal(layout?.getAttribute('aria-label'),'Layout: Compact');
+ assert.equal(layout?.getAttribute('data-action'),'layout-cycle');
+ assert.equal(layout?.textContent,'');
+ assert.equal(layout?.querySelector('svg')?.getAttribute('data-icon'),'panel');
+ assert.equal(theme?.getAttribute('aria-label'),'Switch to light theme');
+ assert.equal(theme?.textContent,'');
+ assert.equal(theme?.querySelector('svg')?.getAttribute('data-icon'),'moon');
+ assert.equal(root.querySelector('#layout-menu'),null);
+ assert.equal(root.querySelector('#theme-menu-toggle'),null);
+ assert.equal(root.querySelector('#theme-menu'),null);
+ assert.equal(root.querySelector('[data-action="settings"]')?.getAttribute('aria-label'),'Settings');
+ assert.equal(root.querySelector('[data-action="settings"]')?.querySelector('svg')?.getAttribute('data-icon'),'settings');
+ const light=parseMarkup(renderTopbarActions({themePreference:'light'})).querySelector('#theme-toggle');
+ assert.equal(light?.getAttribute('aria-label'),'Switch to dark theme');
+ assert.equal(light?.querySelector('svg')?.getAttribute('data-icon'),'sun');
+});
+
+test('theme preferences remain available as a native settings control',()=>{
+ const settings=parseMarkup(renderThemePreferenceControl('high-contrast'));
+ const select=settings.querySelector('select[name="theme"]');
+ assert.equal(settings.querySelector('h2')?.textContent,'Appearance');
+ assert.equal(select?.getAttribute('aria-label'),'Theme');
+ assert.equal(select?.querySelector('option:checked')?.getAttribute('value'),'high-contrast');
+ assert.deepEqual([...select?.querySelectorAll('option')||[]].map(option=>option.getAttribute('value')),
+  ['auto','dark','light','high-contrast']);
+});
+
+test('settings page reuses the icon-only back control and retains service diagnostics',()=>{
+ const page=parseMarkup(renderSettingsPage({
+  themePreference:'dark',serviceSummary:'Everything is working',serviceFields:[{label:'Simulated blinds',value:4}],
+ }));
+ assert.equal(page.querySelector('h1')?.textContent,'Settings');
+ const back=page.querySelector('[data-action="home"]');
+ assert.equal(back?.textContent,'');
+ assert.equal(back?.getAttribute('aria-label'),'Back to blinds');
+ assert.equal(back?.querySelector('svg')?.getAttribute('data-icon'),'back');
+ assert.equal(page.querySelector('.settings-service>h2')?.textContent,'Service status');
+ assert.equal(page.querySelector('.service-health__summary')?.textContent,'Everything is working');
+ assert.equal(page.querySelector('.service-health .info-item strong')?.textContent,'4');
 });
 
 test('battery and relative-time primitives show the last reading without cached jargon or duplicate info controls',()=>{
@@ -669,20 +703,22 @@ test('shared control tokens replace invalid slider CSS and panel size patches',(
  assert.match(components,/\.snackbar--info/);
 });
 
-test('topbar uses reusable labelled actions for service, add, layout, theme, and refresh', () => {
-  const panel = renderTopbarActions({blindCount:3, panelMode:true, displayPreference:'panel'});
+test('topbar reuses named icon controls for settings, layout, theme, reset, and refresh', () => {
+  const panel = renderTopbarActions({blindCount:3, panelMode:true, demoMode:true, displayPreference:'panel'});
   assert.match(panel, /class="topbar-device-count">3 blinds<\/span>/);
   assert.match(panel, /data-action="add"[^>]*aria-label="Add a blind"/);
   assert.match(panel, /data-icon="add"/);
   assert.match(panel, /id="layout-mode-toggle"/);
-  assert.match(panel, /data-action="layout-menu-toggle"/);
+  assert.match(panel, /data-action="layout-cycle"/);
   assert.match(panel, /id="theme-toggle"/);
-  assert.match(panel, /id="layout-menu"/);
-  assert.match(panel, /id="theme-menu"/);
+  assert.doesNotMatch(panel, /id="layout-menu"|id="theme-menu"|More themes/);
   assert.match(panel, /data-action="refresh"[^>]*aria-label="Refresh"/);
   assert.match(panel, /data-icon="refresh"/);
   assert.match(panel, />Add a blind<\/span>/);
   assert.match(panel, />Refresh<\/span>/);
+  assert.match(panel, /data-action="demo-reset"[^>]*aria-label="Reset demo"/);
+  const regular=renderTopbarActions({panelMode:false});
+  assert.match(regular, /data-action="settings"[^>]*aria-label="Settings"/);
 
   for (const displayPreference of ['mobile', 'desktop']) {
     const regular = renderTopbarActions({blindCount:3, panelMode:false, displayPreference});
@@ -693,27 +729,28 @@ test('topbar uses reusable labelled actions for service, add, layout, theme, and
   }
 });
 
-test('panel topbar keeps a visibly labelled demo reset button when the banner is compacted away', () => {
+test('panel topbar keeps an accessible icon-only demo reset button when the banner is compacted away', () => {
   const panel = renderTopbarActions({panelMode:true, demoMode:true});
   const reset = parseMarkup(panel).querySelector('[data-action="demo-reset"]');
   assert.ok(reset);
   assert.equal(reset.getAttribute('aria-label'),'Reset demo');
-  assert.equal(reset.textContent,'Reset demo');
+  assert.equal(reset.textContent,'');
   assert.equal(reset.querySelector('svg')?.getAttribute('data-icon'),'reset');
+  assert.equal(reset.getAttribute('title'),'Reset demo');
 });
 
-test('grouped demo cards strip duplicated room names and keep stale time out of fresh cards', () => {
+test('room-aware cards show their room label and preserve a shared collection grid', () => {
   // Contract: UI-ROOM-01 in docs/test-contracts.md.
   const markup = renderBlindCard({
     id:'demo-living', label:'Living Room — Main Window', room:'Living Room', isSimulated:true,
-    lastSeen:'', availabilityLabel:'Online', positionPercent:75,
+    lastSeen:'', availabilityLabel:'Online', positionPercent:75, showRoom:true,
     movementStatus:'at_target', controlsMarkup:renderBlindActions({
       deviceId:'demo-living', blindLabel:'Living Room — Main Window',
     }),
   });
   const card = parseMarkup(markup);
   assert.equal(card.querySelector('.card-title')?.textContent, 'Main Window');
-  assert.equal(card.querySelector('.room-label'), null);
+  assert.equal(card.querySelector('.room-label')?.textContent, 'Living Room');
   assert.equal(card.querySelector('.device-kind'), null);
   assert.equal(card.querySelector('.last-seen'), null);
   assert.ok(card.querySelector('.card-title-chevron'));
@@ -724,6 +761,14 @@ test('grouped demo cards strip duplicated room names and keep stale time out of 
     movementStatus:'at_target', controlsMarkup:'',
   }));
   assert.equal(caseVariant.querySelector('.card-title')?.textContent, 'Side Window');
+  const groupsMarkup=renderRoomGroup({room:'Bedroom'})+renderRoomGroup({room:'Living Room'});
+  const collection=parseMarkup(renderRoomCollection({groupsMarkup,cardsMarkup:markup+renderBlindCard({
+    id:'bedroom',label:'Blackout Blind',room:'Bedroom',showRoom:true,availabilityLabel:'Online',positionPercent:0,
+    movementStatus:'at_target',controlsMarkup:'',
+  })}));
+  assert.equal(collection.querySelectorAll('.room-collection__grid').length,1);
+  assert.equal(collection.querySelector('.room-collection__grid')?.querySelectorAll('.card').length,2);
+  assert.deepEqual([...collection.querySelectorAll('.room-heading')].map(heading=>heading.textContent),['Bedroom','Living Room']);
   assert.deepEqual(
     [...card.querySelectorAll('.controls button')].map(button => [
       button.getAttribute('aria-label'), button.getAttribute('data-action'),
@@ -759,7 +804,6 @@ test('room picker offers Unassigned, existing names, and a custom room field', (
 test('room group provides reusable, accessible management actions', () => {
   const group = parseMarkup(renderRoomGroup({
     room:'Unassigned',
-    cardsMarkup:'<article>Blind</article>',
     actionsMarkup:'<button type="button" data-action="room-rename">Rename room</button>',
   }));
   assert.equal(group.querySelector('.room-heading')?.textContent, 'Unassigned');
