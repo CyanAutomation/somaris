@@ -5508,7 +5508,7 @@ async fn queue_batch(
         prune_journal(&mut inner, state.retained_command_limit);
         prune_batch_journal(&mut inner, state.retained_batch_limit);
         let mut enrollments: Vec<_> = if let Some(targets) = requested_targets.as_ref() {
-            let mut selected = Vec::with_capacity(targets.len());
+            let mut selected = Vec::new();
             for target_id in targets {
                 let Some(enrollment) = inner.enrollments.get(target_id) else {
                     return error_response(
