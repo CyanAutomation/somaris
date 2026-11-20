@@ -405,6 +405,24 @@ async fn targeted_batch_rejects_empty_duplicate_and_unknown_ids() {
     assert_eq!(unknown.unwrap()["error"]["code"], "enrollment_not_found");
 }
 
+#[tokio::test]
+async fn targeted_batch_rejects_more_than_the_maximum_target_count() {
+    let app = router(AppState::new());
+    let targets: Vec<_> = (0..1001)
+        .map(|index| format!("enrollment-{index}"))
+        .collect();
+    let (status, _, oversized) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "oversized-targets")],
+        Some(json!({"action": "close", "targets": targets})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(oversized.unwrap()["error"]["code"], "invalid_batch_targets");
+}
+
 async fn request(
     app: &Router,
     method: Method,
@@ -1595,6 +1613,10 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         contract["components"]["schemas"]["BatchCommandRequest"]["properties"]["targets"]["items"]
             ["type"],
         "string"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["BatchCommandRequest"]["properties"]["targets"]["maxItems"],
+        1000
     );
     assert_eq!(
         contract["components"]["schemas"]["Batch"]["properties"]["requested_targets"]["minItems"],

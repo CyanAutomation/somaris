@@ -101,6 +101,7 @@ const MAX_DEMO_BATCHES: usize = 64;
 const MAX_DEMO_HISTORY: usize = 5_000;
 const MAX_SIMULATOR_ENROLLMENTS: usize = 2;
 const MAX_COMMANDS: usize = 1000;
+const MAX_BATCH_TARGETS: usize = MAX_COMMANDS;
 const MAX_BATCHES: usize = 1000;
 const MAX_DISCOVERED_DEVICES: usize = 1024;
 const MAX_AUDIT_ENTRIES: usize = 30;
@@ -5456,6 +5457,13 @@ async fn queue_batch(
                 StatusCode::BAD_REQUEST,
                 "invalid_batch_targets",
                 "targets must contain at least one enrollment ID when provided.",
+            );
+        }
+        Some(targets) if targets.len() > MAX_BATCH_TARGETS => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_batch_targets",
+                "targets must not contain more than 1000 enrollment IDs.",
             );
         }
         Some(targets) => {
