@@ -136,6 +136,41 @@ async fn rooms_can_be_assigned_renamed_removed_and_cleared_without_changing_enro
 }
 
 #[tokio::test]
+async fn clearing_a_room_does_not_rename_the_blind_label() {
+    let app = router(AppState::new());
+    let (status, _, enrolled) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({
+            "observed_device_id": "simulator-1",
+            "label": "Kitchen — Kitchen — Main Window",
+            "room": "Kitchen"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let enrolled = enrolled.unwrap()["data"].clone();
+    let enrollment_id = enrolled["id"].as_str().unwrap();
+    assert_eq!(enrolled["label"], "Kitchen — Main Window");
+
+    let (status, _, cleared) = request(
+        &app,
+        Method::PATCH,
+        &format!("/api/control/v1/devices/{enrollment_id}"),
+        &[],
+        Some(json!({"room": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        cleared.unwrap()["data"]["enrollment"]["label"],
+        "Kitchen — Main Window"
+    );
+}
+
+#[tokio::test]
 async fn room_assignments_survive_a_service_restart() {
     let directory = tempfile::tempdir().unwrap();
     let state_path = directory.path().join("state.json");
