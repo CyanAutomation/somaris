@@ -9,6 +9,7 @@ import {
   renderDismissButton,
   renderDemoBanner,
   renderRoomGroup,
+  renderRoomCollection,
   renderRoomPicker,
   roomFromChoice,
   renderServiceSummary,
@@ -26,7 +27,8 @@ import {
   renderRelativeTime,
   relativeTimeLabel,
   renderActivitySection,
-  renderServiceHealthSummary,
+  renderBackButton,
+  renderSettingsPage,
   renderMotorSpeedControl,
   renderCalibrationControls,
   renderEmptyState,
@@ -68,6 +70,7 @@ import type {
 export {escapeHtml};
 const displayModes = new Set<DisplayPreference>(DISPLAY_MODE_OPTIONS.map(([value]) => value));
 const themeModes = new Set(['auto','dark','light','high-contrast']);
+export function isThemePreference(preference:string):boolean { return themeModes.has(preference); }
 const displayPreferenceCycle: DisplayPreference[] = DISPLAY_MODE_OPTIONS.map(([value]) => value);
 export function nextDisplayPreference(preference: string): DisplayPreference {
   const index = displayPreferenceCycle.indexOf(preference as DisplayPreference);
@@ -85,20 +88,6 @@ export function displayPreferenceFrom(search: string | null | undefined, saved: 
   const requested = new URLSearchParams(search || '').get('view');
   if (requested && displayModes.has(requested as DisplayPreference)) return requested as DisplayPreference;
   return saved && displayModes.has(saved as DisplayPreference) ? saved as DisplayPreference : 'auto';
-}
-function menuChoicePreference(action: string, operation: string, value: string): string | null {
- if(operation!=='set')return null;
- if(action==='display'&&displayModes.has(value as DisplayPreference))return value;
- if(action==='theme'&&themeModes.has(value))return value;
- return null;
-}
-export function dispatchMenuChoice(action: string, operation: string, value: string, apply: (kind:'display'|'theme', preference:string)=>void): boolean {
- const preference=menuChoicePreference(action,operation,value);
- if(!preference)return false;
- if(action==='display')apply('display',preference);
- else if(action==='theme')apply('theme',preference);
- else return false;
- return true;
 }
 export function resolveActionFocus({
   focusedAction = null,
@@ -611,6 +600,7 @@ export function renderManagedDeviceCard(
  dashboard: DashboardState,
  panelMode: boolean,
  now = Date.now(),
+ showRoom = false,
 ): string {
  const e=device.enrollment, o=observationFor(device,dashboard.observations), [label,tone]=availability(device.availability), p=device.position?.current_closed_percent;
  const blindLabel=e.label ?? 'Blind';
@@ -644,10 +634,11 @@ export function renderManagedDeviceCard(
   controlsMarkup, messageMarkup, footerMarkup, panelMode,
   supportsPosition:device.capabilities?.set_position===true,
   showPositionCue:!positionCueDismissed&&dashboard.managed.find(item=>item.capabilities?.set_position===true)?.enrollment.id===e.id,
+  showRoom:showRoom&&!panelMode,
  });
 }
-function card(device: ManagedDevice): string {
- return renderManagedDeviceCard(device,state,document.documentElement.dataset.displayMode==='panel');
+function card(device: ManagedDevice, showRoom = false): string {
+ return renderManagedDeviceCard(device,state,document.documentElement.dataset.displayMode==='panel',Date.now(),showRoom);
 }
 function roomGroupMarkup(room: string, devices: ManagedDevice[]): string {
  const encoded=encodeURIComponent(room);
@@ -661,7 +652,6 @@ function roomGroupMarkup(room: string, devices: ManagedDevice[]): string {
  }
  return renderRoomGroup({
   room,
-  cardsMarkup:devices.map(card).join(''),
   actionsMarkup,
   managementMarkup,
  });
@@ -698,12 +688,15 @@ function home() {
     })),{
      room:'Unassigned',
      devices:state.managed.filter(device=>!device.enrollment.room),
-    }].filter(group=>group.devices.length).map(group=>roomGroupMarkup(group.room,group.devices)).join('')
-  : '';
+    }].filter(group=>group.devices.length)
+  : [];
+ const roomGroupsMarkup=roomGroups.map(group=>roomGroupMarkup(group.room,group.devices)).join('');
+ const roomCardsMarkup=roomGroups.flatMap(group=>group.devices).map(device=>card(device,true)).join('');
+ const groupsMarkup=roomGroups.length?renderRoomCollection({groupsMarkup:roomGroupsMarkup,cardsMarkup:roomCardsMarkup}):'';
  const listMarkup=renderDeviceList({
   count:state.managed.length, panelMode,
-  cardsMarkup:state.managed.map(card).join(''), emptyMarkup:loadingError||empty, toolbarMarkup:batchControls,
-  groupsMarkup:roomGroups,
+  cardsMarkup:state.managed.map(device=>card(device)).join(''), emptyMarkup:loadingError||empty, toolbarMarkup:batchControls,
+  groupsMarkup,
  });
  const serviceMarkup=renderServiceSummary(scannerSummary());
  const demoHint=state.demoMode&&!hintDismissed&&!panelMode?`<aside class="demo-hint"><span>${renderIcon('target')} Drag a blind graphic to set its position, or use Open, Stop, and Close for quick moves.</span>${renderDismissButton({label:'Dismiss demo hint',action:'demo-hint-dismiss',variant:'demo-hint-dismiss'})}</aside>`:'';
@@ -715,7 +708,7 @@ function home() {
  return renderHomeContent({deviceListMarkup:listMarkup,demoHintMarkup:demoHint,supportingMarkup:supportingSections});
 }
 function scannerSummary(){ const s=state.diagnostics?.scanner; if(state.demoMode)return state.diagnostics?.simulator_ready?'Everything is working':'Simulator unavailable'; if(!s) return 'Service status unavailable'; return s.adapter_available ? (s.scan_active?'Bluetooth adapter available · scanning':'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
-function back(){ return `<div class="back-navigation">${renderButton({label:'Back to blinds',action:'home',icon:'back',variant:'back-button'})}</div>`; }
+function back(){ return renderBackButton(); }
 function addPage(){
  const available=state.observations.filter(o=>!state.managed.some(m=>m.enrollment.logical_id===o.logical_id && !!m.enrollment.is_simulated===!!o.is_simulated));
  const intro=state.demoMode?'This demo lists simulated blinds only; Bluetooth discovery is unavailable here.':'Choose a recently discovered blind to make it available for control.';
@@ -857,11 +850,10 @@ function serviceStatusSummary():string {
  if(state.demoMode)return state.diagnostics?.simulator_ready?'Everything is working':'The simulator is unavailable';
  return state.diagnostics?.scanner?.adapter_available?'Everything is working':'Bluetooth scanning is unavailable';
 }
-function servicePage(): string {
+function settingsPage(): string {
  const data=serviceStatusFields();
- const simulatorSection=simulatorControlsForMode();
  const notUsedMarkup=state.demoMode?renderInfoGrid(data.notUsed):'';
- return `${back()}<h1 class="page-title">Service status</h1>${renderServiceHealthSummary({summary:serviceStatusSummary(),fields:data.fields,notUsedMarkup})}${simulatorSection}`;
+ return renderSettingsPage({themePreference,serviceSummary:serviceStatusSummary(),serviceFields:data.fields,notUsedMarkup,simulatorMarkup:simulatorControlsForMode()});
 }
 function simulatorControlsForMode(): string {
  return state.demoMode?'':simulatorControls();
@@ -869,7 +861,7 @@ function simulatorControlsForMode(): string {
 function page(): string {return location.hash.slice(1)||'home'}
 function pageContent(route: string): string {
  if(route==='add')return addPage();
- if(route==='service')return servicePage();
+ if(route==='settings'||route==='service')return settingsPage();
  if(route.startsWith('details/'))return detailPage(decodeURIComponent(route.slice(8)));
  return home();
 }
@@ -1509,13 +1501,6 @@ export function parseActionValue(value: string | undefined): [string, string, st
  return [action, argument, id];
 }
 
-export function dispatchMenuActionValue(value: string | undefined, apply: (kind:'display'|'theme', preference:string)=>void): boolean {
- const [action,operation,preference]=parseActionValue(value);
- if(action!=='display'&&action!=='theme')return false;
- dispatchMenuChoice(action,operation,preference,apply);
- return true;
-}
-
 function isBlindAction(action: string | undefined): action is import('./types.mjs').BlindAction {
  return action !== undefined && [
   'open','close','stop','toggle','set_position','set_motor_speed',
@@ -1545,50 +1530,12 @@ function changeDisplayMode(preference: string, applyDisplayMode: () => boolean):
  document.getElementById('layout-mode-toggle')?.focus({preventScroll:true});
 }
 
-function changeTheme(preference: string): void {
- if(!themeModes.has(preference))return;
+function changeTheme(preference: string, focusTargetId='theme-toggle'): void {
+ if(!isThemePreference(preference))return;
  themePreference=preference;
  try { globalThis.localStorage?.setItem('somaris-theme',themePreference); } catch { /* Current selection still applies for this page. */ }
  render();
- document.getElementById('theme-toggle')?.focus({preventScroll:true});
-}
-
-function closeDisplayMenu(returnFocus = false): void {
- for(const [menuId,triggerId] of [['layout-menu','layout-mode-toggle'],['theme-menu','theme-menu-toggle']] as const){
-  const menu=document.getElementById(menuId);
-  const trigger=document.getElementById(triggerId);
-  if(menu instanceof HTMLElement)menu.hidden=true;
-  trigger?.setAttribute('aria-expanded','false');
- }
- if(returnFocus){
-  const trigger=document.getElementById('layout-mode-toggle') as HTMLElement|null;
-  const themeTrigger=document.getElementById('theme-menu-toggle') as HTMLElement|null;
-  (themeTrigger?.dataset.wasOpen==='true'?themeTrigger:trigger)?.focus({preventScroll:true});
-  if(themeTrigger)delete themeTrigger.dataset.wasOpen;
- }
-}
-
-function toggleDisplayMenu(): void {
- const menu=document.querySelector<HTMLElement>('#layout-menu');
- const trigger=document.querySelector<HTMLButtonElement>('#layout-mode-toggle');
- if(!menu||!trigger)return;
- const wasOpen=!menu.hidden;
- closeDisplayMenu();
- menu.hidden=wasOpen;
- trigger.setAttribute('aria-expanded',String(!menu.hidden));
- if(!menu.hidden)menu.querySelector<HTMLElement>('[aria-checked="true"]')?.focus({preventScroll:true});
-}
-
-function toggleThemeMenu():void {
- const menu=document.querySelector<HTMLElement>('#theme-menu');
- const trigger=document.querySelector<HTMLButtonElement>('#theme-menu-toggle');
- if(!menu||!trigger)return;
- const wasOpen=!menu.hidden;
- closeDisplayMenu();
- menu.hidden=wasOpen;
- trigger.dataset.wasOpen=String(!menu.hidden);
- trigger.setAttribute('aria-expanded',String(!menu.hidden));
- if(!menu.hidden)menu.querySelector<HTMLElement>('[aria-checked="true"]')?.focus({preventScroll:true});
+ document.getElementById(focusTargetId)?.focus({preventScroll:true});
 }
 
 function toggleTheme():void {
@@ -1649,8 +1596,7 @@ type ClickActionHandler = (
 
 const clickActionHandlers: Record<string, ClickActionHandler> = {
  'snackbar-dismiss':(_argument,_id,deviceId)=>{snackbarQueue.dismiss(deviceId);return true;},
- 'layout-menu-toggle':()=>{toggleDisplayMenu();return true;},
- 'theme-menu-toggle':()=>{toggleThemeMenu();return true;},
+ 'layout-cycle':(_argument,_id,_deviceId,applyDisplayMode)=>{changeDisplayMode(nextDisplayPreference(displayPreference),applyDisplayMode);return true;},
  'theme-toggle':()=>{toggleTheme();return true;},
  command:(argument,id)=>dispatchBlindCommand(argument,id),
  batch:argument=>handleBatchClick(argument),
@@ -1856,9 +1802,6 @@ if(app){
  window.addEventListener('offline',()=>{serviceFailure(state,new Error('Network unavailable'));render();});
  window.addEventListener('online',()=>{void refresh();});
  document.addEventListener('keydown',(event:KeyboardEvent)=>{
-  const layoutMenu=document.querySelector<HTMLElement>('#layout-menu');
-  const themeMenu=document.querySelector<HTMLElement>('#theme-menu');
-  if(event.key==='Escape'&&((layoutMenu&&!layoutMenu.hidden)||(themeMenu&&!themeMenu.hidden))){event.preventDefault();closeDisplayMenu(true);}
   const graphic=closestHtmlElement(event.target,'[data-position-graphic]');
   const range=closestHtmlElement(event.target,'[data-position-input]');
   if(!graphic&&!(range instanceof HTMLInputElement))return;
@@ -1884,23 +1827,10 @@ if(app){
   if(graphic){const id=graphic.dataset.positionGraphic||'';commitPosition(id,Number(graphic.getAttribute('aria-valuenow')||0));}
   else if(range instanceof HTMLInputElement){const id=range.dataset.positionInput||'';commitPosition(id,Number(range.value));}
  });
- document.addEventListener('pointerdown',(event:PointerEvent)=>{
-  const layout=document.querySelector<HTMLElement>('.layout-picker');
-  const theme=document.querySelector<HTMLElement>('.theme-picker');
-  const within=layout?.contains(event.target as Node)||theme?.contains(event.target as Node);
-  if(!within)closeDisplayMenu();
- });
  actionRoot.addEventListener('click', (event: MouseEvent)=>{
   const target=closestHtmlElement(event.target,'[data-action]');
   if(!target)return;
   const actionValue=target.dataset.action;
-  if(dispatchMenuActionValue(actionValue,(kind,preference)=>{
-   if(kind==='display')changeDisplayMode(preference,applyDisplayMode);
-   else changeTheme(preference);
-  })){
-   closeDisplayMenu();
-   return;
-  }
   const [action,argument,id]=parseActionValue(actionValue);
   dispatchClickAction(action,argument,id,applyDisplayMode);
  });
@@ -1980,6 +1910,11 @@ if(app){
   previewPosition(id,Number(range.value));
  });
  app.addEventListener('change',(event:Event)=>{
+  const themePreferenceControl=closestHtmlElement(event.target,'[data-theme-preference]');
+  if(themePreferenceControl instanceof HTMLSelectElement){
+   changeTheme(themePreferenceControl.value,themePreferenceControl.id);
+   return;
+  }
   const roomChoice=closestHtmlElement(event.target,'[data-room-choice]');
   if(roomChoice instanceof HTMLSelectElement){
    const picker=roomChoice.closest('.room-picker');

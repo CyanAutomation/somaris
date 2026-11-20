@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, closedPercentFromOpenPercent, commandAwareMovementStatus, commandMessage, displayPreferenceFrom, dispatchMenuActionValue, dispatchMenuChoice, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, motionFeedbackLabel, nextDisplayPreference, observationFor, openPercentFromClosedPercent, positionCommandMessage, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
+import {activityMessage, availability, batchEligibleCount, buildCommandRequestBody, closedPercentFromOpenPercent, commandAwareMovementStatus, commandMessage, displayPreferenceFrom, escapeHtml, gattReadinessLabel, gattTransportEvidenceLabel, handleCommandPollFailure, isThemePreference, motionFeedbackLabel, nextDisplayPreference, observationFor, openPercentFromClosedPercent, positionCommandMessage, refreshCommandTelemetry, refreshService, relativeAt, resetDemo, resolveDisplayMode, shouldPauseRefresh, validateDisplayName} from '../app.mjs';
 import type {ActivityEntry, ApiError, ApiRequest, BatchState, CommandRecord, DashboardState, ManagedDevice, Notification, RefreshTarget} from '../types.mjs';
 
 type CommandTarget = RefreshTarget & {
@@ -256,17 +256,10 @@ test('action data parsing preserves encoded identifiers and ignores extra segmen
  assert.deepEqual(parseActionValue('remove:blind-1:ignored'), ['remove','blind-1','ignored']);
 });
 
-test('display and theme action values dispatch supported preferences', () => {
+test('theme settings accept the supported preferences and reject unknown values', () => {
  // Contract: UI-PREF-01 in docs/test-contracts.md.
- const choices:Array<[string,string]>=[];
- const apply=(kind:'display'|'theme',preference:string)=>choices.push([kind,preference]);
- assert.equal(dispatchMenuActionValue('display:set:panel',apply),true);
- assert.equal(dispatchMenuActionValue('theme:set:light',apply),true);
- assert.equal(dispatchMenuActionValue('command:open:blind-1',apply),false);
- assert.equal(dispatchMenuChoice('display','set','unknown',apply),false);
- assert.equal(dispatchMenuChoice('theme','set','unknown',apply),false);
- assert.equal(dispatchMenuActionValue('theme:set:unknown',apply),true);
- assert.deepEqual(choices,[['display','panel'],['theme','light']]);
+ assert.deepEqual(['auto','dark','light','high-contrast'].map(isThemePreference),[true,true,true,true]);
+ assert.equal(isThemePreference('unknown'),false);
 });
 
 test('command dispatch decodes the device ID before sending the command', async () => {
