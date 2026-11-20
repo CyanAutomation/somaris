@@ -682,10 +682,10 @@ async fn cors_preflight_requires_an_explicit_allowed_origin() {
     let (status, headers, _) = request(
         &app,
         Method::OPTIONS,
-        "/api/v1/devices",
+        "/api/control/v1/devices/probe",
         &[
             ("origin", "https://console.example"),
-            ("access-control-request-method", "GET"),
+            ("access-control-request-method", "PATCH"),
         ],
         None,
     )
@@ -698,6 +698,15 @@ async fn cors_preflight_requires_an_explicit_allowed_origin() {
             .to_str()
             .unwrap(),
         "https://console.example"
+    );
+    assert!(
+        headers
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(',')
+            .any(|method| method.trim() == "PATCH")
     );
 
     let (status, headers, _) = request(

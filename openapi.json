@@ -3,7 +3,7 @@
   "info": {
     "title": "Somaris API",
     "version": "1.3.0",
-    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, percentage-position, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes typed supported commands. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. Two built-in simulators remain available for software development under the distinct names Somaris Simulator 1 and Somaris Simulator 2. Their positions and failure settings are independent, and simulated commands never use Bluetooth. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. BLE scans use bounded windows and yield exclusive adapter access to GATT operations between windows. The control API has no authentication and is intended for a trusted network; CORS is not authentication. SOMARIS_DEMO_MODE is opt-in and creates a simulator-only demo. In demo mode, stateful device, simulator, command, batch, and activity API paths require the HttpOnly somaris-demo-session cookie returned by POST /api/demo/session. The cookie isolates visitor state; it is not authentication. Demo sessions are held in memory, expire after 30 minutes idle, are limited to 32 active sessions, and are lost on service restart. Demo mutations require a same-origin Origin header; CORS is not an access-control boundary."
+    "description": "Somaris exposes read-only SOMA V2 advertisement telemetry and asynchronous, idempotent open, close, stop, percentage-position, and toggle commands for enrolled blinds. Physical discovery uses manufacturer advertisements; control resolves a fresh unique name, verifies identity and GATT services, then writes typed supported commands. Battery voltage is read from BA71 in the background for enrolled blinds. Position values are observations, not command acknowledgements. Two built-in simulators remain available for software development under the distinct names Somaris Simulator 1 and Somaris Simulator 2. Their positions and failure settings are independent, and simulated commands never use Bluetooth. Command and batch records are persisted in a bounded single-process journal. Browser preflights require exact HTTP or HTTPS origins from SOMARIS_ALLOWED_ORIGINS; the default allowlist is empty. Queue defaults are 1000 outstanding commands, 32 per device, one adapter operation at a time, and a 120-second queue wait. BLE scans use bounded windows and yield exclusive adapter access to GATT operations between windows. The control API has no authentication and is intended for a trusted network; CORS is not authentication. SOMARIS_DEMO_MODE is opt-in and creates a simulator-only demo. In demo mode, stateful device, simulator, command, batch, and activity API paths require the HttpOnly somaris-demo-session cookie returned by POST /api/demo/session. The cookie isolates visitor state; it is not authentication. Demo sessions are held in memory, expire after 30 minutes idle, are limited to 32 active sessions, and are lost on service restart. Demo mutations require a same-origin Origin header; CORS is not an access-control boundary. Enrolled blinds carry an optional room label; room labels are case-insensitively unique, exist while assigned, and do not require a separate room record. Room assignment, rename, and removal are exposed through the control API. Selected batch targets are enrollment IDs and are fixed at acceptance."
   },
   "servers": [
     {
@@ -828,6 +828,45 @@
             "$ref": "#/components/responses/Error"
           }
         }
+      },
+      "patch": {
+        "operationId": "updateManagedDeviceRoom",
+        "summary": "Assign an enrolled blind to a room or Unassigned",
+        "description": "Updates only the room label on the enrollment. Use null for Unassigned. Existing enrollment IDs and telemetry history are retained. Room labels are trimmed, limited to 40 characters, and matched case-insensitively.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoomAssignmentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated managed device.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedDeviceEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
       }
     },
     "/api/control/v1/devices/{id}/motor-settings": {
@@ -1097,14 +1136,14 @@
     "/api/control/v1/batches": {
       "post": {
         "operationId": "submitBlindBatch",
-        "summary": "Queue an action for all currently ready enrolled blinds",
-        "description": "The service snapshots enrolled blinds with a unique, fresh supported observation at acceptance. Enrollments that are not seen, stale, ambiguous, or in a movement cooldown are returned in skipped and do not count as failures; Stop batches bypass cooldown. The durable batch processes targets sequentially in label order. Stop batches cancel queued movement and preempt in-flight movement before its GATT write on every accepted target, reserve adapter access for the batch, make one attempt for each blind, then retry eligible confirmed pre-write failures. Each target rechecks identity and freshness before connecting and reports its ordinary child command status. A failed target does not prevent later targets from running. A batch is idempotent by its required Idempotency-Key; repeating that key with another action returns 409. A write_acknowledged child does not confirm physical movement. If no enrolled blind is eligible for the requested action, the request returns 409 no_available_blinds.",
+        "summary": "Queue an action for all ready enrolled blinds or an explicit enrollment-ID subset",
+        "description": "The service snapshots enrolled blinds with a unique, fresh supported observation at acceptance. Enrollments that are not seen, stale, ambiguous, or in a movement cooldown are returned in skipped and do not count as failures; Stop batches bypass cooldown. The durable batch processes targets sequentially in label order. Stop batches cancel queued movement and preempt in-flight movement before its GATT write on every accepted target, reserve adapter access for the batch, make one attempt for each blind, then retry eligible confirmed pre-write failures. Each target rechecks identity and freshness before connecting and reports its ordinary child command status. A failed target does not prevent later targets from running. A batch is idempotent by its required Idempotency-Key; repeating that key with a different action or target selection returns 409. Explicit targets are captured in the durable batch record. A write_acknowledged child does not confirm physical movement. If no enrolled blind is eligible for the requested action, the request returns 409 no_available_blinds.",
         "parameters": [
           {
             "name": "Idempotency-Key",
             "in": "header",
             "required": true,
-            "description": "Client-generated key for this batch. Repeating the same key and action returns the original batch record.",
+            "description": "Client-generated key for this batch. Repeating the same key, action, and target selection returns the original batch record.",
             "schema": {
               "type": "string",
               "minLength": 1,
@@ -1230,7 +1269,7 @@
       "get": {
         "operationId": "getRecentActivity",
         "summary": "Read the latest 30 changes and control outcomes",
-        "description": "Returns the most recent enrollment changes, command outcomes, batch outcomes, and simulator changes, newest first. This bounded activity log is stored with persistent service state and does not require SOMARIS_HISTORY_PATH. Caller identity is not available because the control API has no authentication. In demo mode this activity belongs only to the cookie-scoped visitor session and is cleared by POST /api/demo/reset.",
+        "description": "Returns the most recent enrollment and room changes, command outcomes, batch outcomes, and simulator changes, newest first. This bounded activity log is stored with persistent service state and does not require SOMARIS_HISTORY_PATH. Caller identity is not available because the control API has no authentication. In demo mode this activity belongs only to the cookie-scoped visitor session and is cleared by POST /api/demo/reset.",
         "responses": {
           "200": {
             "description": "Up to 30 recent activity entries.",
@@ -1539,6 +1578,166 @@
       "options": {
         "operationId": "preflightDemoReset",
         "summary": "Same-origin browser preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/api/control/v1/rooms": {
+      "get": {
+        "operationId": "listRooms",
+        "summary": "List room labels currently assigned to blinds",
+        "description": "Rooms are a projection of enrollment room labels, not separately persisted records. A room exists while at least one enrolled blind carries the label.",
+        "parameters": [
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "Weak ETag received from an earlier response.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current room labels with assigned blind counts.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomListEnvelope"
+                }
+              }
+            },
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/ETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/ConditionalCacheControl"
+              }
+            }
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightRooms",
+        "summary": "Browser CORS preflight",
+        "responses": {
+          "204": {
+            "description": "Preflight accepted for a configured browser origin."
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ]
+    },
+    "/api/control/v1/rooms/{name}": {
+      "parameters": [
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "description": "Current room label. Matching is case-insensitive.",
+          "schema": {
+            "type": "string",
+            "maxLength": 40
+          }
+        },
+        {
+          "$ref": "#/components/parameters/DemoSessionCookie"
+        }
+      ],
+      "patch": {
+        "operationId": "renameRoom",
+        "summary": "Rename a room label on all assigned blinds",
+        "description": "Updates every enrollment carrying this room label in one persisted state change. A name already used by another room returns 409. The room label must remain non-empty, at most 40 characters, and cannot be Unassigned.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameRoomRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Room rename result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomMutationEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "removeRoom",
+        "summary": "Remove a room and unassign its blinds",
+        "description": "Clears the room label from every currently assigned enrollment. Enrollment IDs and telemetry history are retained.",
+        "responses": {
+          "200": {
+            "description": "Room removal result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoomMutationEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "405": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "options": {
+        "operationId": "preflightRoom",
+        "summary": "Browser CORS preflight",
         "responses": {
           "204": {
             "description": "Preflight accepted for a configured browser origin."
@@ -2119,6 +2318,9 @@
         "enum": [
           "enrollment_added",
           "enrollment_removed",
+          "room_removed",
+          "room_renamed",
+          "room_assignment_changed",
           "command",
           "batch",
           "simulator_settings_changed",
@@ -2492,6 +2694,15 @@
             "minLength": 1,
             "maxLength": 64,
             "description": "User-facing name for the managed blind."
+          },
+          "room": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 40,
+            "description": "Optional room label. Omit or use null for Unassigned. Non-null labels are trimmed and matched case-insensitively.",
+            "minLength": 1
           }
         }
       },
@@ -2530,7 +2741,8 @@
           },
           "room": {
             "type": "string",
-            "description": "Optional room fixture label for a seeded demo blind."
+            "maxLength": 40,
+            "description": "Optional room label. Absent means Unassigned. Room labels are assigned to one or more enrollments and are not separate persisted records."
           }
         }
       },
@@ -2975,6 +3187,16 @@
               "close",
               "stop"
             ]
+          },
+          "targets": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000,
+            "uniqueItems": true,
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional enrollment IDs to target. Omit to preserve the existing all-ready-enrolled-blinds behavior. Explicit targets are snapshotted when the batch is accepted."
           }
         }
       },
@@ -3112,6 +3334,15 @@
           "pending_count": {
             "type": "integer",
             "minimum": 0
+          },
+          "requested_targets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Explicit enrollment IDs requested by the caller. Absent means all enrolled blinds were considered.",
+            "minItems": 1,
+            "uniqueItems": true
           }
         }
       },
@@ -3623,6 +3854,113 @@
             "minLength": 1,
             "maxLength": 64,
             "description": "Optional safety assertion copied from the current managed-device list. Somaris rejects the toggle if it does not match the enrollment identified by the path ID."
+          }
+        }
+      },
+      "RoomAssignmentRequest": {
+        "type": "object",
+        "required": [
+          "room"
+        ],
+        "properties": {
+          "room": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 40,
+            "description": "Room label to assign, or null for Unassigned. Empty and the reserved label Unassigned are rejected."
+          }
+        }
+      },
+      "RenameRoomRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40,
+            "description": "New room label. Matching is case-insensitive; a label used by another room returns 409."
+          }
+        }
+      },
+      "RoomSummary": {
+        "type": "object",
+        "required": [
+          "name",
+          "blind_count"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "blind_count": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "RoomMutationResult": {
+        "type": "object",
+        "required": [
+          "room",
+          "updated_count"
+        ],
+        "properties": {
+          "room": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "updated_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "RoomListEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RoomSummary"
+            }
+          },
+          "meta": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/Meta"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "count"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "RoomMutationEnvelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "meta"
+        ],
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/RoomMutationResult"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
           }
         }
       }

@@ -140,6 +140,32 @@ button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,te
 .controls .position-preset[aria-pressed="true"]{border-color:var(--color-accent);background:var(--token-focus);color:var(--token-on-accent)}
 .room-group__grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr))}
 @media(max-width:700px){.room-group__grid{grid-template-columns:minmax(0,1fr)}}
+.room-group__heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 10px}
+.room-group__heading .room-heading{margin:0}
+.room-group__actions{display:flex;align-items:center;gap:8px;flex:none}
+.room-group__actions .button{min-height:44px;padding:9px 14px}
+.room-group__management{display:grid;gap:10px;margin:0 0 14px;padding:16px;border:1px solid var(--color-border);border-radius:16px;background:var(--color-surface)}
+.room-group__management .field{margin:0}
+.room-group__management .room-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.room-picker{display:grid;grid-template-columns:minmax(160px,1fr) minmax(160px,1fr);gap:10px;align-items:start}
+.room-picker .field{margin:0}
+.room-picker select,.room-picker input{min-height:44px}
+.room-picker__custom-field[hidden]{display:none}
+.room-assignment{margin-top:18px}
+.room-assignment h2{margin:0;font-size:18px}
+.room-assignment>p{margin:0;color:var(--color-muted);line-height:1.5}
+.room-assignment form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:end}
+.room-assignment form .room-picker{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+.room-assignment__actions .button{min-height:44px}
+.room-assignment .room-picker__custom-field{grid-column:2}
+@media(max-width:600px){
+ .room-group__heading{align-items:stretch;flex-direction:column}
+ .room-group__actions{width:100%}
+ .room-group__actions .button{flex:1}
+ .room-picker,.room-assignment form,.room-assignment form .room-picker{grid-template-columns:minmax(0,1fr)}
+ .room-assignment .room-picker__custom-field{grid-column:1}
+ .room-assignment__actions .button{width:100%}
+}
 
 .status-indicator{display:grid;place-items:center;flex:none;width:var(--status-indicator-size);min-width:var(--status-indicator-size);height:var(--status-indicator-size);border-radius:10px;background:var(--token-good-bg);color:var(--color-good)}
 .status-indicator .ui-icon{width:22px;height:22px}
