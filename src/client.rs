@@ -36,6 +36,14 @@ pub enum RemoteAction {
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteBatchAction {
+    Open,
+    Close,
+    Stop,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalibrationAction {
     Start,
@@ -146,6 +154,16 @@ impl RemoteApiClient {
         .await
     }
 
+    pub async fn get_rooms(&self) -> Result<Value, String> {
+        self.send_json(
+            Method::GET,
+            self.endpoint_url(&["api", "control", "v1", "rooms"])?,
+            None,
+            "Failed to get rooms",
+        )
+        .await
+    }
+
     pub async fn enroll_device(
         &self,
         observed_device_id: &str,
@@ -162,6 +180,86 @@ impl RemoteApiClient {
             "Failed to enroll device",
         )
         .await
+    }
+
+    pub async fn enroll_device_in_room(
+        &self,
+        observed_device_id: &str,
+        label: &str,
+        room: Option<&str>,
+    ) -> Result<Value, String> {
+        validate_device_id(observed_device_id)?;
+        self.send_json(
+            Method::POST,
+            self.endpoint_url(&["api", "control", "v1", "devices"])?,
+            Some(json!({
+                "observed_device_id": observed_device_id,
+                "label": label,
+                "room": room,
+            })),
+            "Failed to enroll device",
+        )
+        .await
+    }
+
+    pub async fn update_device_room(
+        &self,
+        managed_device_id: &str,
+        room: Option<&str>,
+    ) -> Result<Value, String> {
+        self.send_json(
+            Method::PATCH,
+            self.device_url("api/control/v1/devices", managed_device_id)?,
+            Some(json!({"room": room})),
+            "Failed to update device room",
+        )
+        .await
+    }
+
+    pub async fn rename_room(&self, room: &str, name: &str) -> Result<Value, String> {
+        let url = append_segment(self.endpoint_url(&["api", "control", "v1", "rooms"])?, room)?;
+        self.send_json(
+            Method::PATCH,
+            url,
+            Some(json!({"name": name})),
+            "Failed to rename room",
+        )
+        .await
+    }
+
+    pub async fn remove_room(&self, room: &str) -> Result<Value, String> {
+        let url = append_segment(self.endpoint_url(&["api", "control", "v1", "rooms"])?, room)?;
+        self.send_json(Method::DELETE, url, None, "Failed to remove room")
+            .await
+    }
+
+    pub async fn submit_batch(
+        &self,
+        action: RemoteBatchAction,
+        target_ids: Option<&[String]>,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        validate_idempotency_key(idempotency_key)?;
+        if let Some(targets) = target_ids
+            && (targets.is_empty()
+                || targets
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    != targets.len())
+        {
+            return Err("Batch targets must be non-empty and contain no duplicates.".into());
+        }
+        let mut body = json!({"action": action});
+        if let Some(targets) = target_ids {
+            body["targets"] = json!(targets);
+        }
+        let request = self
+            .client
+            .post(self.endpoint_url(&["api", "control", "v1", "batches"])?)
+            .header("Idempotency-Key", idempotency_key)
+            .json(&body);
+        self.send_request(request, "Failed to submit batch").await
     }
 
     pub async fn remove_enrollment(&self, managed_device_id: &str) -> Result<Value, String> {

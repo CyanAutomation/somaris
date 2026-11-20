@@ -1,4 +1,4 @@
-import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderBatteryReading, renderRelativeTime, relativeTimeLabel, renderActivitySection, renderServiceHealthSummary, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderAddDeviceEmptyState, renderHomeContent, renderDisclosure, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
+import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderRoomPicker, roomFromChoice, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderBatteryReading, renderRelativeTime, relativeTimeLabel, renderActivitySection, renderServiceHealthSummary, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderAddDeviceEmptyState, renderHomeContent, renderDisclosure, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
 import { SnackbarQueue } from './snackbar.mjs';
 import { mountClock } from './clock.mjs';
 export { escapeHtml };
@@ -104,6 +104,9 @@ export function activityMessage(activity) {
     switch (activity.kind) {
         case 'enrollment_added': return `Added ${subject}`;
         case 'enrollment_removed': return `Removed ${subject}`;
+        case 'room_assignment_changed': return `Updated room assignment · ${subject}`;
+        case 'room_renamed': return `Renamed room · ${subject}`;
+        case 'room_removed': return `Removed room · ${subject}`;
         case 'command': return `${action} command${status ? ` · ${status}` : ''} · ${subject}`;
         case 'batch': return `${action} batch${status ? ` · ${status}` : ''} · ${subject}`;
         case 'simulator_settings_changed': return `Updated simulator settings · ${subject}${activity.detail ? ` · ${activity.detail}` : ''}`;
@@ -147,6 +150,8 @@ let themePreference = storedPreference('somaris-theme', 'auto');
 let hintDismissed = storedFlag('somaris-demo-hint-dismissed');
 let positionCueDismissed = storedFlag('somaris-position-cue-dismissed');
 let activityCollapsedByUser = null;
+let editingRoomName = null;
+let confirmingRoomRemoval = null;
 let positionInteraction = false;
 const positionStartValues = new Map();
 let positionInteractionId = null;
@@ -299,6 +304,25 @@ export function validateDisplayName(value) {
         return 'Use 64 characters or fewer.';
     return '';
 }
+export function validateRoomName(value) {
+    const room = value.trim();
+    if (!room)
+        return 'Enter a room name.';
+    if ([...room].length > 40)
+        return 'Use 40 characters or fewer.';
+    if (room.toLowerCase() === 'unassigned')
+        return 'Choose another name; Unassigned is reserved.';
+    return '';
+}
+export function roomNamesFromDevices(devices) {
+    const rooms = new Map();
+    for (const device of devices) {
+        const name = device.enrollment.room?.trim();
+        if (name && !rooms.has(name.toLowerCase()))
+            rooms.set(name.toLowerCase(), name);
+    }
+    return [...rooms.values()].sort((left, right) => left.localeCompare(right, undefined, { sensitivity: 'base' }));
+}
 const terminalBatchStatuses = new Set(['completed', 'partial', 'failed', 'rejected']);
 function blindBatchIsLocked(batch) {
     return !!batch && !terminalBatchStatuses.has(batch.status);
@@ -315,10 +339,13 @@ function newIdempotencyKey() {
     return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 function batchRequestOptions(batch) {
+    const body = { action: batch.action };
+    if (batch.targetIds)
+        body.targets = batch.targetIds;
     return {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Idempotency-Key': batch.idempotencyKey ?? '' },
-        body: JSON.stringify({ action: batch.action }),
+        body: JSON.stringify(body),
     };
 }
 const batchFailureStatuses = new Set(['connection_failed', 'deferred', 'write_failed', 'outcome_unknown', 'expired', 'cancelled']);
@@ -376,10 +403,12 @@ function applyBatchResult(target, batch, result, onChange) {
     onChange();
     return true;
 }
-export async function submitBlindBatch(target, request, action, onChange = () => { }, createKey = newIdempotencyKey) {
+export async function submitBlindBatch(target, request, action, onChange = () => { }, createKey = newIdempotencyKey, targetIds) {
     if (!['open', 'close'].includes(action) || blindBatchIsLocked(target.batch))
         return false;
-    const batch = { action, status: 'submitting', idempotencyKey: createKey(), id: null, data: null, error: null };
+    if (targetIds && (!targetIds.length || new Set(targetIds).size !== targetIds.length))
+        return false;
+    const batch = { action, status: 'submitting', idempotencyKey: createKey(), id: null, data: null, error: null, targetIds: targetIds ? [...targetIds] : undefined };
     target.batch = batch;
     onChange();
     try {
@@ -570,6 +599,24 @@ export function renderManagedDeviceCard(device, dashboard, panelMode, now = Date
 function card(device) {
     return renderManagedDeviceCard(device, state, document.documentElement.dataset.displayMode === 'panel');
 }
+function roomGroupMarkup(room, devices) {
+    const encoded = encodeURIComponent(room);
+    const unassigned = room === 'Unassigned';
+    const actionsMarkup = unassigned ? '' : `${renderButton({ label: 'Rename room', action: `room-rename:${encoded}`, variant: 'secondary' })}${renderDestructiveButton({ label: 'Remove room', action: `room-remove:${encoded}` })}`;
+    let managementMarkup = '';
+    if (editingRoomName === room) {
+        managementMarkup = `<form class="room-group__management" data-room-rename="${esc(encoded)}" novalidate><label class="field" for="room-name-${esc(encoded)}">Room name<input id="room-name-${esc(encoded)}" name="name" maxlength="40" required value="${esc(room)}" data-room-name-input aria-invalid="false" aria-describedby="room-name-${esc(encoded)}-error"><span id="room-name-${esc(encoded)}-error" class="field-error" data-room-name-error hidden role="alert"></span></label><div class="room-actions">${renderButton({ label: 'Cancel', action: `room-edit-cancel:${encoded}`, variant: 'secondary' })}${renderButton({ label: 'Save room', type: 'submit' })}</div></form>`;
+    }
+    else if (confirmingRoomRemoval === room) {
+        managementMarkup = `<div class="room-group__management">${renderConfirmationPanel({ title: `Remove ${room}?`, message: `${devices.length} ${devices.length === 1 ? 'blind will' : 'blinds will'} move to Unassigned. Their history will stay with each blind.`, confirmLabel: 'Remove room', confirmAction: `room-remove-confirm:${encoded}`, cancelAction: `room-remove-cancel:${encoded}` })}</div>`;
+    }
+    return renderRoomGroup({
+        room,
+        cardsMarkup: devices.map(card).join(''),
+        actionsMarkup,
+        managementMarkup,
+    });
+}
 function activityPanel() {
     const entries = state.activity || [];
     const list = entries.length
@@ -595,10 +642,19 @@ function home() {
         batch: state.batch,
     });
     const loadingError = state.serviceError && !state.managed.length ? `<div class="panel error-state" role="alert"><span class="error-state__icon" role="img" aria-label="Connection problem">${renderIcon('warning')}</span><h3>Somaris is disconnected</h3><p>${esc(globalThis.navigator?.onLine === false ? 'You are offline. Reconnect and try again.' : 'Could not load your blinds. Check the connection and try again.')}</p>${renderIconButton({ label: 'Retry loading blinds', action: 'refresh', icon: 'refresh', variant: 'secondary' })}</div>` : '';
+    const roomGroups = !panelMode && state.managed.length
+        ? [...roomNamesFromDevices(state.managed).map(room => ({
+                room,
+                devices: state.managed.filter(device => device.enrollment.room?.toLowerCase() === room.toLowerCase()),
+            })), {
+                room: 'Unassigned',
+                devices: state.managed.filter(device => !device.enrollment.room),
+            }].filter(group => group.devices.length).map(group => roomGroupMarkup(group.room, group.devices)).join('')
+        : '';
     const listMarkup = renderDeviceList({
         count: state.managed.length, panelMode,
         cardsMarkup: state.managed.map(card).join(''), emptyMarkup: loadingError || empty, toolbarMarkup: batchControls,
-        groupsMarkup: !panelMode && state.managed.some(device => device.enrollment.room) ? [...new Set(state.managed.map(device => device.enrollment.room || 'Other'))].map(room => renderRoomGroup({ room, cardsMarkup: state.managed.filter(device => (device.enrollment.room || 'Other') === room).map(card).join('') })).join('') : '',
+        groupsMarkup: roomGroups,
     });
     const serviceMarkup = renderServiceSummary(scannerSummary());
     const demoHint = state.demoMode && !hintDismissed && !panelMode ? `<aside class="demo-hint"><span>${renderIcon('target')} Drag a blind graphic to set its position, or use Open, Stop, and Close for quick moves.</span>${renderDismissButton({ label: 'Dismiss demo hint', action: 'demo-hint-dismiss', variant: 'demo-hint-dismiss' })}</aside>` : '';
@@ -620,7 +676,7 @@ function addPage() {
         const deviceName = o.advertised_name || o.device_name || 'Unnamed blind';
         const fieldId = `display-name-${encodeURIComponent(o.id)}`;
         const errorId = `${fieldId}-error`;
-        return `<form class="panel device-row" data-enroll="${esc(o.id)}" novalidate><div><h3>${esc(deviceName)}</h3><p class="subtle">${o.is_simulated ? 'Simulator · ' : ''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field" for="${esc(fieldId)}">Display name<input id="${esc(fieldId)}" name="label" maxlength="64" required value="${esc(o.advertised_name || o.device_name || 'Blind')}" aria-describedby="${esc(errorId)}" aria-invalid="false" data-display-name><span class="field-error" id="${esc(errorId)}" hidden role="alert"></span></label></div>${renderButton({ label: 'Add blind', accessibleLabel: `Add ${deviceName}`, title: `Add ${deviceName}`, type: 'submit', icon: 'add', iconOnly: true, variant: 'secondary', disabled: o.freshness !== 'fresh' })}</form>`;
+        return `<form class="panel device-row" data-enroll="${esc(o.id)}" novalidate><div><h3>${esc(deviceName)}</h3><p class="subtle">${o.is_simulated ? 'Simulator · ' : ''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field" for="${esc(fieldId)}">Display name<input id="${esc(fieldId)}" name="label" maxlength="64" required value="${esc(o.advertised_name || o.device_name || 'Blind')}" aria-describedby="${esc(errorId)}" aria-invalid="false" data-display-name><span class="field-error" id="${esc(errorId)}" hidden role="alert"></span></label>${renderRoomPicker({ id: `room-choice-${encodeURIComponent(o.id)}`, rooms: roomNamesFromDevices(state.managed) })}</div>${renderButton({ label: 'Add blind', accessibleLabel: `Add ${deviceName}`, title: `Add ${deviceName}`, type: 'submit', icon: 'add', iconOnly: true, variant: 'secondary', disabled: o.freshness !== 'fresh' })}</form>`;
     }).join('')}</div>` : state.demoMode ? renderAddDeviceEmptyState({ demoMode: true, adapterAvailable: false }) : `<div class="section-heading"><h2>Nearby devices</h2><span class="count">0 found</span></div>${renderAddDeviceEmptyState({ demoMode: false, adapterAvailable: state.diagnostics?.scanner?.adapter_available === true })}`;
     return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">${intro}</p>${nearby}`;
 }
@@ -638,8 +694,6 @@ export function deviceDetailFields(device, observation, now = Date.now()) {
         fields.push({ label: 'Learned travel rate', value: `${travelRate.toFixed(2)}% per second`, advanced: true });
     }
     fields.push({ label: 'Signal strength', value: observation?.rssi_dbm != null ? `${observation.rssi_dbm} dBm` : 'Unavailable' }, { label: 'Battery', value: observation?.battery?.percent_estimate != null ? `~${observation.battery.percent_estimate}%${observation.battery.observed_at ? ` · Last reading ${relativeTimeLabel(observation.battery.observed_at, now)}` : ''}` : 'Unavailable' }, { label: 'Battery voltage', value: observation?.battery?.voltage_mv != null ? `${observation.battery.voltage_mv} mV${observation.battery.observed_at ? ` · Last reading ${relativeTimeLabel(observation.battery.observed_at, now)}` : ''}` : 'Unavailable', advanced: true }, { label: 'Source', value: device.enrollment.is_simulated ? 'Simulator' : 'Bluetooth' });
-    if (device.enrollment.room)
-        fields.push({ label: 'Room', value: device.enrollment.room });
     if (device.gatt_readiness)
         fields.push(...gattDetailFields(device.gatt_readiness, now));
     return fields;
@@ -679,6 +733,11 @@ function calibrationSection(id, device, busy) {
         : '';
     return `<section class="panel device-settings"><h2>Endpoint calibration</h2><p>Calibration changes the blind’s stored open and closed limits. Stay with the blind while adjusting it. Use the small nudges to reach each endpoint, mark both limits, then end calibration.</p>${warning}${renderCalibrationControls({ deviceId: id, active: device.calibration_mode_active === true, busy })}</section>`;
 }
+function roomAssignmentSection(device) {
+    const id = device.enrollment.id;
+    const encodedId = encodeURIComponent(id);
+    return `<section class="panel room-assignment"><h2>Room</h2><p>Choose where this blind belongs. Choose Unassigned to remove it from a room.</p><form data-room-assignment="${esc(encodedId)}" novalidate>${renderRoomPicker({ id: `device-room-${encodedId}`, rooms: roomNamesFromDevices(state.managed), selectedRoom: device.enrollment.room || null })}<div class="room-assignment__actions">${renderButton({ label: 'Save room', type: 'submit' })}</div></form></section>`;
+}
 function detailPage(id) {
     const device = state.managed.find(item => item.enrollment.id === id);
     if (!device)
@@ -694,7 +753,7 @@ function detailPage(id) {
         : '';
     const calibration = calibrationSection(id, device, busy);
     const enrollment = enrollmentConfirmation(id, device);
-    return `${back()}<h1 class="page-title">${esc(device.enrollment.label ?? 'Blind')}</h1><p class="page-intro">The latest observations reported by your blind.</p>${fields}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>${advanced}${motorSettings}${calibration}<section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${enrollment}</section>`;
+    return `${back()}<h1 class="page-title">${esc(device.enrollment.label ?? 'Blind')}</h1><p class="page-intro">The latest observations reported by your blind.</p>${roomAssignmentSection(device)}${fields}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>${advanced}${motorSettings}${calibration}<section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${enrollment}</section>`;
 }
 function simulatorControls() {
     if (!state.simulators?.length)
@@ -961,11 +1020,14 @@ export async function handleCommandPollFailure(target, id, token, error, refresh
     onChange();
     return true;
 }
-export async function enrollBlind(target, request, refreshData, observedDeviceId, label) {
+export async function enrollBlind(target, request, refreshData, observedDeviceId, label, room) {
     try {
+        const body = { observed_device_id: observedDeviceId, label };
+        if (room !== undefined)
+            body.room = room;
         await request('/api/control/v1/devices', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ observed_device_id: observedDeviceId, label }),
+            body: JSON.stringify(body),
         });
     }
     catch (error) {
@@ -990,6 +1052,50 @@ export async function enrollBlind(target, request, refreshData, observedDeviceId
     }
     notifyTarget(target, { message: `${label} added.`, tone: 'success' });
     return true;
+}
+async function executeRoomMutation(target, request, refreshData, path, method, body, successMessage) {
+    try {
+        await request(path, { method, headers: body ? { 'Content-Type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined });
+    }
+    catch (error) {
+        try {
+            await refreshData();
+        }
+        catch (refreshError) {
+            serviceFailure(target, refreshError);
+        }
+        notifyTarget(target, { message: `Room change failed: ${errorMessage(error)}`, tone: 'error' });
+        return false;
+    }
+    try {
+        await refreshData();
+    }
+    catch (refreshError) {
+        serviceFailure(target, refreshError);
+    }
+    notifyTarget(target, { message: successMessage, tone: 'success' });
+    return true;
+}
+export async function updateBlindRoom(target, request, refreshData, managedDeviceId, room) {
+    if (room !== null) {
+        const validation = validateRoomName(room);
+        if (validation) {
+            notifyTarget(target, { message: validation, tone: 'error' });
+            return false;
+        }
+    }
+    return executeRoomMutation(target, request, refreshData, `/api/control/v1/devices/${encodeURIComponent(managedDeviceId)}`, 'PATCH', { room }, 'Room assignment saved.');
+}
+export async function renameRoom(target, request, refreshData, room, newName) {
+    const validation = validateRoomName(newName);
+    if (validation) {
+        notifyTarget(target, { message: validation, tone: 'error' });
+        return false;
+    }
+    return executeRoomMutation(target, request, refreshData, `/api/control/v1/rooms/${encodeURIComponent(room)}`, 'PATCH', { name: newName.trim() }, `Renamed ${room} to ${newName.trim()}.`);
+}
+export async function removeRoom(target, request, refreshData, room) {
+    return executeRoomMutation(target, request, refreshData, `/api/control/v1/rooms/${encodeURIComponent(room)}`, 'DELETE', undefined, `Removed ${room}; its blinds are now Unassigned.`);
 }
 export async function removeEnrolledBlind(target, request, refreshData, managedDeviceId) {
     if (target.removingEnrollmentId === managedDeviceId)
@@ -1595,6 +1701,19 @@ function handleRemovalClick(action, deviceId) {
     }
     return true;
 }
+function handleRoomRemovalClick(room, confirm) {
+    if (!confirm) {
+        confirmingRoomRemoval = room;
+        editingRoomName = null;
+        render();
+        return;
+    }
+    void removeRoom(state, api, () => refreshService(state, api), room).then(removed => {
+        if (removed)
+            confirmingRoomRemoval = null;
+        render();
+    });
+}
 const clickActionHandlers = {
     'snackbar-dismiss': (_argument, _id, deviceId) => { snackbarQueue.dismiss(deviceId); return true; },
     'layout-menu-toggle': () => { toggleDisplayMenu(); return true; },
@@ -1632,6 +1751,17 @@ const clickActionHandlers = {
     remove: (_argument, _id, deviceId) => handleRemovalClick('remove', deviceId),
     'remove-confirm': (_argument, _id, deviceId) => handleRemovalClick('remove-confirm', deviceId),
     'remove-cancel': (_argument, _id, deviceId) => handleRemovalClick('remove-cancel', deviceId),
+    'room-rename': (_argument, _id, room) => {
+        editingRoomName = room;
+        confirmingRoomRemoval = null;
+        render();
+        app?.querySelector('[data-room-name-input]')?.focus();
+        return true;
+    },
+    'room-edit-cancel': () => { editingRoomName = null; render(); return true; },
+    'room-remove': (_argument, _id, room) => { handleRoomRemovalClick(room, false); return true; },
+    'room-remove-confirm': (_argument, _id, room) => { handleRoomRemovalClick(room, true); return true; },
+    'room-remove-cancel': () => { confirmingRoomRemoval = null; render(); return true; },
 };
 function dispatchClickAction(action, argument, id, applyDisplayMode) {
     const deviceId = argument ? decodeURIComponent(argument) : '';
@@ -1679,6 +1809,14 @@ async function submitEnrollmentForm(form) {
         input?.focus();
         return;
     }
+    const roomValue = roomValueFromForm(form);
+    showRoomValueError(form, roomValue.error);
+    if (roomValue.error) {
+        const input = form.querySelector('[data-room-custom-input]');
+        const select = form.querySelector('[data-room-choice]');
+        (select?.value === 'custom' ? input : select)?.focus();
+        return;
+    }
     input?.setAttribute('aria-invalid', 'false');
     if (error) {
         error.textContent = '';
@@ -1692,9 +1830,71 @@ async function submitEnrollmentForm(form) {
         button.setAttribute('aria-label', `Adding ${label}`);
         button.title = `Adding ${label}`;
     }
-    const added = await enrollBlind(state, api, () => refreshService(state, api), id, label);
+    const added = await enrollBlind(state, api, () => refreshService(state, api), id, label, roomValue.room);
     if (added)
         location.hash = 'home';
+    render();
+}
+function roomValueFromForm(form) {
+    const data = new FormData(form);
+    const choice = String(data.get('room_choice') || 'unassigned');
+    const custom = String(data.get('room_custom') || '');
+    if (choice === 'unassigned')
+        return { room: null, error: '' };
+    const room = roomFromChoice(choice, custom);
+    if (room === null)
+        return { room: null, error: 'Choose a room or Unassigned.' };
+    return { room: room.trim(), error: validateRoomName(room) };
+}
+function showRoomValueError(form, message) {
+    const input = form.querySelector('[data-room-custom-input]');
+    const error = form.querySelector('[data-room-error]');
+    const customSelected = form.querySelector('[data-room-choice]')?.value === 'custom';
+    input?.setAttribute('aria-invalid', String(customSelected && !!message));
+    if (error) {
+        error.textContent = message;
+        error.hidden = !message;
+    }
+}
+async function submitRoomAssignmentForm(form) {
+    const encodedId = form.dataset.roomAssignment;
+    if (!encodedId)
+        return;
+    const selected = roomValueFromForm(form);
+    showRoomValueError(form, selected.error);
+    if (selected.error) {
+        const input = form.querySelector('[data-room-custom-input]');
+        const select = form.querySelector('[data-room-choice]');
+        (select?.value === 'custom' ? input : select)?.focus();
+        return;
+    }
+    const button = form.querySelector('button[type="submit"]');
+    if (button)
+        button.disabled = true;
+    await updateBlindRoom(state, api, () => refreshService(state, api), decodeURIComponent(encodedId), selected.room);
+    render();
+}
+async function submitRoomRenameForm(form) {
+    const encodedRoom = form.dataset.roomRename;
+    const input = form.querySelector('[data-room-name-input]');
+    const name = input?.value.trim() || '';
+    const validation = validateRoomName(name);
+    const error = form.querySelector('[data-room-name-error]');
+    input?.setAttribute('aria-invalid', String(!!validation));
+    if (error) {
+        error.textContent = validation;
+        error.hidden = !validation;
+    }
+    if (validation) {
+        input?.focus();
+        return;
+    }
+    const button = form.querySelector('button[type="submit"]');
+    if (button)
+        button.disabled = true;
+    const renamed = await renameRoom(state, api, () => refreshService(state, api), decodeURIComponent(encodedRoom || ''), name);
+    if (renamed)
+        editingRoomName = null;
     render();
 }
 async function handleFormSubmit(event) {
@@ -1709,6 +1909,16 @@ async function handleFormSubmit(event) {
     if (form.matches('[data-motor-speed]')) {
         event.preventDefault();
         submitMotorSpeed(form);
+        return;
+    }
+    if (form.matches('[data-room-assignment]')) {
+        event.preventDefault();
+        await submitRoomAssignmentForm(form);
+        return;
+    }
+    if (form.matches('[data-room-rename]')) {
+        event.preventDefault();
+        await submitRoomRenameForm(form);
         return;
     }
     if (!form.matches('[data-enroll]'))
@@ -1895,6 +2105,26 @@ if (app) {
                 }
                 return;
             }
+            const customRoomInput = closestHtmlElement(event.target, '[data-room-custom-input]');
+            if (customRoomInput instanceof HTMLInputElement) {
+                if (customRoomInput.getAttribute('aria-invalid') === 'true') {
+                    const form = customRoomInput.closest('form');
+                    if (form)
+                        showRoomValueError(form, validateRoomName(customRoomInput.value));
+                }
+                return;
+            }
+            const renamedRoomInput = closestHtmlElement(event.target, '[data-room-name-input]');
+            if (renamedRoomInput instanceof HTMLInputElement && renamedRoomInput.getAttribute('aria-invalid') === 'true') {
+                const validation = validateRoomName(renamedRoomInput.value);
+                const error = renamedRoomInput.parentElement?.querySelector('[data-room-name-error]');
+                if (error) {
+                    error.textContent = validation;
+                    error.hidden = !validation;
+                }
+                renamedRoomInput.setAttribute('aria-invalid', String(!!validation));
+                return;
+            }
             const input = closestHtmlElement(event.target, '[data-position-input]');
             if (!input)
                 return;
@@ -1910,6 +2140,23 @@ if (app) {
             previewPosition(id, Number(range.value));
         });
         app.addEventListener('change', (event) => {
+            const roomChoice = closestHtmlElement(event.target, '[data-room-choice]');
+            if (roomChoice instanceof HTMLSelectElement) {
+                const picker = roomChoice.closest('.room-picker');
+                const customField = picker?.querySelector('[data-room-custom-field]');
+                if (customField)
+                    customField.hidden = roomChoice.value !== 'custom';
+                if (roomChoice.value !== 'custom') {
+                    const input = picker?.querySelector('[data-room-custom-input]');
+                    input?.setAttribute('aria-invalid', 'false');
+                    const error = picker?.querySelector('[data-room-error]');
+                    if (error) {
+                        error.textContent = '';
+                        error.hidden = true;
+                    }
+                }
+                return;
+            }
             const range = closestHtmlElement(event.target, '[data-position-input]');
             if (range instanceof HTMLInputElement) {
                 const id = range.dataset.positionInput || '';

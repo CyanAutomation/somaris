@@ -465,6 +465,47 @@ async fn batches_and_simulator_settings_are_scoped_to_the_demo_cookie() {
     .await;
     assert_eq!(untouched_activity.unwrap()["data"], json!([]));
 
+    let devices_a = devices(&app, &visitor_a).await;
+    let devices_b = devices(&app, &visitor_b).await;
+    let living_room_member = devices_a
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["enrollment"]["room"] == "Living Room")
+        .unwrap();
+    let member_id = living_room_member["enrollment"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, _, moved_member) = request(
+        &app,
+        Method::PATCH,
+        &format!("/api/control/v1/devices/{member_id}"),
+        Some(&visitor_a),
+        Some(json!({"room": "Office"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        moved_member.unwrap()["data"]["enrollment"]["room"],
+        "Office"
+    );
+    let devices_a = devices(&app, &visitor_a).await;
+    assert!(
+        devices_a
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["enrollment"]["room"] == "Office")
+    );
+    assert!(
+        !devices_b
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["enrollment"]["room"] == "Office")
+    );
+
     let (status_a, _, batch_a) = request(
         &app,
         Method::POST,
@@ -615,6 +656,27 @@ async fn demo_cookie_is_http_only_secure_on_https_and_mutations_reject_cross_sit
                 .header(header::ORIGIN, "https://attacker.test")
                 .header(header::COOKIE, &cookie_pair)
                 .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "demo_origin_denied");
+
+    let enrollment_id = original[0]["enrollment"]["id"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PATCH)
+                .uri(format!("/api/control/v1/devices/{enrollment_id}"))
+                .header(header::HOST, "somaris.test")
+                .header(header::ORIGIN, "https://attacker.test")
+                .header(header::COOKIE, &cookie_pair)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"room": "Study"}).to_string()))
                 .unwrap(),
         )
         .await

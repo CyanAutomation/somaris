@@ -43,7 +43,9 @@ Resolve these product decisions before implementation. The defaults below are re
 
 ### 2. Add a small persisted schedule model
 
-Represent each schedule with a stable ID, name, enabled state, weekday set, local time, IANA time zone, explicit target enrollment IDs, target action, creation/update timestamps, and computed next-run instant. Do not store only a device label or an ephemeral BLE identifier.
+Represent each schedule with a stable ID, name, enabled state, weekday set, local time, IANA time zone, target selection, target action, creation/update timestamps, and computed next-run instant. A target selection may be explicit enrollment IDs or a room label. Enrollment IDs remain the dispatch-level target so commands continue to use the existing batch/command contract; room targeting resolves the current members to those IDs when a run is accepted.
+
+Room labels are case-insensitive and currently exist only while at least one blind carries the label. Before adding persisted room-targeted schedules or scenes, define their lifecycle: a room rename must update or safely migrate every saved room reference, and removing the last blind from a room must leave a clear paused or missing-target state. If reliable cross-feature rename semantics become awkward, introduce stable room IDs in a later data-model migration rather than keying saved automations permanently to display text. A room assignment change should affect future room-targeted runs while preserving each blind's history. The same choice applies to scene membership. Explicit enrollment-ID schedules keep the existing stable-target behavior.
 
 Record each execution occurrence with a unique schedule ID plus nominal scheduled instant. Persist a claim before dispatch so restart or concurrent scheduler ticks cannot enqueue the same occurrence twice. Associate child command IDs and terminal outcomes per target. Bound run-history retention using a documented count or age, consistent with the existing command and activity journals.
 
