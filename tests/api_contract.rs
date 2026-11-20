@@ -28,6 +28,401 @@ async fn enrollment_emits_internal_state_change_notification() {
     assert!(changes.recv().await.unwrap().revision >= 1);
 }
 
+#[tokio::test]
+async fn rooms_can_be_assigned_renamed_removed_and_cleared_without_changing_enrollment_ids() {
+    let app = router(AppState::new());
+    let first = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({
+            "observed_device_id": "simulator-1",
+            "label": "Living Room — Main Window",
+            "room": " Living Room "
+        })),
+    )
+    .await;
+    assert_eq!(first.0, StatusCode::CREATED);
+    let first = first.2.unwrap()["data"].clone();
+    assert_eq!(first["room"], "Living Room");
+    assert_eq!(first["label"], "Main Window");
+    let first_id = first["id"].as_str().unwrap().to_owned();
+
+    let second = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({
+            "observed_device_id": "simulator-2",
+            "label": "Living Room — Side Window",
+            "room": "living room"
+        })),
+    )
+    .await;
+    assert_eq!(second.0, StatusCode::CREATED);
+    let second = second.2.unwrap()["data"].clone();
+    assert_eq!(second["room"], "Living Room");
+    assert_eq!(second["label"], "Side Window");
+    let second_id = second["id"].as_str().unwrap().to_owned();
+
+    let (status, _, rooms) = request(&app, Method::GET, "/api/control/v1/rooms", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rooms = rooms.unwrap();
+    assert_eq!(rooms["data"][0]["name"], "Living Room");
+    assert_eq!(rooms["data"][0]["blind_count"], 2);
+
+    let (status, _, renamed) = request(
+        &app,
+        Method::PATCH,
+        "/api/control/v1/rooms/Living%20Room",
+        &[],
+        Some(json!({"name": "Lounge"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed.unwrap()["data"]["updated_count"], 2);
+
+    let (_, _, managed) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
+    let managed = managed.unwrap()["data"].as_array().unwrap().clone();
+    for (id, label) in [(&first_id, "Main Window"), (&second_id, "Side Window")] {
+        let device = managed
+            .iter()
+            .find(|device| device["enrollment"]["id"].as_str() == Some(id.as_str()))
+            .unwrap();
+        assert_eq!(device["enrollment"]["room"], "Lounge");
+        assert_eq!(device["enrollment"]["label"], label);
+    }
+
+    let (status, _, removed) = request(
+        &app,
+        Method::DELETE,
+        "/api/control/v1/rooms/Lounge",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(removed.unwrap()["data"]["updated_count"], 2);
+
+    let (status, _, moved) = request(
+        &app,
+        Method::PATCH,
+        &format!("/api/control/v1/devices/{first_id}"),
+        &[],
+        Some(json!({"room": "Office"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let moved = moved.unwrap()["data"]["enrollment"].clone();
+    assert_eq!(moved["id"], first_id);
+    assert_eq!(moved["room"], "Office");
+    assert_eq!(moved["label"], "Main Window");
+
+    let (status, _, cleared) = request(
+        &app,
+        Method::PATCH,
+        &format!("/api/control/v1/devices/{first_id}"),
+        &[],
+        Some(json!({"room": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let enrollment = cleared.unwrap()["data"]["enrollment"].clone();
+    assert_eq!(enrollment["id"], first_id);
+    assert!(enrollment.get("room").is_none());
+    assert_eq!(enrollment["label"], "Main Window");
+}
+
+#[tokio::test]
+async fn clearing_a_room_does_not_rename_the_blind_label() {
+    let app = router(AppState::new());
+    let (status, _, enrolled) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({
+            "observed_device_id": "simulator-1",
+            "label": "Kitchen — Kitchen — Main Window",
+            "room": "Kitchen"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let enrolled = enrolled.unwrap()["data"].clone();
+    let enrollment_id = enrolled["id"].as_str().unwrap();
+    assert_eq!(enrolled["label"], "Kitchen — Main Window");
+
+    let (status, _, cleared) = request(
+        &app,
+        Method::PATCH,
+        &format!("/api/control/v1/devices/{enrollment_id}"),
+        &[],
+        Some(json!({"room": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        cleared.unwrap()["data"]["enrollment"]["label"],
+        "Kitchen — Main Window"
+    );
+}
+
+#[tokio::test]
+async fn room_assignments_survive_a_service_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let state_path = directory.path().join("state.json");
+    let app = router(AppState::from_data_path(&state_path).await.unwrap());
+    let (status, _, enrolled) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": "simulator-1", "label": "Kitchen shade", "room": "Kitchen"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let enrollment_id = enrolled.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+
+    let restored = router(AppState::from_data_path(&state_path).await.unwrap());
+    let (status, _, managed) =
+        request(&restored, Method::GET, "/api/control/v1/devices", &[], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let device = managed.unwrap()["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["enrollment"]["id"] == enrollment_id)
+        .unwrap()
+        .clone();
+    assert_eq!(device["enrollment"]["room"], "Kitchen");
+}
+
+#[tokio::test]
+async fn enrollment_accepts_null_room_and_room_assignment_requires_the_room_field() {
+    let app = router(AppState::new());
+    let (status, _, enrolled) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(
+            json!({"observed_device_id": "simulator-1", "label": "Unassigned shade", "room": null}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = enrolled.unwrap()["data"]["id"].as_str().unwrap().to_owned();
+
+    let (status, _, _) = request(
+        &app,
+        Method::PATCH,
+        &format!("/api/control/v1/devices/{id}"),
+        &[],
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _, null_room) = request(
+        &app,
+        Method::PATCH,
+        &format!("/api/control/v1/devices/{id}"),
+        &[],
+        Some(json!({"room": null})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        null_room.unwrap()["data"]["enrollment"]
+            .get("room")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn room_names_are_limited_and_rename_conflicts_are_rejected() {
+    let app = router(AppState::new());
+    let (status, _, too_long) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({
+            "observed_device_id": "simulator-1",
+            "label": "One",
+            "room": "12345678901234567890123456789012345678901"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(too_long.unwrap()["error"]["code"], "invalid_room");
+
+    for (observed_device_id, room) in [("simulator-1", "Unassigned"), ("simulator-1", "   ")] {
+        let (status, _, invalid) = request(
+            &app,
+            Method::POST,
+            "/api/control/v1/devices",
+            &[],
+            Some(json!({"observed_device_id": observed_device_id, "label": "One", "room": room})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.unwrap()["error"]["code"], "invalid_room");
+    }
+
+    for (observed_device_id, label, room) in [
+        ("simulator-1", "Kitchen Blind", "Kitchen"),
+        ("simulator-2", "Bedroom Blind", "Bedroom"),
+    ] {
+        let (status, _, _) = request(
+            &app,
+            Method::POST,
+            "/api/control/v1/devices",
+            &[],
+            Some(json!({"observed_device_id": observed_device_id, "label": label, "room": room})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, _, conflict) = request(
+        &app,
+        Method::PATCH,
+        "/api/control/v1/rooms/Kitchen",
+        &[],
+        Some(json!({"name": " bedroom "})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(conflict.unwrap()["error"]["code"], "room_name_conflict");
+}
+
+#[tokio::test]
+async fn targeted_batches_snapshot_only_requested_enrollments_and_scope_idempotency() {
+    let app = router(AppState::new());
+    let first = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": "simulator-1", "label": "First", "room": "Room A"})),
+    )
+    .await
+    .2
+    .unwrap()["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[],
+        Some(json!({"observed_device_id": "simulator-2", "label": "Second", "room": "Room B"})),
+    )
+    .await
+    .2
+    .unwrap()["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (status, _, accepted) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "room-a-close")],
+        Some(json!({"action": "close", "targets": [first.clone()]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let accepted = accepted.unwrap()["data"].clone();
+    assert_eq!(accepted["target_count"], 1);
+    assert_eq!(accepted["requested_targets"], json!([first.clone()]));
+    assert_eq!(accepted["targets"][0]["managed_device_id"], first);
+
+    let (status, _, duplicate) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "room-a-close")],
+        Some(json!({"action": "close", "targets": [first.clone()]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(duplicate.unwrap()["data"]["id"], accepted["id"]);
+
+    let (status, _, conflict) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "room-a-close")],
+        Some(json!({"action": "close", "targets": [second.clone()]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(conflict.unwrap()["error"]["code"], "idempotency_conflict");
+}
+
+#[tokio::test]
+async fn targeted_batch_rejects_empty_duplicate_and_unknown_ids() {
+    let app = router(AppState::new());
+    for targets in [json!([]), json!("bad-shape")] {
+        let (status, _, _) = request(
+            &app,
+            Method::POST,
+            "/api/control/v1/batches",
+            &[("idempotency-key", "bad-targets")],
+            Some(json!({"action": "close", "targets": targets})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    let (status, _, duplicate) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "duplicate-targets")],
+        Some(json!({"action": "close", "targets": ["one", "one"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(duplicate.unwrap()["error"]["code"], "invalid_batch_targets");
+
+    let (status, _, unknown) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "unknown-target")],
+        Some(json!({"action": "close", "targets": ["unknown"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(unknown.unwrap()["error"]["code"], "enrollment_not_found");
+}
+
+#[tokio::test]
+async fn targeted_batch_rejects_more_than_the_maximum_target_count() {
+    let app = router(AppState::new());
+    let targets: Vec<_> = (0..1001)
+        .map(|index| format!("enrollment-{index}"))
+        .collect();
+    let (status, _, oversized) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/batches",
+        &[("idempotency-key", "oversized-targets")],
+        Some(json!({"action": "close", "targets": targets})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(oversized.unwrap()["error"]["code"], "invalid_batch_targets");
+}
+
 async fn request(
     app: &Router,
     method: Method,
@@ -1142,7 +1537,15 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         ("/api/dev/simulators/{id}/scenario", &["put", "options"]),
         ("/api/dev/simulators/{id}/reset", &["post", "options"]),
         ("/api/control/v1/devices", &["get", "post", "options"]),
-        ("/api/control/v1/devices/{id}", &["delete", "options"]),
+        (
+            "/api/control/v1/devices/{id}",
+            &["patch", "delete", "options"],
+        ),
+        ("/api/control/v1/rooms", &["get", "options"]),
+        (
+            "/api/control/v1/rooms/{name}",
+            &["patch", "delete", "options"],
+        ),
         (
             "/api/control/v1/devices/{id}/motor-settings",
             &["get", "options"],
@@ -1190,6 +1593,35 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         contract["components"]["schemas"]["Enrollment"]["properties"]["room"]["type"],
         "string"
     );
+    assert_eq!(
+        contract["components"]["schemas"]["Enrollment"]["properties"]["room"]["maxLength"],
+        40
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["EnrollmentRequest"]["properties"]["room"]["maxLength"],
+        40
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["EnrollmentRequest"]["properties"]["room"]["type"][1],
+        "null"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["RoomAssignmentRequest"]["required"][0],
+        "room"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["BatchCommandRequest"]["properties"]["targets"]["items"]
+            ["type"],
+        "string"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["BatchCommandRequest"]["properties"]["targets"]["maxItems"],
+        1000
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["Batch"]["properties"]["requested_targets"]["minItems"],
+        1
+    );
     for path in [
         "/api/v1/diagnostics",
         "/api/v1/devices",
@@ -1198,6 +1630,9 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         "/api/dev/simulators/{id}/reset",
         "/api/control/v1/devices/{id}/motor-settings",
         "/api/control/v1/devices/{id}/commands",
+        "/api/control/v1/devices/{id}",
+        "/api/control/v1/rooms",
+        "/api/control/v1/rooms/{name}",
         "/api/control/v1/batches/{id}",
     ] {
         assert!(
@@ -1379,6 +1814,7 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
                 "get" => Method::GET,
                 "post" => Method::POST,
                 "put" => Method::PUT,
+                "patch" => Method::PATCH,
                 "delete" => Method::DELETE,
                 "options" => Method::OPTIONS,
                 other => panic!("unexpected method in route inventory: {other}"),
@@ -1432,7 +1868,12 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
             .as_object()
             .unwrap()
             .keys()
-            .filter(|key| matches!(key.as_str(), "get" | "post" | "put" | "delete" | "options"))
+            .filter(|key| {
+                matches!(
+                    key.as_str(),
+                    "get" | "post" | "put" | "patch" | "delete" | "options"
+                )
+            })
             .map(String::as_str)
             .collect();
         let mut expected_methods: Vec<_> = expected_methods.to_vec();

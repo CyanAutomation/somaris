@@ -148,6 +148,7 @@ export interface BatchState {
   action: BatchAction;
   status: BatchStatus;
   idempotencyKey?: string;
+  targetIds?: string[];
   data?: Partial<BatchResponse> | null;
   error?: string | null;
   target_count?: number;

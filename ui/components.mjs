@@ -168,7 +168,7 @@ export function renderFreshnessIndicator(label) {
     return `<span class="freshness-indicator" role="img" aria-label="${name}" title="${name}">${iconMarkup('clock')}</span>`;
 }
 function cardDisplayName(label, room) {
-    if (!room || !label.startsWith(room))
+    if (!room || label.slice(0, room.length).toLowerCase() !== room.toLowerCase())
         return label;
     const suffix = label.slice(room.length);
     const match = suffix.match(/^\s*(?:[:—–-])\s*(.+)$/);
@@ -313,8 +313,40 @@ export function renderAddBlindButton({ variant = '' } = {}) {
         icon: 'add',
     });
 }
-export function renderRoomGroup({ room, cardsMarkup }) {
-    return `<section class="room-group"><h3 class="room-heading">${escapeHtml(room)}</h3><div class="grid room-group__grid">${cardsMarkup}</div></section>`;
+export function renderRoomGroup({ room, cardsMarkup, actionsMarkup, managementMarkup }) {
+    return renderRoomGroupWithActions({ room, cardsMarkup, actionsMarkup, managementMarkup });
+}
+export function renderRoomGroupWithActions({ room, cardsMarkup, actionsMarkup = '', managementMarkup = '' }) {
+    return `<section class="room-group" data-room-group="${escapeHtml(room)}"><div class="room-group__heading"><h3 class="room-heading">${escapeHtml(room)}</h3>${actionsMarkup ? `<div class="room-group__actions">${actionsMarkup}</div>` : ''}</div>${managementMarkup}<div class="grid room-group__grid">${cardsMarkup}</div></section>`;
+}
+export function roomChoiceValue(room) {
+    return `existing:${encodeURIComponent(room)}`;
+}
+export function roomFromChoice(choice, customName = '') {
+    if (choice === 'custom')
+        return customName.trim();
+    if (choice === 'unassigned' || !choice)
+        return null;
+    if (!choice.startsWith('existing:'))
+        return null;
+    try {
+        return decodeURIComponent(choice.slice('existing:'.length));
+    }
+    catch {
+        return null;
+    }
+}
+export function renderRoomPicker({ id, rooms, selectedRoom = null }) {
+    const optionMarkup = rooms.map(room => {
+        const value = roomChoiceValue(room);
+        const selected = selectedRoom?.toLowerCase() === room.toLowerCase() ? ' selected' : '';
+        return `<option value="${escapeHtml(value)}"${selected}>${escapeHtml(room)}</option>`;
+    }).join('');
+    const selectedValue = selectedRoom
+        ? roomChoiceValue(selectedRoom)
+        : 'unassigned';
+    const customId = `${id}-custom`;
+    return `<div class="room-picker"><label class="field" for="${escapeHtml(id)}">Room<select id="${escapeHtml(id)}" name="room_choice" data-room-choice aria-label="Room" aria-describedby="${escapeHtml(id)}-error"><option value="unassigned"${selectedValue === 'unassigned' ? ' selected' : ''}>Unassigned</option>${optionMarkup}<option value="custom">Create a room…</option></select></label><div class="room-picker__custom-field" data-room-custom-field hidden><label class="field" for="${escapeHtml(customId)}">New room name<input id="${escapeHtml(customId)}" name="room_custom" maxlength="40" autocomplete="off" placeholder="e.g. Living Room" data-room-custom-input aria-invalid="false" aria-describedby="${escapeHtml(customId)}-error"></label><span id="${escapeHtml(customId)}-error" class="field-error" data-room-error hidden role="alert"></span></div><span id="${escapeHtml(id)}-error" class="field-error" data-room-choice-error hidden role="alert"></span></div>`;
 }
 export function renderPositionPreset({ deviceId, blindLabel, position, selectedPosition, disabled = false }) {
     const label = `Move ${blindLabel} to ${position}% open`;

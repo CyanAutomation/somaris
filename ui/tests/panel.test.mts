@@ -10,6 +10,7 @@ import {
   renderPanelNotice,
   renderTopbarActions,
   renderRoomGroup,
+  renderRoomPicker,
 } from '../components.mjs';
 import {renderClock} from '../clock.mjs';
 
@@ -145,6 +146,42 @@ test('room groups keep a single blind the same width as blinds in a pair', async
     assert.ok(layout.pairedLefts[0]! < layout.pairedLefts[1]!);
     assert.ok(layout.singleWidth < layout.gridWidth);
     assert.ok(layout.pairedWidths.every(width => Math.abs(layout.singleWidth - width) < 1));
+  } finally {
+    await page.close();
+  }
+});
+
+test('room controls stack below the heading and keep 44px targets on mobile', async () => {
+  // Contract: UI-ROOM-02 in docs/test-contracts.md.
+  const room = renderRoomGroup({
+    room:'Living Room',
+    actionsMarkup:'<button class="button">Rename room</button><button class="button danger">Remove room</button>',
+    cardsMarkup:'<article class="card">Blind</article>',
+  });
+  const picker = renderRoomPicker({id:'room-choice',rooms:['Living Room']});
+  const page = await browser.newPage({viewport:{width:390,height:800}});
+  try {
+    await page.setContent(`<!doctype html><html><head><style>${styles}</style></head><body><main class="app-shell">${room}${picker}</main></body></html>`);
+    const layout = await page.evaluate(() => {
+      const heading = document.querySelector('.room-group__heading h3')!.getBoundingClientRect();
+      const actions = document.querySelector('.room-group__actions')!.getBoundingClientRect();
+      const buttons = [...document.querySelectorAll('.room-group__actions button')].map(button => button.getBoundingClientRect());
+      const select = document.querySelector('.room-picker select')!.getBoundingClientRect();
+      const input = document.querySelector('.room-picker input')!;
+      input.closest('[data-room-custom-field]')!.removeAttribute('hidden');
+      const customInput = input.getBoundingClientRect();
+      return {
+        headingBottom:heading.bottom,
+        actionsTop:actions.top,
+        buttonSizes:buttons.map(button => [button.width,button.height]),
+        selectSize:[select.width,select.height],
+        customInputSize:[customInput.width,customInput.height],
+      };
+    });
+    assert.ok(layout.actionsTop >= layout.headingBottom);
+    assert.ok(layout.buttonSizes.every(([width,height]) => width >= 44 && height >= 44));
+    assert.ok(layout.selectSize[0] >= 44 && layout.selectSize[1] >= 44);
+    assert.ok(layout.customInputSize[0] >= 44 && layout.customInputSize[1] >= 44);
   } finally {
     await page.close();
   }
