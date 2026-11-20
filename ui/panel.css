@@ -453,8 +453,4 @@ html[data-display-mode="panel"] .demo-banner{display:none}
   html[data-display-mode="panel"] .topbar{flex-wrap:nowrap}
   html[data-display-mode="panel"] .topbar-brand{flex:0 1 auto}
   html[data-display-mode="panel"] .top-actions{flex:0 1 auto;flex-wrap:nowrap;gap:2px}
-  html[data-display-mode="panel"] .theme-menu-toggle{display:none}
-  html[data-display-mode="panel"] .layout-mode-toggle .ui-icon{display:none}
-  html[data-display-mode="panel"] .layout-mode-toggle,html[data-display-mode="panel"] .theme-toggle{gap:4px;padding-inline:6px;font-size:12px}
-  html[data-display-mode="panel"] .topbar-icon-button[data-action="demo-reset"]{gap:4px;padding:6px 8px;font-size:12px}
 }

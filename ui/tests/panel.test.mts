@@ -10,6 +10,7 @@ import {
   renderPanelNotice,
   renderTopbarActions,
   renderRoomGroup,
+  renderRoomCollection,
   renderRoomPicker,
 } from '../components.mjs';
 import {renderClock} from '../clock.mjs';
@@ -61,7 +62,7 @@ function panelMarkup({longLabels = false, notices = false}: {longLabels?: boolea
   const topbar = renderTopbarActions({blindCount:4, panelMode:true, displayPreference:'panel', demoMode:true});
   const clock = renderClock(new Date(2026, 10, 19, 17, 42));
 
-  return `<!doctype html><html lang="en" data-display-mode="panel"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><div class="topbar-brand"><a class="brand" href="#home">somaris.</a><span id="header-clock-slot">${clock}</span></div><div class="top-actions">${topbar}</div></header><main id="app"><section class="demo-banner"><span>Explore a simulated smart home.</span><button class="icon-button">Reset</button></section>${devices}</main></div></body></html>`;
+  return `<!doctype html><html lang="en" data-display-mode="panel"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><div class="topbar-brand"><a class="brand" href="#home">somaris.</a></div><div id="header-clock-slot" class="topbar-clock">${clock}</div><div class="top-actions">${topbar}</div></header><main id="app"><section class="demo-banner"><span>Explore a simulated smart home.</span><button class="icon-button">Reset</button></section>${devices}</main></div></body></html>`;
 }
 
 async function openPanel(width: number, height: number, options: {longLabels?: boolean; notices?: boolean} = {}): Promise<Page> {
@@ -84,7 +85,7 @@ async function openMobile(width: number): Promise<Page> {
   });
   const toolbar = renderTopbarActions({blindCount:1, displayPreference:'mobile'});
   const clock = renderClock(new Date(2026, 10, 19, 17, 42));
-  await page.setContent(`<!doctype html><html lang="en" data-display-mode="mobile"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><div class="topbar-brand"><a class="brand" href="#home"><span class="brand-mark"><i></i><i></i><i></i></span><span>somaris<span class="brand-dot">.</span></span></a><span id="header-clock-slot">${clock}</span></div><div class="top-actions">${toolbar}</div></header><main id="app"><section class="demo-banner"><div>Demo</div><button class="button icon-button icon-action">↻</button></section><section class="hero"><div>Welcome</div><button class="button icon-button hero-dismiss icon-action">×</button></section><section class="device-list"><div class="grid">${card}</div></section></main></div></body></html>`);
+  await page.setContent(`<!doctype html><html lang="en" data-display-mode="mobile"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><div class="topbar-brand"><a class="brand" href="#home"><span class="brand-mark"><i></i><i></i><i></i></span><span>somaris<span class="brand-dot">.</span></span></a></div><div id="header-clock-slot" class="topbar-clock">${clock}</div><div class="top-actions">${toolbar}</div></header><main id="app"><section class="demo-banner"><div>Demo</div><button class="button icon-button icon-action">↻</button></section><section class="hero"><div>Welcome</div><button class="button icon-button hero-dismiss icon-action">×</button></section><section class="device-list"><div class="grid">${card}</div></section></main></div></body></html>`);
   return page;
 }
 
@@ -117,36 +118,64 @@ test('panel view lays out blind cards in two columns at 480px with usable contro
   }
 });
 
-test('room groups keep a single blind the same width as blinds in a pair', async () => {
+test('room boundaries do not break the shared blind grid into separate rows', async () => {
   // Contract: UI-ROOM-01 in docs/test-contracts.md.
   const card = (id:string,label:string) => renderBlindCard({
     id,label,availabilityLabel:'Online',availabilityStatus:'ready',positionPercent:50,
     movementStatus:'at_target',controlsMarkup:renderBlindActions({deviceId:id,blindLabel:label}),
   });
-  const singleRoom = renderRoomGroup({room:'Bedroom',cardsMarkup:card('bedroom','Bedroom blind')});
-  const pairedRoom = renderRoomGroup({room:'Living Room',cardsMarkup:card('left','Left blind')+card('right','Right blind')});
+  const roomLabels = renderRoomGroup({room:'Bedroom'})+renderRoomGroup({room:'Living Room'});
+  const collection = renderRoomCollection({
+    groupsMarkup:roomLabels,
+    cardsMarkup:card('bedroom','Bedroom blind')+card('left','Left blind')+card('right','Right blind'),
+  });
   const page = await browser.newPage({viewport:{width:1160,height:900}});
   try {
-    await page.setContent(`<!doctype html><html><head><style>${styles}</style></head><body><div class="app-shell">${singleRoom}${pairedRoom}</div></body></html>`);
+    await page.setContent(`<!doctype html><html><head><style>${styles}</style></head><body><div class="app-shell">${collection}</div></body></html>`);
     const layout = await page.evaluate(() => {
-      const singleGrid = document.querySelector('.room-group__grid')!;
-      const pairedGrid = document.querySelectorAll('.room-group__grid')[1]!;
-      const singleCard = singleGrid.querySelector('.card')!.getBoundingClientRect();
-      const pairedCards = [...pairedGrid.querySelectorAll('.card')].map(card => card.getBoundingClientRect());
+      const grid = document.querySelector('.room-collection__grid')!;
+      const cards = [...grid.querySelectorAll('.card')].map(card => card.getBoundingClientRect());
       return {
-        singleWidth:singleCard.width,
-        pairedWidths:pairedCards.map(card => card.width),
-        pairedLefts:pairedCards.map(card => card.left),
-        gridWidth:singleGrid.getBoundingClientRect().width,
+        cardCount:cards.length,
+        firstTop:cards[0]?.top,
+        secondTop:cards[1]?.top,
+        firstLeft:cards[0]?.left,
+        secondLeft:cards[1]?.left,
+        gridWidth:grid.getBoundingClientRect().width,
         roomNames:[...document.querySelectorAll('.room-heading')].map(heading => heading.textContent),
+        allCardsUseOneGrid:[...document.querySelectorAll('.card')].every(card=>card.parentElement===grid),
       };
     });
     assert.deepEqual(layout.roomNames, ['Bedroom', 'Living Room']);
-    assert.equal(layout.pairedWidths.length, 2);
-    assert.ok(layout.pairedLefts[0]! < layout.pairedLefts[1]!);
-    assert.ok(layout.singleWidth < layout.gridWidth);
-    assert.ok(layout.pairedWidths.every(width => Math.abs(layout.singleWidth - width) < 1));
+    assert.equal(layout.cardCount,3);
+    assert.ok(layout.secondTop! < layout.firstTop! + 1);
+    assert.ok(layout.firstLeft! < layout.secondLeft!);
+    assert.ok(layout.gridWidth > 0);
+    assert.equal(layout.allCardsUseOneGrid,true);
   } finally {
+    await page.close();
+  }
+});
+
+test('blind position text stays clear of the interactive graphic in narrow cards',async()=>{
+  const card=renderBlindCard({
+    id:'narrow-blind',label:'Main Window',room:'Living Room',showRoom:true,
+    availabilityLabel:'Online',availabilityStatus:'ready',positionPercent:75,
+    movementStatus:'at_target',supportsPosition:true,controlsMarkup:renderBlindActions({deviceId:'narrow-blind',blindLabel:'Main Window',supportsPosition:true}),
+  });
+  const page=await browser.newPage({viewport:{width:990,height:865}});
+  try{
+    await page.setContent(`<!doctype html><html><head><style>${styles}</style></head><body><div style="width:302px">${card}</div></body></html>`);
+    const geometry=await page.evaluate(()=>{
+      const status=document.querySelector('.blind-state')!.getBoundingClientRect();
+      const graphic=document.querySelector('.blind-art-wrap')!.getBoundingClientRect();
+      const label=document.querySelector('.blind-state__label')!.getBoundingClientRect();
+      return {status:{left:status.left,right:status.right,top:status.top,bottom:status.bottom},graphic:{left:graphic.left,right:graphic.right,top:graphic.top,bottom:graphic.bottom},label:{right:label.right,bottom:label.bottom}};
+    });
+    const overlaps=geometry.status.left<geometry.graphic.right&&geometry.graphic.left<geometry.status.right&&geometry.status.top<geometry.graphic.bottom&&geometry.graphic.top<geometry.status.bottom;
+    assert.equal(overlaps,false);
+    assert.ok(geometry.label.bottom<=geometry.graphic.top||geometry.label.right<=geometry.graphic.left);
+  }finally{
     await page.close();
   }
 });
@@ -156,7 +185,6 @@ test('room controls stack below the heading and keep 44px targets on mobile', as
   const room = renderRoomGroup({
     room:'Living Room',
     actionsMarkup:'<button class="button">Rename room</button><button class="button danger">Remove room</button>',
-    cardsMarkup:'<article class="card">Blind</article>',
   });
   const picker = renderRoomPicker({id:'room-choice',rooms:['Living Room']});
   const page = await browser.newPage({viewport:{width:390,height:800}});
