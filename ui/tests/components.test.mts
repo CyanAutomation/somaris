@@ -19,6 +19,8 @@ import {
   renderIconButton,
   renderIconLinkButton,
   renderAddBlindButton,
+  renderRoomPicker,
+  renderRoomGroup,
   renderDemoBanner,
   renderPositionPreset,
   renderServiceSummary,
@@ -716,6 +718,12 @@ test('grouped demo cards strip duplicated room names and keep stale time out of 
   assert.equal(card.querySelector('.last-seen'), null);
   assert.ok(card.querySelector('.card-title-chevron'));
   assert.equal(card.querySelector('.blind-state__label')?.textContent, 'Partially open');
+  const caseVariant = parseMarkup(renderBlindCard({
+    id:'demo-living-side', label:'living room - Side Window', room:'Living Room', isSimulated:true,
+    lastSeen:'', availabilityLabel:'Online', positionPercent:50,
+    movementStatus:'at_target', controlsMarkup:'',
+  }));
+  assert.equal(caseVariant.querySelector('.card-title')?.textContent, 'Side Window');
   assert.deepEqual(
     [...card.querySelectorAll('.controls button')].map(button => [
       button.getAttribute('aria-label'), button.getAttribute('data-action'),
@@ -726,6 +734,37 @@ test('grouped demo cards strip duplicated room names and keep stale time out of 
       ['Close Living Room — Main Window', 'command:close:demo-living'],
     ],
   );
+});
+
+test('room picker offers Unassigned, existing names, and a custom room field', () => {
+  const picker = parseMarkup(renderRoomPicker({
+    id:'blind-room',
+    rooms:['Living Room','Study'],
+    selectedRoom:'Study',
+  }));
+  const select = picker.querySelector<HTMLSelectElement>('[data-room-choice]');
+  assert.ok(select);
+  assert.deepEqual([...select.options].map(option => option.textContent), [
+    'Unassigned','Living Room','Study','Create a room…',
+  ]);
+  assert.equal(select.options[2]?.getAttribute('selected'), '');
+  assert.equal(select.getAttribute('aria-label'), 'Room');
+  assert.equal(select.getAttribute('aria-describedby'), 'blind-room-error');
+  const custom = picker.querySelector<HTMLInputElement>('[name="room_custom"]');
+  assert.equal(custom?.getAttribute('maxlength'), '40');
+  assert.equal(custom?.getAttribute('aria-describedby'), 'blind-room-custom-error');
+  assert.equal(custom?.closest('[data-room-custom-field]')?.hasAttribute('hidden'), true);
+});
+
+test('room group provides reusable, accessible management actions', () => {
+  const group = parseMarkup(renderRoomGroup({
+    room:'Unassigned',
+    cardsMarkup:'<article>Blind</article>',
+    actionsMarkup:'<button type="button" data-action="room-rename">Rename room</button>',
+  }));
+  assert.equal(group.querySelector('.room-heading')?.textContent, 'Unassigned');
+  assert.equal(group.querySelector('[data-action="room-rename"]')?.textContent, 'Rename room');
+  assert.match(group.querySelector('[data-room-group]')?.getAttribute('data-room-group') || '', /Unassigned/);
 });
 
 test('panel home omits supporting sections while regular view retains activity and service', () => {

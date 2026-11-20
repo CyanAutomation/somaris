@@ -56,6 +56,8 @@ struct EnrollmentArgs {
     observed_device_id: String,
     /// User-facing label, from 1 to 64 characters.
     label: String,
+    /// Optional room label, from 1 to 40 characters. Omit or use null for Unassigned.
+    room: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
@@ -138,10 +140,34 @@ struct ToggleArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct BatchArgs {
-    /// Fixed supported action applied to the ready enrolled devices.
+    /// Fixed supported action applied to all ready enrolled devices or the selected targets.
     action: BatchCommandAction,
+    /// Optional enrollment IDs to target. Omit to target every ready enrolled device.
+    targets: Option<Vec<String>>,
     /// Caller-supplied key. Reuse it only when retrying the same request.
     idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct DeviceRoomArgs {
+    /// Managed-device enrollment ID.
+    managed_device_id: String,
+    /// Room label from 1 to 40 characters; use null to move the blind to Unassigned.
+    room: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RenameRoomArgs {
+    /// Current room label.
+    room: String,
+    /// New room label from 1 to 40 characters.
+    name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RoomNameArgs {
+    /// Room label to remove.
+    name: String,
 }
 
 impl SomarisMcp {
@@ -330,6 +356,18 @@ impl SomarisMcp {
         .await
     }
 
+    #[tool(description = "List current room labels and their assigned blind counts.")]
+    async fn list_rooms(&self) -> String {
+        self.call(
+            Method::GET,
+            &["api", "control", "v1", "rooms"],
+            &[],
+            None,
+            None,
+        )
+        .await
+    }
+
     #[tool(
         description = "Enroll a freshly observed device for control. This changes persistent service state."
     )]
@@ -341,7 +379,50 @@ impl SomarisMcp {
             Some(json!({
                 "observed_device_id": args.observed_device_id,
                 "label": args.label,
+                "room": args.room,
             })),
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Assign one enrolled blind to a room or Unassigned. This changes persistent service state."
+    )]
+    async fn update_device_room(&self, Parameters(args): Parameters<DeviceRoomArgs>) -> String {
+        self.call(
+            Method::PATCH,
+            &["api", "control", "v1", "devices", &args.managed_device_id],
+            &[],
+            Some(json!({"room": args.room})),
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Rename a room label on every blind currently assigned to it. This changes persistent service state."
+    )]
+    async fn rename_room(&self, Parameters(args): Parameters<RenameRoomArgs>) -> String {
+        self.call(
+            Method::PATCH,
+            &["api", "control", "v1", "rooms", &args.room],
+            &[],
+            Some(json!({"name": args.name})),
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Remove a room label and move all its blinds to Unassigned. This changes persistent service state."
+    )]
+    async fn remove_room(&self, Parameters(args): Parameters<RoomNameArgs>) -> String {
+        self.call(
+            Method::DELETE,
+            &["api", "control", "v1", "rooms", &args.name],
+            &[],
+            None,
             None,
         )
         .await
@@ -409,14 +490,14 @@ impl SomarisMcp {
     }
 
     #[tool(
-        description = "Queue an asynchronous fixed action for every currently ready enrolled device. Returns a batch ID to poll with get_batch."
+        description = "Queue an asynchronous fixed action for every currently ready enrolled device, or for the explicitly selected enrollment IDs in targets. Omit targets to use all enrolled devices. Returns a batch ID to poll with get_batch."
     )]
     async fn submit_batch(&self, Parameters(args): Parameters<BatchArgs>) -> String {
         self.call(
             Method::POST,
             &["api", "control", "v1", "batches"],
             &[],
-            Some(json!({ "action": args.action.as_str() })),
+            Some(json!({ "action": args.action.as_str(), "targets": args.targets })),
             Some(&args.idempotency_key),
         )
         .await

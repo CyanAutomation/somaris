@@ -75,6 +75,23 @@ test('display name validation reports required and maximum length failures',()=>
  assert.equal(validateDisplayName(' Living Room '), '');
 });
 
+test('room names are trimmed, capped at forty characters, and deduplicated without case',async()=>{
+ const {roomNamesFromDevices,validateRoomName}=await import('../app.mjs') as unknown as {
+  roomNamesFromDevices:(devices:ManagedDevice[])=>string[];
+  validateRoomName:(value:string)=>string;
+ };
+ assert.equal(validateRoomName('  '),'Enter a room name.');
+ assert.equal(validateRoomName('x'.repeat(41)),'Use 40 characters or fewer.');
+ assert.equal(validateRoomName(' Unassigned '),'Choose another name; Unassigned is reserved.');
+ assert.equal(validateRoomName('Study'),'');
+ assert.deepEqual(roomNamesFromDevices([
+  {enrollment:{id:'one',room:'Living Room'}},
+  {enrollment:{id:'two',room:'living room'}},
+  {enrollment:{id:'three',room:'Study'}},
+  {enrollment:{id:'four'}},
+ ]),['Living Room','Study']);
+});
+
 test('demo readiness stays positive while the physical adapter remains unavailable', async () => {
  const state: RefreshTarget & {demoMode:boolean; serviceError:string|null} = {demoMode:false,serviceError:null};
  const request: ApiRequest = async path => {
@@ -146,6 +163,21 @@ test('all-blinds batch submission is idempotent and a failed request stays locke
  assert.equal(requestHeader(requests.at(-1)?.[1], 'Idempotency-Key'), 'key-2');
  assert.equal(requestBody(requests.at(-1)?.[1]).action, 'close');
  assert.equal(unknownState.batch.id, 'batch-1');
+});
+
+test('targeted batch submission preserves the selected enrollment IDs and rejects an empty selection',async()=>{
+ const {submitBlindBatch}=await import('../app.mjs');
+ const state:RefreshTarget&{batch:BatchState|null}={batch:null};
+ const requests:Array<RequestInit|undefined>=[];
+ const request:ApiRequest=async(_path,options)=>{
+  requests.push(options);
+  return {id:'batch-room',action:'open',status:'queued',target_count:2};
+ };
+ assert.equal(await submitBlindBatch(state,request,'open',()=>{},()=> 'room-key',['blind-2','blind-1']),true);
+ assert.deepEqual(requestBody(requests[0]),{action:'open',targets:['blind-2','blind-1']});
+ assert.equal(state.batch?.targetIds?.length,2);
+ const emptyState:RefreshTarget&{batch:BatchState|null}={batch:null};
+ assert.equal(await submitBlindBatch(emptyState,request,'open',()=>{},()=> 'empty-key',[]),false);
 });
 
 test('batch polling preserves an unknown outcome for a known batch ID and updates terminal results', async () => {
@@ -288,7 +320,7 @@ test('device detail fields show cached telemetry age without jargon and only act
  const fields = deviceDetailFields(device,observation,now);
  assert.deepEqual(fields.map(field=>field.label),[
   'Availability','Position','Last heard from','Advertisement age','Reported target','Movement feedback',
-  'Learned travel rate','Signal strength','Battery','Battery voltage','Source','Room','Last GATT command',
+  'Learned travel rate','Signal strength','Battery','Battery voltage','Source','Last GATT command',
   'Transport evidence','Last command attempt','Last acknowledged GATT write','Movement cooldown until','Latest failure',
  ]);
  assert.equal(fields.find(field=>field.label==='Battery')?.value,'~80% · Last reading 2 h ago');
@@ -653,13 +685,40 @@ test('enrollment errors notify in context and successful enrollment reports comp
  };
  const refresh = async () => {};
  assert.equal(await enrollBlind(state, request, refresh, 'blind-1', 'Hallway'), false);
- const successfulRequest: ApiRequest = async (path, options) => options?.method === 'POST' ? {} : request(path, options);
- assert.equal(await enrollBlind(state, successfulRequest, refresh, 'blind-1', 'Hallway'), true);
+ let sentBody: Record<string, unknown> = {};
+ const successfulRequest: ApiRequest = async (path, options) => {
+  if(options?.method==='POST')sentBody=requestBody(options);
+  return options?.method === 'POST' ? {} : request(path, options);
+ };
+ assert.equal(await enrollBlind(state, successfulRequest, refresh, 'blind-1', 'Hallway', 'Study'), true);
+ assert.deepEqual(sentBody,{observed_device_id:'blind-1',label:'Hallway',room:'Study'});
  assert.equal(notices.length,2);
  assert.equal(notices[0].tone,'error');
  assert.match(notices[0].message,/Device is no longer fresh/);
  assert.equal(notices[1].tone,'success');
  assert.match(notices[1].message,/Hallway.*added/i);
+});
+
+test('room assignment uses the room API, refreshes managed state, and keeps errors visible',async()=>{
+ const {updateBlindRoom}=await import('../app.mjs') as unknown as {
+  updateBlindRoom:(target:RefreshTarget,request:ApiRequest,refresh:()=>Promise<unknown>,id:string,room:string|null)=>Promise<boolean>;
+ };
+ const notices:Notification[]=[];
+ const calls:Array<[string,RequestInit|undefined]> = [];
+ let refreshed=0;
+ const state:RefreshTarget={notify:item=>notices.push(item)};
+ const request:ApiRequest=async(path,options)=>{calls.push([path,options]);return {};};
+ assert.equal(await updateBlindRoom(state,request,async()=>{refreshed++;},'managed/a','Living Room'),true);
+ assert.equal(calls[0]?.[0],'/api/control/v1/devices/managed%2Fa');
+ assert.equal(calls[0]?.[1]?.method,'PATCH');
+ assert.deepEqual(requestBody(calls[0]?.[1]),{room:'Living Room'});
+ assert.equal(refreshed,1);
+ assert.equal(notices.at(-1)?.tone,'success');
+
+ const failing:ApiRequest=async()=>{throw new Error('Room name already exists');};
+ assert.equal(await updateBlindRoom(state,failing,async()=>{},'managed/a',null),false);
+ assert.equal(notices.at(-1)?.tone,'error');
+ assert.match(notices.at(-1)?.message||'',/Room name already exists/);
 });
 
 test('battery display shows estimated percentage and the age of the last reading', async () => {

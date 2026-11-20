@@ -10,7 +10,8 @@ use axum::{
 };
 use serde_json::{Value, json};
 use somaris::client::{
-    CalibrationAction, ClientOptions, RemoteAction, RemoteApiClient, validate_device_id,
+    CalibrationAction, ClientOptions, RemoteAction, RemoteApiClient, RemoteBatchAction,
+    validate_device_id,
 };
 use tokio::sync::Mutex;
 
@@ -236,6 +237,45 @@ async fn enrollment_client_matches_control_api_and_handles_no_content_removal() 
     );
     assert_eq!(requests[2].0, "DELETE");
     assert_eq!(requests[2].1, "/api/control/v1/devices/managed-1");
+}
+
+#[tokio::test]
+async fn client_covers_room_lifecycle_and_selected_batch_targets() {
+    let requests: Requests = Arc::default();
+    let client = test_client(requests.clone()).await;
+    client.get_rooms().await.unwrap();
+    client
+        .enroll_device_in_room("observed-1", "Main Window", Some("Living Room"))
+        .await
+        .unwrap();
+    client
+        .update_device_room("managed-1", Some("Study"))
+        .await
+        .unwrap();
+    client.rename_room("Living Room", "Lounge").await.unwrap();
+    client.remove_room("Lounge").await.unwrap();
+    let selected_targets = vec!["managed-1".to_owned(), "managed-2".to_owned()];
+    client
+        .submit_batch(
+            RemoteBatchAction::Close,
+            Some(&selected_targets),
+            "room-close",
+        )
+        .await
+        .unwrap();
+
+    let requests = requests.lock().await;
+    assert_eq!(requests[0].0, "GET");
+    assert_eq!(requests[0].1, "/api/control/v1/rooms");
+    assert_eq!(requests[1].3["room"], "Living Room");
+    assert_eq!(requests[2].0, "PATCH");
+    assert_eq!(requests[2].3, json!({"room":"Study"}));
+    assert_eq!(requests[3].1, "/api/control/v1/rooms/Living%20Room");
+    assert_eq!(requests[4].0, "DELETE");
+    assert_eq!(requests[5].0, "POST");
+    assert_eq!(requests[5].3["action"], "close");
+    assert_eq!(requests[5].3["targets"], json!(["managed-1", "managed-2"]));
+    assert_eq!(requests[5].2["idempotency-key"], "room-close");
 }
 
 #[tokio::test]

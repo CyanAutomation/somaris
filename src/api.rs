@@ -32,7 +32,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{get, patch, post, put},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1770,6 +1770,7 @@ pub fn router(state: AppState) -> Router {
             axum::http::Method::GET,
             axum::http::Method::POST,
             axum::http::Method::PUT,
+            axum::http::Method::PATCH,
             axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ])
@@ -1842,7 +1843,14 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/control/v1/devices/{id}",
-            delete(remove_enrollment).options(preflight),
+            patch(update_device_room)
+                .delete(remove_enrollment)
+                .options(preflight),
+        )
+        .route("/api/control/v1/rooms", get(list_rooms).options(preflight))
+        .route(
+            "/api/control/v1/rooms/{name}",
+            patch(rename_room).delete(remove_room).options(preflight),
         )
         .route(
             "/api/control/v1/devices/{id}/commands",
@@ -2193,7 +2201,10 @@ async fn enforce_cors_contract(
         && request_path.starts_with("/api/")
         && matches!(
             *request.method(),
-            axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::DELETE
+            axum::http::Method::POST
+                | axum::http::Method::PUT
+                | axum::http::Method::PATCH
+                | axum::http::Method::DELETE
         )
         && !request_has_same_origin(&request)
     {
@@ -2221,6 +2232,7 @@ async fn enforce_cors_contract(
                 axum::http::Method::GET
                     | axum::http::Method::POST
                     | axum::http::Method::PUT
+                    | axum::http::Method::PATCH
                     | axum::http::Method::DELETE
                     | axum::http::Method::OPTIONS
             )
@@ -3057,6 +3069,9 @@ struct RegistryDiagnostics {
 enum ActivityKind {
     EnrollmentAdded,
     EnrollmentRemoved,
+    RoomAssignmentChanged,
+    RoomRenamed,
+    RoomRemoved,
     Command,
     Batch,
     SimulatorSettingsChanged,
@@ -3303,6 +3318,39 @@ pub struct ControlPosition {
 struct EnrollmentRequest {
     observed_device_id: String,
     label: String,
+    #[serde(default)]
+    room: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoomAssignmentRequest {
+    room: RoomAssignment,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RoomAssignment {
+    Name(String),
+    Unassigned(()),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameRoomRequest {
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RoomSummary {
+    name: String,
+    blind_count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RoomMutationResult {
+    room: String,
+    updated_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3485,6 +3533,8 @@ struct CommandAttempt {
 #[serde(deny_unknown_fields)]
 struct BatchCommandRequest {
     action: Action,
+    #[serde(default)]
+    targets: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3511,6 +3561,8 @@ struct BatchSkipped {
 struct Batch {
     id: String,
     action: Action,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_targets: Option<Vec<String>>,
     status: String,
     accepted_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4461,6 +4513,344 @@ async fn list_managed_devices(RequestState(state): RequestState, headers: Header
     )
 }
 
+async fn list_rooms(RequestState(state): RequestState, headers: HeaderMap) -> Response {
+    let inner = state.inner.lock().await;
+    let rooms = room_summaries(&inner.enrollments);
+    conditional_json(
+        &headers,
+        rooms.clone(),
+        envelope(rooms.clone(), Some(rooms.len() as u64)),
+    )
+}
+
+async fn update_device_room(
+    RequestState(state): RequestState,
+    RoutePath(id): RoutePath<String>,
+    payload: Result<Json<RoomAssignmentRequest>, JsonRejection>,
+) -> Response {
+    let request = match parse_json(payload) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let requested_room = match request.room {
+        RoomAssignment::Name(room) => match validate_room_name(&room) {
+            Ok(room) => Some(room),
+            Err(()) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_room",
+                    "room must contain 1 to 40 characters and cannot be named Unassigned.",
+                );
+            }
+        },
+        RoomAssignment::Unassigned(()) => None,
+    };
+    let mut inner = state.inner.lock().await;
+    let Some(current) = inner.enrollments.get(&id).cloned() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "enrollment_not_found",
+            "Managed-device enrollment was not found.",
+        );
+    };
+    let room = requested_room
+        .as_deref()
+        .map(|room| canonical_room_name(&inner.enrollments, room));
+    let normalization_room = current.room.as_deref().or(room.as_deref());
+    let label = normalization_room
+        .map(|room| strip_room_prefix(&current.label, room))
+        .unwrap_or_else(|| current.label.clone());
+    let changed = current.room != room || current.label != label;
+    let Some(enrollment) = inner.enrollments.get_mut(&id) else {
+        unreachable!("enrollment was checked while holding the state lock");
+    };
+    enrollment.room = room.clone();
+    enrollment.label = label;
+    let enrollment = enrollment.clone();
+    if changed {
+        let detail = match room.as_deref() {
+            Some(room) => format!("Room: {room}"),
+            None => "Room: Unassigned".to_owned(),
+        };
+        record_activity(
+            &mut inner,
+            None,
+            ActivityKind::RoomAssignmentChanged,
+            Some(enrollment.label.clone()),
+            None,
+            None,
+            Some(detail),
+        );
+    }
+    if changed && state.persist(&inner).await.is_err() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_outcome_unknown",
+            "Room assignment may have been saved; refresh the managed-device list.",
+        );
+    }
+    let managed = managed_device(&inner, enrollment);
+    (StatusCode::OK, Json(envelope(managed, None))).into_response()
+}
+
+async fn rename_room(
+    RequestState(state): RequestState,
+    RoutePath(name): RoutePath<String>,
+    payload: Result<Json<RenameRoomRequest>, JsonRejection>,
+) -> Response {
+    let request = match parse_json(payload) {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let old_name = match validate_room_name(&name) {
+        Ok(room) => room,
+        Err(()) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_room",
+                "Room names must contain 1 to 40 characters and cannot be named Unassigned.",
+            );
+        }
+    };
+    let new_name = match validate_room_name(&request.name) {
+        Ok(room) => room,
+        Err(()) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_room",
+                "Room names must contain 1 to 40 characters and cannot be named Unassigned.",
+            );
+        }
+    };
+    let old_key = room_key(&old_name);
+    let new_key = room_key(&new_name);
+    let mut inner = state.inner.lock().await;
+    let Some(canonical_old_name) = inner
+        .enrollments
+        .values()
+        .filter_map(|enrollment| enrollment.room.as_deref())
+        .filter(|room| room_key(room) == old_key)
+        .min_by(|left, right| left.cmp(right))
+        .map(str::to_owned)
+    else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "room_not_found",
+            "No enrolled blinds are assigned to this room.",
+        );
+    };
+    if new_key != old_key
+        && inner
+            .enrollments
+            .values()
+            .filter_map(|enrollment| enrollment.room.as_deref())
+            .any(|room| room_key(room) == new_key)
+    {
+        return error_response(
+            StatusCode::CONFLICT,
+            "room_name_conflict",
+            "A room with that name already exists.",
+        );
+    }
+    if new_name == canonical_old_name {
+        return (
+            StatusCode::OK,
+            Json(envelope(
+                RoomMutationResult {
+                    room: new_name,
+                    updated_count: 0,
+                },
+                None,
+            )),
+        )
+            .into_response();
+    }
+    let mut updated_count = 0;
+    for enrollment in inner.enrollments.values_mut() {
+        if enrollment
+            .room
+            .as_deref()
+            .is_some_and(|room| room_key(room) == old_key)
+        {
+            enrollment.label = strip_room_prefix(&enrollment.label, &canonical_old_name);
+            enrollment.room = Some(new_name.clone());
+            updated_count += 1;
+        }
+    }
+    record_activity(
+        &mut inner,
+        None,
+        ActivityKind::RoomRenamed,
+        Some(canonical_old_name.clone()),
+        None,
+        None,
+        Some(format!("Renamed to {new_name} · {updated_count} blinds")),
+    );
+    if state.persist(&inner).await.is_err() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_outcome_unknown",
+            "Room rename may have been saved; refresh the managed-device list.",
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(envelope(
+            RoomMutationResult {
+                room: new_name,
+                updated_count,
+            },
+            None,
+        )),
+    )
+        .into_response()
+}
+
+async fn remove_room(
+    RequestState(state): RequestState,
+    RoutePath(name): RoutePath<String>,
+) -> Response {
+    let room_name = match validate_room_name(&name) {
+        Ok(room) => room,
+        Err(()) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_room",
+                "Room names must contain 1 to 40 characters and cannot be named Unassigned.",
+            );
+        }
+    };
+    let key = room_key(&room_name);
+    let mut inner = state.inner.lock().await;
+    let Some(canonical_name) = inner
+        .enrollments
+        .values()
+        .filter_map(|enrollment| enrollment.room.as_deref())
+        .filter(|room| room_key(room) == key)
+        .min_by(|left, right| left.cmp(right))
+        .map(str::to_owned)
+    else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "room_not_found",
+            "No enrolled blinds are assigned to this room.",
+        );
+    };
+    let mut updated_count = 0;
+    for enrollment in inner.enrollments.values_mut() {
+        if enrollment
+            .room
+            .as_deref()
+            .is_some_and(|room| room_key(room) == key)
+        {
+            enrollment.label = strip_room_prefix(&enrollment.label, &canonical_name);
+            enrollment.room = None;
+            updated_count += 1;
+        }
+    }
+    record_activity(
+        &mut inner,
+        None,
+        ActivityKind::RoomRemoved,
+        Some(canonical_name.clone()),
+        None,
+        None,
+        Some(format!("Unassigned {updated_count} blinds")),
+    );
+    if state.persist(&inner).await.is_err() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_outcome_unknown",
+            "Room removal may have been saved; refresh the managed-device list.",
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(envelope(
+            RoomMutationResult {
+                room: canonical_name,
+                updated_count,
+            },
+            None,
+        )),
+    )
+        .into_response()
+}
+
+fn room_key(room: &str) -> String {
+    room.to_lowercase()
+}
+
+fn validate_room_name(room: &str) -> Result<String, ()> {
+    let room = room.trim();
+    if room.is_empty() || room.chars().count() > 40 || room.eq_ignore_ascii_case("unassigned") {
+        return Err(());
+    }
+    Ok(room.to_owned())
+}
+
+fn canonical_room_name(enrollments: &HashMap<String, Enrollment>, room: &str) -> String {
+    let key = room_key(room);
+    enrollments
+        .values()
+        .filter_map(|enrollment| enrollment.room.as_deref())
+        .find(|existing| room_key(existing) == key)
+        .unwrap_or(room)
+        .to_owned()
+}
+
+fn room_summaries(enrollments: &HashMap<String, Enrollment>) -> Vec<RoomSummary> {
+    let mut by_key: HashMap<String, RoomSummary> = HashMap::new();
+    for room in enrollments
+        .values()
+        .filter_map(|enrollment| enrollment.room.as_deref())
+    {
+        let key = room_key(room);
+        let entry = by_key.entry(key).or_insert_with(|| RoomSummary {
+            name: room.to_owned(),
+            blind_count: 0,
+        });
+        if room < entry.name.as_str() {
+            entry.name = room.to_owned();
+        }
+        entry.blind_count += 1;
+    }
+    let mut rooms: Vec<_> = by_key.into_values().collect();
+    rooms.sort_by(|left, right| {
+        room_key(&left.name)
+            .cmp(&room_key(&right.name))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    rooms
+}
+
+fn strip_room_prefix(label: &str, room: &str) -> String {
+    if room.is_empty() {
+        return label.to_owned();
+    }
+    let mut label_chars = label.char_indices();
+    let mut prefix_end = 0;
+    for room_char in room.chars() {
+        let Some((byte_index, label_char)) = label_chars.next() else {
+            return label.to_owned();
+        };
+        if label_char.to_lowercase().to_string() != room_char.to_lowercase().to_string() {
+            return label.to_owned();
+        }
+        prefix_end = byte_index + label_char.len_utf8();
+    }
+    let remainder = label[prefix_end..].trim_start();
+    for separator in ['—', '–', '-', ':'] {
+        if let Some(suffix) = remainder.strip_prefix(separator) {
+            let suffix = suffix.trim();
+            if !suffix.is_empty() {
+                return suffix.to_owned();
+            }
+        }
+    }
+    label.to_owned()
+}
+
 async fn get_motor_settings(
     RequestState(state): RequestState,
     RoutePath(managed_device_id): RoutePath<String>,
@@ -4638,6 +5028,19 @@ async fn enroll_device(
             "label must contain 1 to 64 characters.",
         );
     }
+    let requested_room = match request.room.as_deref() {
+        Some(room) => match validate_room_name(room) {
+            Ok(room) => Some(room),
+            Err(()) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_room",
+                    "room must contain 1 to 40 characters and cannot be named Unassigned.",
+                );
+            }
+        },
+        None => None,
+    };
     let mut inner = state.inner.lock().await;
     prune_registry(&mut inner, Utc::now());
     let observed = if inner.simulator_enabled {
@@ -4733,14 +5136,21 @@ async fn enroll_device(
             "The advertised name matches more than one fresh device.",
         );
     }
+    let room = requested_room
+        .as_deref()
+        .map(|room| canonical_room_name(&inner.enrollments, room));
+    let label = room
+        .as_deref()
+        .map(|room| strip_room_prefix(label, room))
+        .unwrap_or_else(|| label.to_owned());
     let enrollment = Enrollment {
         id: Uuid::new_v4().to_string(),
-        label: label.to_owned(),
+        label,
         advertised_name: observed.advertised_name,
         logical_id,
         is_simulated: observed.is_simulated,
         created_at: Utc::now(),
-        room: None,
+        room,
     };
     inner
         .enrollments
@@ -5040,6 +5450,29 @@ async fn queue_batch(
             "Only open, close, and stop may target multiple devices.",
         );
     }
+    let requested_targets = match request.targets.as_ref() {
+        Some(targets) if targets.is_empty() => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_batch_targets",
+                "targets must contain at least one enrollment ID when provided.",
+            );
+        }
+        Some(targets) => {
+            let unique: HashSet<_> = targets.iter().collect();
+            if unique.len() != targets.len() {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_batch_targets",
+                    "targets must not contain duplicate enrollment IDs.",
+                );
+            }
+            let mut sorted = targets.clone();
+            sorted.sort();
+            Some(sorted)
+        }
+        None => None,
+    };
     let Some(key) = idempotency_key(&headers) else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -5053,19 +5486,35 @@ async fn queue_batch(
         if let Some(existing_id) = inner.batch_idempotency.get(&key_id)
             && let Some(existing) = inner.batches.get(existing_id)
         {
-            if existing.action == request.action {
+            if existing.action == request.action && existing.requested_targets == requested_targets
+            {
                 return (StatusCode::ACCEPTED, Json(envelope(existing.clone(), None)))
                     .into_response();
             }
             return error_response(
                 StatusCode::CONFLICT,
                 "idempotency_conflict",
-                "Idempotency-Key was already used with a different batch action.",
+                "Idempotency-Key was already used with a different action or target selection.",
             );
         }
         prune_journal(&mut inner, state.retained_command_limit);
         prune_batch_journal(&mut inner, state.retained_batch_limit);
-        let mut enrollments: Vec<_> = inner.enrollments.values().cloned().collect();
+        let mut enrollments: Vec<_> = if let Some(targets) = requested_targets.as_ref() {
+            let mut selected = Vec::with_capacity(targets.len());
+            for target_id in targets {
+                let Some(enrollment) = inner.enrollments.get(target_id) else {
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        "enrollment_not_found",
+                        "A requested batch target is not currently enrolled.",
+                    );
+                };
+                selected.push(enrollment.clone());
+            }
+            selected
+        } else {
+            inner.enrollments.values().cloned().collect()
+        };
         enrollments.sort_by(|a, b| a.label.cmp(&b.label));
         let ready_count = enrollments
             .iter()
@@ -5174,6 +5623,7 @@ async fn queue_batch(
         let batch = Batch {
             id: Uuid::new_v4().to_string(),
             action: request.action,
+            requested_targets,
             status: "queued".into(),
             accepted_at: now,
             started_at: None,
@@ -7926,6 +8376,7 @@ mod security_hardening_tests {
                 Ok(Json(EnrollmentRequest {
                     observed_device_id: id.into(),
                     label: label.into(),
+                    room: None,
                 })),
             )
             .await;
@@ -7937,6 +8388,7 @@ mod security_hardening_tests {
             Ok(Json(EnrollmentRequest {
                 observed_device_id: "simulator-3".into(),
                 label: third_name.into(),
+                room: None,
             })),
         )
         .await;
@@ -7952,6 +8404,7 @@ mod security_hardening_tests {
             Ok(Json(EnrollmentRequest {
                 observed_device_id: "physical-1".into(),
                 label: "Physical Blind".into(),
+                room: None,
             })),
         )
         .await;
@@ -7991,6 +8444,7 @@ mod security_hardening_tests {
             Ok(Json(EnrollmentRequest {
                 observed_device_id: "simulator-3".into(),
                 label: third_name.into(),
+                room: None,
             })),
         )
         .await;

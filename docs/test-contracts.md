@@ -20,7 +20,14 @@ These stable identifiers link regression tests to the behavior they protect. The
 - **UI-THEME-01 — Opt-in themes:** Dark remains the default; Light and High contrast are explicit choices, while Auto follows system color and contrast preferences.
 - **UI-UNDO-01 — Undo positioning and bulk actions:** Position and completed all-blinds actions offer icon-only undo actions. A later command on an affected blind invalidates its bulk undo.
 - **UI-PREF-01 — Display and theme selection:** Selecting a supported display mode or theme applies that preference. Unsupported values and unrelated actions do not apply a preference.
-- **UI-ROOM-01 — Room grouping:** Room groups show their room name. At a desktop width that supports two columns, a one-blind group uses the same card width as each card in a pair.
+- **UI-ROOM-01 — Room grouping:** Assigned blinds are grouped under their room and blinds without a room appear under Unassigned. Grouped card names omit a matching room-name prefix and separator. At a desktop width that supports two columns, a one-blind group uses the same card width as each card in a pair.
+- **UI-ROOM-02 — Room management:** Add-blind and blind-details flows offer Unassigned, existing room suggestions, and a custom room name. Room names are trimmed, limited to 40 characters, and reserve Unassigned. A room rename updates all members; removing a room moves them to Unassigned without changing enrollment IDs. Room controls remain keyboard accessible and provide 44 CSS-pixel targets on small screens.
+
+## API
+
+- **API-ROOM-01 — Persisted room assignment:** Enrollment accepts an optional room; the managed-device record exposes the persisted assignment. Updating or clearing a room keeps the enrollment ID and history association.
+- **API-ROOM-02 — Derived room lifecycle:** Room listing contains the case-insensitive unique labels in use. Rename updates all members together; removal clears every member's assignment. Invalid, reserved, too-long, missing, and conflicting room names return documented errors.
+- **API-BATCH-01 — Selected targets:** Batch requests may specify unique enrollment IDs. Omitted targets preserve the all-enrolled behavior; explicit selections are snapshotted and included in idempotency comparisons.
 - **UI-SERVICE-01 — Service summary:** The dashboard exposes a visible action to open service status and renders its summary as text.
 
 ## Bluetooth cleanup
