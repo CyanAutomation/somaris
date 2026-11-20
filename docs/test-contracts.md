@@ -14,13 +14,13 @@ These stable identifiers link regression tests to the behavior they protect. The
 - **UI-PWA-01 — Offline app shell:** The manifest and root-scoped worker are served with the correct content types; the worker caches only versioned static shell assets and bypasses every `/api/*` request.
 - **UI-STATUS-01 — Plain-language status with diagnostics:** Main cards use the plain-language availability labels; technical GATT, advertisement-age, travel-rate, failure, and transport details remain available inside the device page’s Advanced disclosure.
 - **UI-POSITION-01 — Direct and preset positioning:** Position-capable blinds expose a keyboard-accessible graphic slider, a range fallback, and five labelled percent-open presets. Position commands commit on release and convert to the API's percent-closed contract. The panel view keeps its compact controls.
-- **UI-NAV-01 — Mobile navigation:** Mobile tabs show a text label below each icon, mark the active route, and provide 44×44 CSS-pixel targets. Panel mode hides the tab bar.
+- **UI-NAV-01 — Mobile navigation:** Mobile tabs show a text label below each icon, mark the active route, and provide 44×44 CSS-pixel targets. Settings replaces service status in the tab bar. Panel mode hides the tab bar.
 - **UI-REFRESH-01 — Stable refresh during interaction:** Periodic refresh pauses during a graphic or range drag, while a text input/select/textarea has focus, or while a confirmation is open. Quiet refreshes preserve card controls and focus.
 - **UI-INPUT-01 — Inline enrollment validation:** Display names are required, limited to 64 characters, and report errors with `aria-invalid` and `aria-describedby` before the add request is sent.
-- **UI-THEME-01 — Opt-in themes:** Dark remains the default; Light and High contrast are explicit choices, while Auto follows system color and contrast preferences.
+- **UI-THEME-01 — Theme controls:** The header icon toggles directly between explicit Dark and Light themes and updates its glyph. Auto and High contrast remain selectable from Settings; Auto follows system color and contrast preferences.
 - **UI-UNDO-01 — Undo positioning and bulk actions:** Position and completed all-blinds actions offer icon-only undo actions. A later command on an affected blind invalidates its bulk undo.
-- **UI-PREF-01 — Display and theme selection:** Selecting a supported display mode or theme applies that preference. Unsupported values and unrelated actions do not apply a preference.
-- **UI-ROOM-01 — Room grouping:** Assigned blinds are grouped under their room and blinds without a room appear under Unassigned. Grouped card names omit a matching room-name prefix and separator. At a desktop width that supports two columns, a one-blind group uses the same card width as each card in a pair.
+- **UI-PREF-01 — Display and theme selection:** The icon-only layout control cycles Auto, Mobile, Compact, and Desktop in that order and updates its glyph and accessible name. The theme icon toggles Dark and Light. Unsupported theme values do not apply.
+- **UI-ROOM-01 — Room grouping:** Assigned blinds retain visible room labels and blinds without a room appear under Unassigned. Card names omit a matching room-name prefix and separator. All room cards use one responsive grid so room boundaries do not force a new row or leave unused columns.
 - **UI-ROOM-02 — Room management:** Add-blind and blind-details flows offer Unassigned, existing room suggestions, and a custom room name. Room names are trimmed, limited to 40 characters, and reserve Unassigned. A room rename updates all members; removing a room moves them to Unassigned without changing enrollment IDs. Room controls remain keyboard accessible and provide 44 CSS-pixel targets on small screens.
 
 ## API
@@ -28,7 +28,7 @@ These stable identifiers link regression tests to the behavior they protect. The
 - **API-ROOM-01 — Persisted room assignment:** Enrollment accepts an optional room; the managed-device record exposes the persisted assignment. Updating or clearing a room keeps the enrollment ID and history association.
 - **API-ROOM-02 — Derived room lifecycle:** Room listing contains the case-insensitive unique labels in use. Rename updates all members together; removal clears every member's assignment. Invalid, reserved, too-long, missing, and conflicting room names return documented errors.
 - **API-BATCH-01 — Selected targets:** Batch requests may specify unique enrollment IDs. Omitted targets preserve the all-enrolled behavior; explicit selections are snapshotted and included in idempotency comparisons.
-- **UI-SERVICE-01 — Service summary:** The dashboard exposes a visible action to open service status and renders its summary as text.
+- **UI-SERVICE-01 — Settings and service summary:** The dashboard exposes a Settings icon action and Settings page. Service diagnostics remain available there, and the summary renders as text.
 
 ## Bluetooth cleanup
 
