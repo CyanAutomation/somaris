@@ -17,6 +17,14 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
         ),
         ("/sw.js", "text/javascript", "precache-manifest"),
         ("/ui/app.mjs", "text/javascript", "resolveDisplayMode"),
+        ("/ui/add-page.mjs", "text/javascript", "renderAddDevicePage"),
+        ("/ui/lazy-module.mjs", "text/javascript", "createLazyModule"),
+        ("/ui/pagination.mjs", "text/javascript", "windowPage"),
+        (
+            "/ui/settings-page.mjs",
+            "text/javascript",
+            "renderSettingsPage",
+        ),
         ("/ui/clock.mjs", "text/javascript", "formatClockTime"),
         (
             "/ui/api-docs.mjs",
@@ -76,7 +84,11 @@ async fn service_worker_is_allowed_to_control_the_root_scope_and_skips_api_respo
     let worker = String::from_utf8_lossy(&body);
     assert!(worker.contains("url.pathname.startsWith('/api/')"));
     assert!(worker.contains("precache-manifest"));
+    assert!(worker.contains("'/ui/add-page.mjs'"));
     assert!(worker.contains("'/ui/clock.mjs'"));
+    assert!(worker.contains("'/ui/lazy-module.mjs'"));
+    assert!(worker.contains("'/ui/pagination.mjs'"));
+    assert!(worker.contains("'/ui/settings-page.mjs'"));
 }
 
 #[tokio::test]
@@ -115,13 +127,17 @@ fn module_import_paths(source_path: &str, source: &str) -> Vec<String> {
         .lines()
         .filter_map(|line| {
             let line = line.trim();
-            let declaration = line
-                .strip_prefix("import ")
-                .or_else(|| line.strip_prefix("export "))?;
-            let specifier = declaration
-                .split_once(" from ")
-                .map_or(declaration, |(_, specifier)| specifier)
-                .trim();
+            let specifier = if let Some(index) = line.find("import(") {
+                line[index + "import(".len()..].split_once(')')?.0.trim()
+            } else {
+                let declaration = line
+                    .strip_prefix("import ")
+                    .or_else(|| line.strip_prefix("export "))?;
+                declaration
+                    .split_once(" from ")
+                    .map_or(declaration, |(_, specifier)| specifier)
+                    .trim()
+            };
             let quote = specifier.chars().next()?;
             if quote != '\'' && quote != '"' {
                 return None;
@@ -137,4 +153,12 @@ fn module_import_paths(source_path: &str, source: &str) -> Vec<String> {
             })
         })
         .collect()
+}
+
+#[test]
+fn module_import_paths_includes_dynamic_imports() {
+    assert_eq!(
+        module_import_paths("/ui/app.mjs", "const page = import('./add-page.mjs');"),
+        vec!["/ui/add-page.mjs"],
+    );
 }
