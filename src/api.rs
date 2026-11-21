@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration as StdDuration, Instant},
 };
@@ -14,6 +14,7 @@ use std::{
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use crate::{
+    auth::{AdminAuth, AuthFailure},
     ble::{
         BleAdapter, BleAttemptTimings, BleCommandControl, BleFailure, BleFailureCause,
         BleFailureStage, BleObservation, BleScanControl, BtleplugAdapter, MotorSpeedReadbackStatus,
@@ -24,12 +25,13 @@ use crate::{
         BlindCommand, BlindDriver, BlindMotion, BlindObservation, DeviceCapabilities,
         DriverFailure, DriverFailureKind, DriverRegistry, StateChange, StateChangePublisher,
     },
+    settings::{self, SettingsDocument},
 };
 use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        FromRequestParts, Path as RoutePath, Query, State,
+        FromRequestParts, OriginalUri, Path as RoutePath, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -100,6 +102,9 @@ const DEMO_SESSION_COOKIE: &str = "somaris-demo-session";
 const MAX_DEMO_SESSIONS: usize = 32;
 const DEMO_SESSION_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60);
 const DEMO_SESSION_COOKIE_MAX_AGE_SECONDS: u64 = 2 * 60 * 60;
+const ADMIN_SESSION_COOKIE: &str = "somaris-admin-session";
+const ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS: u64 = 12 * 60 * 60;
+type LogLevelReloader = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 const MAX_DEMO_COMMANDS: usize = 128;
 const MAX_DEMO_BATCHES: usize = 64;
 const MAX_DEMO_HISTORY: usize = 5_000;
@@ -161,33 +166,6 @@ impl QueueConfig {
         }
         Ok(self)
     }
-
-    fn from_environment() -> io::Result<Self> {
-        let defaults = Self::default();
-        let config = Self {
-            max_outstanding_commands: env_positive_usize(
-                "SOMARIS_COMMAND_MAX_OUTSTANDING",
-                defaults.max_outstanding_commands,
-            )?,
-            max_queued_per_device: env_positive_usize(
-                "SOMARIS_COMMAND_MAX_QUEUED_PER_DEVICE",
-                defaults.max_queued_per_device,
-            )?,
-            adapter_concurrency: env_positive_usize(
-                "SOMARIS_ADAPTER_CONCURRENCY",
-                defaults.adapter_concurrency,
-            )?,
-            adapter_scan_window_ms: env_positive_u64(
-                "SOMARIS_ADAPTER_SCAN_WINDOW_MS",
-                defaults.adapter_scan_window_ms,
-            )?,
-            queue_wait_timeout_seconds: env_positive_usize(
-                "SOMARIS_COMMAND_QUEUE_WAIT_TIMEOUT_SECONDS",
-                defaults.queue_wait_timeout_seconds as usize,
-            )? as i64,
-        };
-        config.validate().map_err(invalid_configuration)
-    }
 }
 
 fn parse_allowed_origins(value: &str) -> Result<Vec<HeaderValue>, String> {
@@ -221,22 +199,6 @@ fn parse_allowed_origins(value: &str) -> Result<Vec<HeaderValue>, String> {
         .collect()
 }
 
-fn env_positive_usize(name: &str, default: usize) -> io::Result<usize> {
-    let Ok(value) = std::env::var(name) else {
-        return Ok(default);
-    };
-    let parsed = value.parse::<usize>().ok().filter(|value| *value > 0);
-    parsed.ok_or_else(|| invalid_configuration(format!("{name} must be a positive integer")))
-}
-
-fn env_positive_u64(name: &str, default: u64) -> io::Result<u64> {
-    let Ok(value) = std::env::var(name) else {
-        return Ok(default);
-    };
-    let parsed = value.parse::<u64>().ok().filter(|value| *value > 0);
-    parsed.ok_or_else(|| invalid_configuration(format!("{name} must be a positive integer")))
-}
-
 fn invalid_configuration(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -255,16 +217,21 @@ pub struct AppState {
     integration_poll_attempts: Arc<Mutex<HashMap<String, Instant>>>,
     integration_enrollment_probes: Arc<Semaphore>,
     ble_enabled: bool,
-    queue_config: QueueConfig,
-    allowed_origins: Vec<HeaderValue>,
+    queue_config: Arc<std::sync::RwLock<QueueConfig>>,
+    allowed_origins: Arc<std::sync::RwLock<Vec<HeaderValue>>>,
+    settings_document: Arc<RwLock<SettingsDocument>>,
+    settings_environment: Arc<HashMap<String, String>>,
+    settings_path: Option<PathBuf>,
+    admin_auth: Arc<Mutex<AdminAuth>>,
+    log_level_reloader: Arc<std::sync::RwLock<Option<LogLevelReloader>>>,
     started_at: DateTime<Utc>,
     started: Instant,
-    history_path: Option<PathBuf>,
     history_storage_path: Option<PathBuf>,
     history_persist_lock: Arc<Mutex<()>>,
     history_revision: Arc<AtomicU64>,
     history_persisted_cursor: Arc<AtomicU64>,
     history_persisted_count: Arc<AtomicUsize>,
+    history_api_enabled: Arc<AtomicBool>,
     data_path: Option<PathBuf>,
     state_changes: StateChangePublisher,
     demo_mode: bool,
@@ -272,7 +239,7 @@ pub struct AppState {
     background_cancel: watch::Sender<bool>,
     retained_command_limit: usize,
     retained_batch_limit: usize,
-    history_limit: usize,
+    history_limit: Arc<std::sync::RwLock<usize>>,
 }
 
 #[derive(Default)]
@@ -633,6 +600,27 @@ impl AppState {
         Self::configured(true, None, None)
     }
 
+    fn queue_config_snapshot(&self) -> QueueConfig {
+        *self
+            .queue_config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn history_limit(&self) -> usize {
+        *self
+            .history_limit
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn allowed_origins_snapshot(&self) -> Vec<HeaderValue> {
+        self.allowed_origins
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn with_history_path(path: impl Into<PathBuf>) -> Self {
         Self::configured(true, Some(path.into()), None)
     }
@@ -641,16 +629,27 @@ impl AppState {
     pub fn with_demo_mode(mut self) -> Self {
         self.demo_mode = true;
         self.ble_enabled = false;
-        self.history_path = None;
         self.history_storage_path = None;
         self.data_path = None;
         self.retained_command_limit = MAX_DEMO_COMMANDS;
         self.retained_batch_limit = MAX_DEMO_BATCHES;
-        self.history_limit = MAX_DEMO_HISTORY;
+        *self
+            .history_limit
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = MAX_DEMO_HISTORY;
+        self.history_api_enabled.store(false, Ordering::Release);
         self.demo_sessions = Some(Arc::new(Mutex::new(DemoSessionStore::default())));
-        self.queue_config.max_outstanding_commands = 32;
-        self.queue_config.max_queued_per_device = 8;
-        self.adapter_slots = Arc::new(Semaphore::new(self.queue_config.adapter_concurrency));
+        {
+            let mut queue = self
+                .queue_config
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.max_outstanding_commands = 32;
+            queue.max_queued_per_device = 8;
+        }
+        self.adapter_slots = Arc::new(Semaphore::new(
+            self.queue_config_snapshot().adapter_concurrency,
+        ));
         let mut inner = self
             .inner
             .try_lock()
@@ -669,7 +668,10 @@ impl AppState {
     pub fn with_queue_config(mut self, config: QueueConfig) -> Result<Self, String> {
         let config = config.validate()?;
         self.adapter_slots = Arc::new(Semaphore::new(config.adapter_concurrency));
-        self.queue_config = config;
+        *self
+            .queue_config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
         Ok(self)
     }
 
@@ -687,7 +689,7 @@ impl AppState {
         self
     }
 
-    pub fn with_allowed_origins<I, S>(mut self, origins: I) -> Result<Self, String>
+    pub fn with_allowed_origins<I, S>(self, origins: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -696,12 +698,54 @@ impl AppState {
             .into_iter()
             .map(|origin| origin.as_ref().to_owned())
             .collect::<Vec<_>>();
-        self.allowed_origins = parse_allowed_origins(&values.join(","))?;
+        *self
+            .allowed_origins
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            parse_allowed_origins(&values.join(","))?;
         Ok(self)
     }
 
     pub async fn from_data_path(path: impl Into<PathBuf>) -> io::Result<Self> {
-        let state = Self::configured(true, None, Some(path.into()));
+        let data_path = path.into();
+        let settings_path = data_path.with_file_name("settings.json");
+        let settings_document = SettingsDocument::load(&settings_path)?;
+        let settings_environment = HashMap::new();
+        let resolved = settings::resolve(&settings_document, &settings_environment)
+            .map_err(invalid_configuration)?;
+        let values = resolved.values;
+        let history_path = values
+            .history_api_enabled
+            .value
+            .then(|| data_path.with_extension("history.jsonl"));
+        let mut state = Self::configured(
+            values.simulator_enabled.value,
+            history_path,
+            Some(data_path.clone()),
+        );
+        state = state
+            .with_queue_config(QueueConfig {
+                max_outstanding_commands: values.queue_max_outstanding.value,
+                max_queued_per_device: values.queue_max_queued_per_device.value,
+                adapter_concurrency: values.adapter_concurrency.value,
+                adapter_scan_window_ms: values.adapter_scan_window_ms.value,
+                queue_wait_timeout_seconds: values.queue_wait_timeout_seconds.value as i64,
+            })
+            .map_err(invalid_configuration)?;
+        state = state
+            .with_allowed_origins(values.allowed_origins.value.iter())
+            .map_err(invalid_configuration)?;
+        *state
+            .history_limit
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = values.history_retention.value;
+        state.settings_document = Arc::new(RwLock::new(settings_document));
+        state.settings_environment = Arc::new(settings_environment);
+        state.settings_path = Some(settings_path);
+        state.admin_auth = Arc::new(Mutex::new(AdminAuth::load(Some(
+            data_path.with_file_name("admin-auth.json"),
+        ))?));
+        state.load_history_file().await?;
         state.load_durable_state().await?;
         state.resume_queued_commands().await;
         Ok(state)
@@ -716,24 +760,58 @@ impl AppState {
                 )
             })
             .unwrap_or(false);
-        let simulator_enabled = demo_mode
-            || std::env::var("SOMARIS_SIMULATOR")
-                .map(|value| !matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
-                .unwrap_or(true);
-        let history_path = (!demo_mode)
-            .then(|| std::env::var_os("SOMARIS_HISTORY_PATH").map(PathBuf::from))
-            .flatten();
         let data_path = (!demo_mode).then(|| {
             std::env::var_os("SOMARIS_DATA_DIR")
                 .map(|path| PathBuf::from(path).join("state.json"))
                 .unwrap_or_else(|| PathBuf::from("data/state.json"))
         });
+        let settings_path = data_path
+            .as_ref()
+            .map(|path| path.with_file_name("settings.json"));
+        let auth_path = data_path
+            .as_ref()
+            .map(|path| path.with_file_name("admin-auth.json"));
+        let settings_document = settings_path
+            .as_deref()
+            .map(SettingsDocument::load)
+            .transpose()?
+            .unwrap_or_default();
+        let settings_environment = settings::process_environment();
+        let resolved = settings::resolve(&settings_document, &settings_environment)
+            .map_err(invalid_configuration)?;
+        let values = resolved.values;
+        let simulator_enabled = demo_mode || values.simulator_enabled.value;
+        let explicit_history_path = std::env::var_os("SOMARIS_HISTORY_PATH").map(PathBuf::from);
+        let history_path = (!demo_mode && values.history_api_enabled.value).then(|| {
+            explicit_history_path.unwrap_or_else(|| {
+                data_path
+                    .as_ref()
+                    .map(|path| path.with_extension("history.jsonl"))
+                    .unwrap_or_else(|| PathBuf::from("data/history.jsonl"))
+            })
+        });
+        let queue_config = QueueConfig {
+            max_outstanding_commands: values.queue_max_outstanding.value,
+            max_queued_per_device: values.queue_max_queued_per_device.value,
+            adapter_concurrency: values.adapter_concurrency.value,
+            adapter_scan_window_ms: values.adapter_scan_window_ms.value,
+            queue_wait_timeout_seconds: values.queue_wait_timeout_seconds.value as i64,
+        };
         let mut state = Self::configured(simulator_enabled, history_path, data_path);
         state = state
-            .with_queue_config(QueueConfig::from_environment()?)
+            .with_queue_config(queue_config)
             .map_err(invalid_configuration)?;
-        let origins = std::env::var("SOMARIS_ALLOWED_ORIGINS").unwrap_or_default();
-        state.allowed_origins = parse_allowed_origins(&origins).map_err(invalid_configuration)?;
+        state = state
+            .with_allowed_origins(values.allowed_origins.value.iter())
+            .map_err(invalid_configuration)?;
+        *state
+            .history_limit
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = values.history_retention.value;
+        state.settings_document = Arc::new(RwLock::new(settings_document));
+        state.settings_environment = Arc::new(settings_environment);
+        state.settings_path = settings_path;
+        state.admin_auth = Arc::new(Mutex::new(AdminAuth::load(auth_path)?));
         if demo_mode {
             state = state.with_demo_mode();
         } else {
@@ -745,12 +823,37 @@ impl AppState {
         Ok(state)
     }
 
+    pub async fn log_admin_setup_code(&self) {
+        if let Some(code) = self.admin_auth.lock().await.setup_code() {
+            tracing::warn!(setup_code = %code, "Somaris admin setup code; enter it on the Settings page");
+        }
+    }
+
+    pub async fn install_log_level_reloader<F>(&self, reloader: F)
+    where
+        F: Fn(&str) -> Result<(), String> + Send + Sync + 'static,
+    {
+        let reloader: LogLevelReloader = Arc::new(reloader);
+        *self
+            .log_level_reloader
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reloader.clone());
+        let document = self.settings_document.read().await;
+        if let Ok(settings) = settings::resolve(&document, &self.settings_environment)
+            && settings.values.log_level.source != settings::SettingSource::Environment
+            && let Err(error) = reloader(&settings.values.log_level.value)
+        {
+            tracing::warn!(%error, "Could not apply configured log level");
+        }
+    }
+
     fn configured(
         simulator_enabled: bool,
         history_path: Option<PathBuf>,
         data_path: Option<PathBuf>,
     ) -> Self {
         let started_at = Utc::now();
+        let history_api_enabled = history_path.is_some();
         let history_storage_path = history_path.clone().or_else(|| {
             data_path
                 .as_ref()
@@ -799,6 +902,9 @@ impl AppState {
         let history_persisted_cursor = inner.history.back().map_or(0, |record| record.cursor);
         let history_persisted_count = inner.history.len();
         let queue_config = QueueConfig::default();
+        let settings_path = data_path
+            .as_ref()
+            .map(|path| path.with_file_name("settings.json"));
         let (pending_adapter_commands, _) = watch::channel(0_usize);
         let (scan_window_generation, _) = watch::channel(0_u64);
         let (background_cancel, _) = watch::channel(false);
@@ -817,16 +923,21 @@ impl AppState {
                 MAX_CONCURRENT_LAN_ENROLLMENT_PROBES,
             )),
             ble_enabled: false,
-            queue_config,
-            allowed_origins: Vec::new(),
+            queue_config: Arc::new(std::sync::RwLock::new(queue_config)),
+            allowed_origins: Arc::new(std::sync::RwLock::new(Vec::new())),
+            settings_document: Arc::new(RwLock::new(SettingsDocument::default())),
+            settings_environment: Arc::new(HashMap::new()),
+            settings_path,
+            admin_auth: Arc::new(Mutex::new(AdminAuth::memory())),
+            log_level_reloader: Arc::new(std::sync::RwLock::new(None)),
             started_at,
             started: Instant::now(),
-            history_path,
             history_storage_path,
             history_persist_lock: Arc::new(Mutex::new(())),
             history_revision: Arc::new(AtomicU64::new(0)),
             history_persisted_cursor: Arc::new(AtomicU64::new(history_persisted_cursor)),
             history_persisted_count: Arc::new(AtomicUsize::new(history_persisted_count)),
+            history_api_enabled: Arc::new(AtomicBool::new(history_api_enabled)),
             data_path,
             state_changes: StateChangePublisher::default(),
             demo_mode: false,
@@ -834,7 +945,7 @@ impl AppState {
             background_cancel,
             retained_command_limit: MAX_COMMANDS,
             retained_batch_limit: MAX_BATCHES,
-            history_limit: 50_000,
+            history_limit: Arc::new(std::sync::RwLock::new(50_000)),
         }
     }
 
@@ -842,12 +953,17 @@ impl AppState {
         let mut state = Self::configured(true, None, None);
         state.demo_mode = true;
         state.ble_enabled = false;
-        state.queue_config = self.queue_config;
-        state.adapter_slots = Arc::new(Semaphore::new(state.queue_config.adapter_concurrency));
-        state.allowed_origins = self.allowed_origins.clone();
+        let queue_config = self.queue_config_snapshot();
+        state.queue_config = Arc::new(std::sync::RwLock::new(queue_config));
+        state.adapter_slots = Arc::new(Semaphore::new(queue_config.adapter_concurrency));
+        state.allowed_origins = Arc::new(std::sync::RwLock::new(self.allowed_origins_snapshot()));
         state.retained_command_limit = MAX_DEMO_COMMANDS;
         state.retained_batch_limit = MAX_DEMO_BATCHES;
-        state.history_limit = MAX_DEMO_HISTORY;
+        *state
+            .history_limit
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = MAX_DEMO_HISTORY;
+        state.history_api_enabled.store(false, Ordering::Release);
         let mut inner = state
             .inner
             .try_lock()
@@ -1042,24 +1158,36 @@ impl AppState {
         let Some(path) = &self.history_storage_path else {
             return Ok(());
         };
-        let history = read_history(path)?;
+        let mut history = read_history(path)?;
+        let original_len = history.len();
         let mut inner = self.inner.lock().await;
         inner.next_cursor = history
             .last()
             .map(|record| record.cursor.saturating_add(1))
             .unwrap_or(1);
         inner.history = history.into();
+        prune_history(&mut inner, self.history_limit());
         inner.latest_history_by_device = inner
             .history
             .iter()
             .map(|record| (record.device_id.clone(), record.clone()))
             .collect();
+        history = inner.history.iter().cloned().collect();
+        let retained_count = history.len();
+        drop(inner);
+        if retained_count < original_len {
+            let path = path.clone();
+            let bytes = serialize_history(&history)?;
+            tokio::task::spawn_blocking(move || atomic_write(&path, &bytes))
+                .await
+                .map_err(io::Error::other)??;
+        }
         self.history_persisted_cursor.store(
-            inner.history.back().map_or(0, |record| record.cursor),
+            history.last().map_or(0, |record| record.cursor),
             Ordering::Release,
         );
         self.history_persisted_count
-            .store(inner.history.len(), Ordering::Release);
+            .store(retained_count, Ordering::Release);
         Ok(())
     }
 
@@ -1205,18 +1333,15 @@ impl AppState {
 
         // Keep an append-only hot path, and compact only after a bounded amount
         // of history has accumulated beyond the in-memory retention window.
-        if persisted_count > 51_000 {
+        let retention = self.history_limit();
+        if persisted_count > retention.saturating_add(1_000) {
             let compact_path = path.clone();
             let compacted_count = tokio::task::spawn_blocking(move || {
                 let mut records = read_history(&compact_path)?;
-                if records.len() > 50_000 {
-                    let remove = records.len() - 50_000;
+                if records.len() > retention {
+                    let remove = records.len() - retention;
                     records.drain(0..remove);
-                    let mut compacted = Vec::new();
-                    for record in &records {
-                        serde_json::to_writer(&mut compacted, record).map_err(io::Error::other)?;
-                        compacted.push(b'\n');
-                    }
+                    let compacted = serialize_history(&records)?;
                     atomic_write(&compact_path, &compacted)?;
                 }
                 Ok::<usize, io::Error>(records.len())
@@ -1351,7 +1476,8 @@ impl AppState {
                     {
                         state.state_changes.publish();
                     }
-                    let recorded = record_history(&mut inner, state.history_limit).unwrap_or(false);
+                    let recorded =
+                        record_history(&mut inner, state.history_limit()).unwrap_or(false);
                     if recorded {
                         let revision = state.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
                         Some((state.pending_history(&inner.history), revision))
@@ -1403,7 +1529,7 @@ impl AppState {
             let scan_permits = self
                 .adapter_slots
                 .clone()
-                .acquire_many_owned(self.queue_config.adapter_concurrency as u32)
+                .acquire_many_owned(self.queue_config_snapshot().adapter_concurrency as u32)
                 .await;
             let Ok(scan_permit) = scan_permits else {
                 tracing::error!("BLE adapter coordination semaphore closed; scanner stopped");
@@ -1428,8 +1554,9 @@ impl AppState {
                 inner.scanner.last_scan_started_at = Some(Utc::now());
                 inner.scanner.last_error_code = None;
             }
-            let scan_window =
-                std::time::Duration::from_millis(self.queue_config.adapter_scan_window_ms);
+            let scan_window = std::time::Duration::from_millis(
+                self.queue_config_snapshot().adapter_scan_window_ms,
+            );
             let scan_control = BleScanControl::new();
             let scan_task_control = scan_control.clone();
             let mut scan = tokio::spawn(async move {
@@ -1668,7 +1795,7 @@ impl AppState {
                     history_changed |= record_history_for_device(&mut inner, simulator);
                 }
             }
-            prune_history(&mut inner, self.history_limit);
+            prune_history(&mut inner, self.history_limit());
             if history_changed {
                 let revision = self.history_revision.fetch_add(1, Ordering::AcqRel) + 1;
                 Some((self.pending_history(&inner.history), revision))
@@ -1894,9 +2021,15 @@ impl Default for SimulatorConfig {
 
 pub fn router(state: AppState) -> Router {
     let allowed_origins = state.allowed_origins.clone();
+    let cors_allowed_origins = Arc::clone(&allowed_origins);
     let demo_mode = state.demo_mode;
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(allowed_origins.clone()))
+        .allow_origin(AllowOrigin::predicate(move |origin, _| {
+            cors_allowed_origins
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(origin)
+        }))
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
@@ -1908,10 +2041,16 @@ pub fn router(state: AppState) -> Router {
         .allow_headers([
             header::ACCEPT,
             header::CONTENT_TYPE,
+            header::IF_MATCH,
             header::IF_NONE_MATCH,
             header::HeaderName::from_static("idempotency-key"),
         ])
         .expose_headers([header::ETAG]);
+    let settings_route = if demo_mode {
+        get(get_settings).options(preflight)
+    } else {
+        get(get_settings).put(update_settings).options(preflight)
+    };
     let app = Router::new()
         .route("/", get(ui_index))
         .route("/manifest.webmanifest", get(ui_manifest))
@@ -2012,6 +2151,27 @@ pub fn router(state: AppState) -> Router {
             get(get_batch).options(preflight),
         )
         .route("/api/control/v1/queue", get(get_queue).options(preflight))
+        .route("/api/control/v1/settings", settings_route)
+        .route(
+            "/api/control/v1/setup-checks",
+            get(get_setup_checks).options(preflight),
+        )
+        .route(
+            "/api/control/v1/auth",
+            get(get_admin_auth_status).options(preflight),
+        )
+        .route(
+            "/api/control/v1/auth/setup",
+            post(setup_admin_auth).options(preflight),
+        )
+        .route(
+            "/api/control/v1/auth/login",
+            post(login_admin_auth).options(preflight),
+        )
+        .route(
+            "/api/control/v1/auth/logout",
+            post(logout_admin_auth).options(preflight),
+        )
         .route(
             "/api/control/v1/commands/{id}",
             get(get_command).options(preflight),
@@ -2023,7 +2183,14 @@ pub fn router(state: AppState) -> Router {
         app.route("/api/demo/session", post(demo_session).options(preflight))
             .route("/api/demo/reset", post(reset_demo).options(preflight))
     } else {
-        app
+        app.route(
+            "/api/control/v1/settings/reset",
+            post(reset_settings).options(preflight),
+        )
+        .route(
+            "/api/control/v1/service/restart",
+            post(restart_service).options(preflight),
+        )
     };
     app.with_state(state)
         .layer(cors)
@@ -2311,8 +2478,11 @@ fn request_is_secure(headers: &HeaderMap) -> bool {
 }
 
 fn request_has_same_origin(request: &axum::extract::Request) -> bool {
-    let Some(origin) = request
-        .headers()
+    request_headers_have_same_origin(request.headers(), request.uri())
+}
+
+fn request_headers_have_same_origin(headers: &HeaderMap, uri: &axum::http::Uri) -> bool {
+    let Some(origin) = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| Url::parse(value).ok())
@@ -2327,28 +2497,21 @@ fn request_has_same_origin(request: &axum::extract::Request) -> bool {
     {
         return false;
     }
-    let scheme = request
-        .headers()
+    let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
         .map(str::trim)
         .filter(|value| matches!(*value, "http" | "https"))
-        .or_else(|| request.uri().scheme_str())
+        .or_else(|| uri.scheme_str())
         .unwrap_or("http");
-    let authority = request
-        .headers()
+    let authority = headers
         .get("x-forwarded-host")
-        .or_else(|| request.headers().get(header::HOST))
+        .or_else(|| headers.get(header::HOST))
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
         .map(str::trim)
-        .or_else(|| {
-            request
-                .uri()
-                .authority()
-                .map(|authority| authority.as_str())
-        });
+        .or_else(|| uri.authority().map(|authority| authority.as_str()));
     let Some(authority) = authority else {
         return false;
     };
@@ -2359,7 +2522,7 @@ fn request_has_same_origin(request: &axum::extract::Request) -> bool {
 }
 
 async fn enforce_cors_contract(
-    State((allowed_origins, demo_mode)): State<(Vec<HeaderValue>, bool)>,
+    State((allowed_origins, demo_mode)): State<(Arc<std::sync::RwLock<Vec<HeaderValue>>>, bool)>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
@@ -2387,7 +2550,12 @@ async fn enforce_cors_contract(
             .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
     if is_preflight {
         let origin = request.headers().get(header::ORIGIN);
-        let allowed = origin.is_some_and(|origin| allowed_origins.contains(origin));
+        let allowed = origin.is_some_and(|origin| {
+            allowed_origins
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(origin)
+        });
         let requested_method = request
             .headers()
             .get(header::ACCESS_CONTROL_REQUEST_METHOD)
@@ -2565,7 +2733,7 @@ async fn diagnostics(RequestState(state): RequestState, headers: HeaderMap) -> R
     let data = Diagnostics {
         service_started_at: state.started_at,
         uptime_seconds: state.started.elapsed().as_secs_f64(),
-        history_enabled: state.history_path.is_some(),
+        history_enabled: state.history_api_enabled.load(Ordering::Acquire),
         demo_mode: state.demo_mode,
         simulator_ready: inner.simulator_enabled,
         scanner: ScannerDiagnostics {
@@ -2650,13 +2818,13 @@ async fn get_history(
     headers: HeaderMap,
     query: Result<Query<HistoryQuery>, QueryRejection>,
 ) -> Response {
-    let Some(_path) = &state.history_path else {
+    if !state.history_api_enabled.load(Ordering::Acquire) {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "history_disabled",
             "Persistent history is not configured.",
         );
-    };
+    }
     let Query(query) = match query {
         Ok(query) => query,
         Err(_) => {
@@ -2956,7 +3124,7 @@ async fn reset_simulator_for(
     device.movement_status = MovementStatus::AtTarget;
     device.last_seen_at = now;
     let subject = device.advertised_name.clone();
-    let history_changed = match record_history(&mut inner, state.history_limit) {
+    let history_changed = match record_history(&mut inner, state.history_limit()) {
         Ok(changed) => changed,
         Err(record) => {
             return error_response(
@@ -3244,6 +3412,7 @@ enum ActivityKind {
     RoomRemoved,
     Command,
     Batch,
+    SettingsChanged,
     SimulatorSettingsChanged,
     SimulatorReset,
 }
@@ -3874,7 +4043,7 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
         })
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -3932,7 +4101,7 @@ fn append_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-fn open_private_file(path: &Path, write: bool) -> io::Result<fs::File> {
+pub(crate) fn open_private_file(path: &Path, write: bool) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(write);
     #[cfg(unix)]
@@ -3947,6 +4116,15 @@ fn open_private_file(path: &Path, write: bool) -> io::Result<fs::File> {
     #[cfg(unix)]
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(file)
+}
+
+fn serialize_history(records: &[HistoryObservation]) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for record in records {
+        serde_json::to_writer(&mut bytes, record).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+    }
+    Ok(bytes)
 }
 
 fn read_history(path: &Path) -> io::Result<Vec<HistoryObservation>> {
@@ -5991,7 +6169,7 @@ async fn queue_batch(
                 let command = make_command(
                     &enrollment.id,
                     request.action,
-                    state.queue_config.queue_wait_timeout_seconds,
+                    state.queue_config_snapshot().queue_wait_timeout_seconds,
                 );
                 let command_id = command.id.clone();
                 targets.push(BatchTarget {
@@ -6139,6 +6317,779 @@ async fn command_snapshot(state: &AppState, command_id: &str) -> Option<Command>
     Some(command)
 }
 
+async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let document = state.settings_document.read().await;
+    let mut settings = match settings::resolve(&document, &state.settings_environment) {
+        Ok(settings) => settings,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_settings",
+                &error,
+            );
+        }
+    };
+    add_pending_restart(&state, &mut settings);
+    conditional_settings_json(settings, &headers)
+}
+
+#[derive(Serialize)]
+struct SetupCheck {
+    key: &'static str,
+    label: &'static str,
+    status: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fix: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct SetupChecks {
+    checks: Vec<SetupCheck>,
+}
+
+async fn get_setup_checks(State(state): State<AppState>) -> Response {
+    // Compose may source the mount from another host directory, but the
+    // container always sees the socket at this target path.
+    let dbus_directory = PathBuf::from("/run/dbus");
+    let dbus_socket = dbus_directory.join("system_bus_socket");
+    let dbus_present = dbus_socket.exists();
+    let (adapter_available, simulator_enabled) = {
+        let inner = state.inner.lock().await;
+        (inner.scanner.adapter_available, inner.simulator_enabled)
+    };
+    let writable = state
+        .data_path
+        .as_deref()
+        .and_then(Path::parent)
+        .is_some_and(directory_is_writable);
+    let host_ip = std::env::var("SOMARIS_HOST_IP").unwrap_or_else(|_| "127.0.0.1".into());
+    let host_is_loopback = host_ip
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(true);
+    let checks = vec![
+        SetupCheck {
+            key: "dbus",
+            label: "D-Bus system socket",
+            status: if dbus_present { "ok" } else { "attention" },
+            message: if dbus_present {
+                format!("Found {}.", dbus_socket.display())
+            } else {
+                format!(
+                    "{} is missing; Somaris cannot reach host BlueZ.",
+                    dbus_socket.display()
+                )
+            },
+            fix: (!dbus_present).then_some(
+                "volumes:\n  - type: bind\n    source: ${SOMARIS_DBUS_DIR:-/run/dbus}\n    target: /run/dbus\n    read_only: true\n    bind:\n      create_host_path: false",
+            ),
+        },
+        SetupCheck {
+            key: "bluetooth",
+            label: "BlueZ adapter",
+            status: if state.demo_mode || !state.ble_enabled {
+                "not_applicable"
+            } else if adapter_available {
+                "ok"
+            } else {
+                "attention"
+            },
+            message: if state.demo_mode || !state.ble_enabled {
+                "Bluetooth is not used by this service mode.".into()
+            } else if adapter_available {
+                "A Bluetooth adapter is available.".into()
+            } else if simulator_enabled {
+                "No BlueZ adapter is available; simulated blinds remain usable.".into()
+            } else {
+                "No BlueZ adapter is available.".into()
+            },
+            fix: (!state.demo_mode && state.ble_enabled && !adapter_available).then_some(
+                "On the host, check `bluetoothctl list` and `systemctl status bluetooth`; ensure the container mounts the host system bus at /run/dbus.",
+            ),
+        },
+        SetupCheck {
+            key: "data_directory",
+            label: "Persistent data directory",
+            status: if state.data_path.is_none() {
+                "not_configured"
+            } else if writable {
+                "ok"
+            } else {
+                "attention"
+            },
+            message: if state.data_path.is_none() {
+                "Persistent storage is not configured for this embedded service.".into()
+            } else if writable {
+                "The directory containing service state is writable.".into()
+            } else {
+                "The directory containing service state is not writable by Somaris.".into()
+            },
+            fix: (!writable && state.data_path.is_some()).then_some(
+                "For a local bind mount, grant UID 10001 write access to the mounted data directory, for example: `sudo chown 10001:10001 ./data`.",
+            ),
+        },
+        SetupCheck {
+            key: "network_scope",
+            label: "Network access",
+            status: if host_is_loopback {
+                "local_only"
+            } else {
+                "attention"
+            },
+            message: if host_is_loopback {
+                "The Compose port is published on localhost only. This is the safe default while control routes remain unauthenticated.".into()
+            } else {
+                format!("The Compose port is published on {host_ip}; control routes remain unauthenticated. Restrict access to a trusted network.")
+            },
+            fix: None,
+        },
+    ];
+    Json(envelope(SetupChecks { checks }, None)).into_response()
+}
+
+fn directory_is_writable(directory: &Path) -> bool {
+    let path = directory.join(format!(".somaris-write-check-{}", Uuid::new_v4()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            drop(file);
+            fs::remove_file(path).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
+#[derive(Serialize)]
+struct SettingsMutationResult {
+    applied: Vec<String>,
+    pending_restart: Vec<String>,
+    settings: settings::SettingsSnapshot,
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    payload: Result<Json<settings::SettingsUpdate>, JsonRejection>,
+) -> Response {
+    let update = match parse_json(payload) {
+        Ok(update) => update,
+        Err(response) => return *response,
+    };
+    mutate_settings(&state, &headers, &uri, Some(update), None).await
+}
+
+async fn reset_settings(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    payload: Result<Json<settings::SettingsReset>, JsonRejection>,
+) -> Response {
+    let reset = match parse_json(payload) {
+        Ok(reset) => reset,
+        Err(response) => return *response,
+    };
+    mutate_settings(&state, &headers, &uri, None, Some(reset)).await
+}
+
+async fn mutate_settings(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    update: Option<settings::SettingsUpdate>,
+    reset: Option<settings::SettingsReset>,
+) -> Response {
+    if state.demo_mode {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "settings_unavailable",
+            "Settings changes are unavailable in demo mode.",
+        );
+    }
+    if !request_headers_have_same_origin(headers, uri) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "same_origin_required",
+            "Settings changes must come from this Somaris page.",
+        );
+    }
+    if !is_admin_authenticated(state, headers).await {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "admin_auth_required",
+            "Sign in as the Somaris administrator to change settings.",
+        );
+    }
+    let Some(if_match) = headers.get(header::IF_MATCH) else {
+        return error_response(
+            StatusCode::PRECONDITION_REQUIRED,
+            "if_match_required",
+            "Read the current settings and send their ETag in If-Match.",
+        );
+    };
+    let Some(settings_path) = state.settings_path.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings_storage_unavailable",
+            "Persistent settings storage is not configured.",
+        );
+    };
+
+    let mut document = state.settings_document.write().await;
+    let mut current = match settings::resolve(&document, &state.settings_environment) {
+        Ok(settings) => settings,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_settings",
+                &error,
+            );
+        }
+    };
+    add_pending_restart(state, &mut current);
+    let current_etag = settings_etag(&current);
+    if !if_match_satisfies(if_match, &current_etag) {
+        return error_response(
+            StatusCode::PRECONDITION_FAILED,
+            "settings_changed",
+            "Settings changed since they were read. Refresh and try again.",
+        );
+    }
+
+    let mut candidate = document.clone();
+    let applied = if let Some(update) = update {
+        let requested = update.keys();
+        if let Some((key, environment_name)) = requested.iter().find_map(|key| {
+            environment_override_for(key, &state.settings_environment).map(|name| (*key, name))
+        }) {
+            return error_response(
+                StatusCode::CONFLICT,
+                "setting_locked",
+                &format!("{key} is managed by {environment_name} and cannot be changed here."),
+            );
+        }
+        candidate.apply(update)
+    } else if let Some(reset) = reset {
+        match candidate.reset(reset.key.as_deref()) {
+            Ok(keys) => keys,
+            Err(error) => {
+                return error_response(StatusCode::BAD_REQUEST, "unknown_setting", &error);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut resolved = match settings::resolve(&candidate, &state.settings_environment) {
+        Ok(settings) => settings,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, "invalid_settings", &error),
+    };
+    add_pending_restart(state, &mut resolved);
+
+    let serialized = match serde_json::to_vec_pretty(&candidate) {
+        Ok(serialized) => serialized,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings_serialization_failed",
+                &error.to_string(),
+            );
+        }
+    };
+    let settings_path = settings_path.clone();
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || atomic_write(&settings_path, &serialized))
+            .await
+            .unwrap_or_else(|error| Err(io::Error::other(error)))
+    {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "settings_write_failed",
+            &format!("Could not save settings: {error}"),
+        );
+    }
+
+    apply_runtime_settings(state, &resolved).await;
+    *document = candidate;
+    let changed_keys = applied
+        .iter()
+        .map(|key| (*key).to_owned())
+        .collect::<Vec<_>>();
+    if !changed_keys.is_empty() {
+        let mut inner = state.inner.lock().await;
+        record_activity(
+            &mut inner,
+            None,
+            ActivityKind::SettingsChanged,
+            None,
+            None,
+            Some("updated".into()),
+            Some(changed_keys.join(", ")),
+        );
+        if state.persist(&inner).await.is_err() {
+            tracing::warn!(keys = %changed_keys.join(", "), "Settings changed but the settings audit could not be persisted");
+        }
+    }
+    drop(document);
+    let mut settings = resolved;
+    add_pending_restart(state, &mut settings);
+    settings_mutation_response(changed_keys, settings)
+}
+
+fn environment_override_for(
+    key: &str,
+    environment: &HashMap<String, String>,
+) -> Option<&'static str> {
+    let names: &[&str] = match key {
+        "simulator_enabled" => &["SOMARIS_SIMULATOR"],
+        "allowed_origins" => &["SOMARIS_ALLOWED_ORIGINS"],
+        "log_level" => &["RUST_LOG"],
+        "history_api_enabled" => &["SOMARIS_HISTORY_API_ENABLED", "SOMARIS_HISTORY_PATH"],
+        "history_retention" => &["SOMARIS_HISTORY_RETENTION"],
+        "queue_max_outstanding" => &["SOMARIS_COMMAND_MAX_OUTSTANDING"],
+        "queue_max_queued_per_device" => &["SOMARIS_COMMAND_MAX_QUEUED_PER_DEVICE"],
+        "adapter_concurrency" => &["SOMARIS_ADAPTER_CONCURRENCY"],
+        "adapter_scan_window_ms" => &["SOMARIS_ADAPTER_SCAN_WINDOW_MS"],
+        "queue_wait_timeout_seconds" => &["SOMARIS_COMMAND_QUEUE_WAIT_TIMEOUT_SECONDS"],
+        _ => &[],
+    };
+    names
+        .iter()
+        .copied()
+        .find(|name| environment.contains_key(*name))
+}
+
+fn add_pending_restart(state: &AppState, settings: &mut settings::SettingsSnapshot) {
+    settings.pending_restart.clear();
+    let active = state.queue_config_snapshot().adapter_concurrency;
+    if settings.values.adapter_concurrency.value != active {
+        settings.pending_restart.push("adapter_concurrency".into());
+    }
+}
+
+async fn apply_runtime_settings(state: &AppState, settings: &settings::SettingsSnapshot) {
+    let active_concurrency = state.queue_config_snapshot().adapter_concurrency;
+    let desired = &settings.values;
+    let previous_history_limit = state.history_limit();
+    let retention_changed = previous_history_limit != desired.history_retention.value;
+    let queue = QueueConfig {
+        max_outstanding_commands: desired.queue_max_outstanding.value,
+        max_queued_per_device: desired.queue_max_queued_per_device.value,
+        adapter_concurrency: active_concurrency,
+        adapter_scan_window_ms: desired.adapter_scan_window_ms.value,
+        queue_wait_timeout_seconds: desired.queue_wait_timeout_seconds.value as i64,
+    };
+    *state
+        .queue_config
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = queue;
+    let origins = desired.allowed_origins.value.join(",");
+    if let Ok(origins) = parse_allowed_origins(&origins) {
+        *state
+            .allowed_origins
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = origins;
+    }
+    *state
+        .history_limit
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = desired.history_retention.value;
+    state
+        .history_api_enabled
+        .store(desired.history_api_enabled.value, Ordering::Release);
+    if desired.log_level.source != settings::SettingSource::Environment {
+        let reloader = state
+            .log_level_reloader
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(reloader) = reloader
+            && let Err(error) = reloader(&desired.log_level.value)
+        {
+            tracing::warn!(%error, "Could not apply updated log level");
+        }
+    }
+    let mut inner = state.inner.lock().await;
+    inner.simulator_enabled = desired.simulator_enabled.value;
+    prune_history(&mut inner, desired.history_retention.value);
+    let history = if retention_changed {
+        state.history_revision.fetch_add(1, Ordering::AcqRel);
+        Some(inner.history.iter().cloned().collect::<Vec<_>>())
+    } else {
+        None
+    };
+    drop(inner);
+    if let (Some(path), Some(history)) = (&state.history_storage_path, history) {
+        let cursor = history.last().map_or(0, |record| record.cursor);
+        let count = history.len();
+        match serialize_history(&history) {
+            Ok(bytes) => {
+                let _persist_guard = state.history_persist_lock.lock().await;
+                let path = path.clone();
+                match tokio::task::spawn_blocking(move || atomic_write(&path, &bytes)).await {
+                    Ok(Ok(())) => {
+                        state
+                            .history_persisted_cursor
+                            .store(cursor, Ordering::Release);
+                        state
+                            .history_persisted_count
+                            .store(count, Ordering::Release);
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "Could not apply telemetry retention to the history journal")
+                    }
+                    Err(error) => tracing::warn!(%error, "Could not compact telemetry history"),
+                }
+            }
+            Err(error) => tracing::warn!(%error, "Could not serialize retained telemetry history"),
+        }
+    }
+}
+
+fn settings_mutation_response(
+    applied: Vec<String>,
+    settings: settings::SettingsSnapshot,
+) -> Response {
+    let etag = settings_etag(&settings);
+    let data = SettingsMutationResult {
+        applied,
+        pending_restart: settings.pending_restart.clone(),
+        settings,
+    };
+    let mut response = Json(envelope(data, None)).into_response();
+    response.headers_mut().insert(header::ETAG, etag);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn conditional_settings_json(
+    settings: settings::SettingsSnapshot,
+    headers: &HeaderMap,
+) -> Response {
+    let etag = settings_etag(&settings);
+    let matches = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag));
+    if matches {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, "private, no-cache")
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    let mut response = Json(envelope(settings, None)).into_response();
+    response.headers_mut().insert(header::ETAG, etag);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    response
+}
+
+fn settings_etag<T: Serialize>(settings: &T) -> HeaderValue {
+    let bytes = serde_json::to_vec(settings).unwrap_or_default();
+    HeaderValue::from_str(&strong_etag(&bytes))
+        .unwrap_or_else(|_| HeaderValue::from_static("\"invalid\""))
+}
+
+fn if_match_satisfies(header: &HeaderValue, etag: &HeaderValue) -> bool {
+    let Ok(header) = header.to_str() else {
+        return false;
+    };
+    header
+        .split(',')
+        .any(|candidate| candidate.trim() == "*" || candidate.trim() == etag)
+}
+
+async fn restart_service(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    if !request_headers_have_same_origin(&headers, &uri) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "same_origin_required",
+            "Restart must come from this Somaris page.",
+        );
+    }
+    if !is_admin_authenticated(&state, &headers).await {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "admin_auth_required",
+            "Sign in as the Somaris administrator to restart the service.",
+        );
+    }
+    tokio::spawn(async {
+        tokio::time::sleep(StdDuration::from_millis(250)).await;
+        std::process::exit(0);
+    });
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(envelope(serde_json::json!({ "accepted": true }), None)),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[derive(Serialize)]
+struct AdminAuthInfo {
+    configured: bool,
+    authenticated: bool,
+    setup_required: bool,
+}
+
+#[derive(Deserialize)]
+struct AdminSetupRequest {
+    code: String,
+    passphrase: String,
+}
+
+#[derive(Deserialize)]
+struct AdminLoginRequest {
+    passphrase: String,
+}
+
+async fn get_admin_auth_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if state.demo_mode {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "admin_auth_unavailable",
+            "Admin settings are unavailable in demo mode.",
+        );
+    }
+    let mut auth = state.admin_auth.lock().await;
+    let configured = auth.is_configured();
+    let authenticated = auth.is_authenticated(admin_cookie_value(&headers), Instant::now());
+    Json(envelope(
+        AdminAuthInfo {
+            configured,
+            authenticated,
+            setup_required: !configured,
+        },
+        None,
+    ))
+    .into_response()
+}
+
+async fn setup_admin_auth(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    payload: Result<Json<AdminSetupRequest>, JsonRejection>,
+) -> Response {
+    if state.demo_mode {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "admin_auth_unavailable",
+            "Admin settings are unavailable in demo mode.",
+        );
+    }
+    if !request_headers_have_same_origin(&headers, &uri) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "same_origin_required",
+            "Admin setup must come from this Somaris page.",
+        );
+    }
+    let request = match parse_json(payload) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    let session = match state
+        .admin_auth
+        .lock()
+        .await
+        .setup(&request.code, &request.passphrase)
+    {
+        Ok(session) => session,
+        Err(error) => return auth_failure_response(error),
+    };
+    auth_success_response(
+        &headers,
+        &session,
+        AdminAuthInfo {
+            configured: true,
+            authenticated: true,
+            setup_required: false,
+        },
+    )
+}
+
+async fn login_admin_auth(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    payload: Result<Json<AdminLoginRequest>, JsonRejection>,
+) -> Response {
+    if state.demo_mode {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "admin_auth_unavailable",
+            "Admin settings are unavailable in demo mode.",
+        );
+    }
+    if !request_headers_have_same_origin(&headers, &uri) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "same_origin_required",
+            "Admin login must come from this Somaris page.",
+        );
+    }
+    let request = match parse_json(payload) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    let session = match state.admin_auth.lock().await.login(&request.passphrase) {
+        Ok(session) => session,
+        Err(error) => return auth_failure_response(error),
+    };
+    auth_success_response(
+        &headers,
+        &session,
+        AdminAuthInfo {
+            configured: true,
+            authenticated: true,
+            setup_required: false,
+        },
+    )
+}
+
+async fn logout_admin_auth(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    if state.demo_mode {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "admin_auth_unavailable",
+            "Admin settings are unavailable in demo mode.",
+        );
+    }
+    if !request_headers_have_same_origin(&headers, &uri) {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "same_origin_required",
+            "Admin logout must come from this Somaris page.",
+        );
+    }
+    state
+        .admin_auth
+        .lock()
+        .await
+        .logout(admin_cookie_value(&headers));
+    let cookie = format!(
+        "{ADMIN_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        if request_is_secure(&headers) {
+            "; Secure"
+        } else {
+            ""
+        }
+    );
+    let mut response = Json(envelope(
+        AdminAuthInfo {
+            configured: true,
+            authenticated: false,
+            setup_required: false,
+        },
+        None,
+    ))
+    .into_response();
+    if let Ok(cookie) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn auth_success_response(headers: &HeaderMap, session: &str, info: AdminAuthInfo) -> Response {
+    let cookie = format!(
+        "{ADMIN_SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={ADMIN_SESSION_COOKIE_MAX_AGE_SECONDS}{}",
+        if request_is_secure(headers) {
+            "; Secure"
+        } else {
+            ""
+        }
+    );
+    let mut response = Json(envelope(info, None)).into_response();
+    if let Ok(cookie) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn auth_failure_response(error: AuthFailure) -> Response {
+    let (status, code, message) = match error {
+        AuthFailure::AlreadyConfigured => (
+            StatusCode::CONFLICT,
+            "admin_auth_already_configured",
+            "Admin authentication is already configured or requires setup first.",
+        ),
+        AuthFailure::SetupCodeInvalid => (
+            StatusCode::FORBIDDEN,
+            "admin_setup_code_invalid",
+            "The one-time setup code is invalid or has expired.",
+        ),
+        AuthFailure::PassphraseTooShort => (
+            StatusCode::BAD_REQUEST,
+            "admin_passphrase_too_short",
+            "Use a passphrase with at least 12 characters.",
+        ),
+        AuthFailure::PassphraseTooLong => (
+            StatusCode::BAD_REQUEST,
+            "admin_passphrase_too_long",
+            "Use a passphrase with at most 256 characters.",
+        ),
+        AuthFailure::InvalidPassphrase => (
+            StatusCode::UNAUTHORIZED,
+            "admin_passphrase_invalid",
+            "The passphrase is incorrect.",
+        ),
+        AuthFailure::Persistence => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "admin_auth_persistence_failed",
+            "Admin authentication could not be saved.",
+        ),
+    };
+    error_response(status, code, message)
+}
+
+fn admin_cookie_value(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| {
+            (name == ADMIN_SESSION_COOKIE && Uuid::parse_str(value).is_ok()).then_some(value)
+        })
+}
+
+async fn is_admin_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
+    state
+        .admin_auth
+        .lock()
+        .await
+        .is_authenticated(admin_cookie_value(headers), Instant::now())
+}
+
 async fn get_queue(RequestState(state): RequestState, headers: HeaderMap) -> Response {
     let inner = state.inner.lock().await;
     let pending: Vec<_> = inner
@@ -6160,10 +7111,10 @@ async fn get_queue(RequestState(state): RequestState, headers: HeaderMap) -> Res
         oldest_queued_age_seconds: oldest
             .map(|value| (Utc::now() - value).num_milliseconds().max(0) as f64 / 1000.0)
             .unwrap_or(0.0),
-        max_outstanding_commands: state.queue_config.max_outstanding_commands as u64,
-        max_queued_per_device: state.queue_config.max_queued_per_device as u64,
-        adapter_concurrency: state.queue_config.adapter_concurrency as u64,
-        adapter_scan_window_ms: state.queue_config.adapter_scan_window_ms,
+        max_outstanding_commands: state.queue_config_snapshot().max_outstanding_commands as u64,
+        max_queued_per_device: state.queue_config_snapshot().max_queued_per_device as u64,
+        adapter_concurrency: state.queue_config_snapshot().adapter_concurrency as u64,
+        adapter_scan_window_ms: state.queue_config_snapshot().adapter_scan_window_ms,
         command_execution_timeout_seconds: COMMAND_EXECUTION_TIMEOUT.as_secs(),
     };
     conditional_json(&headers, data.clone(), envelope(data, None))
@@ -6474,7 +7425,7 @@ async fn submit_command(
             )
         })
         .collect();
-    if outstanding.len() >= state.queue_config.max_outstanding_commands {
+    if outstanding.len() >= state.queue_config_snapshot().max_outstanding_commands {
         return Err(ApiFailure::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "queue_capacity_reached",
@@ -6485,7 +7436,7 @@ async fn submit_command(
         .iter()
         .filter(|command| command.managed_device_id == managed_device_id)
         .count();
-    if per_device >= state.queue_config.max_queued_per_device {
+    if per_device >= state.queue_config_snapshot().max_queued_per_device {
         return Err(ApiFailure::new(
             StatusCode::CONFLICT,
             "device_queue_full",
@@ -6530,7 +7481,7 @@ async fn submit_command(
     let mut command = make_command(
         managed_device_id,
         action,
-        state.queue_config.queue_wait_timeout_seconds,
+        state.queue_config_snapshot().queue_wait_timeout_seconds,
     );
     command.target_closed_percent = target_closed_percent;
     command.motor_speed_percent = motor_speed_percent;
@@ -7209,7 +8160,7 @@ async fn process_command_with_retry_budget(
             SimulatorScenario::Normal | SimulatorScenario::OutcomeUnknown
         )
     {
-        if record_history(&mut inner, state.history_limit).unwrap_or(false) {
+        if record_history(&mut inner, state.history_limit()).unwrap_or(false) {
             state.history_revision.fetch_add(1, Ordering::AcqRel);
         }
         let history_revision = state.history_revision.load(Ordering::Acquire);
@@ -7632,9 +8583,10 @@ async fn yield_adapter_for_retry_scan(
     let previous_generation = *scan_generation.borrow_and_update();
     drop(permit);
 
-    let scan_wait = std::time::Duration::from_millis(state.queue_config.adapter_scan_window_ms)
-        .saturating_add(SCAN_RESTART_DELAY)
-        .saturating_add(std::time::Duration::from_millis(250));
+    let scan_wait =
+        std::time::Duration::from_millis(state.queue_config_snapshot().adapter_scan_window_ms)
+            .saturating_add(SCAN_RESTART_DELAY)
+            .saturating_add(std::time::Duration::from_millis(250));
     let scan_deadline = tokio::time::Instant::now() + scan_wait;
     let scan_refreshed = tokio::select! {
         biased;
@@ -8184,8 +9136,8 @@ async fn process_batch(state: AppState, batch_id: String) {
     };
     let _stop_batch_adapter_permits = if action == Action::Stop {
         let command_waiter = AdapterCommandWaiter::new(state.pending_adapter_commands.clone());
-        let mut permits = Vec::with_capacity(state.queue_config.adapter_concurrency);
-        for _ in 0..state.queue_config.adapter_concurrency {
+        let mut permits = Vec::with_capacity(state.queue_config_snapshot().adapter_concurrency);
+        for _ in 0..state.queue_config_snapshot().adapter_concurrency {
             let Ok(permit) = state.adapter_slots.clone().acquire_owned().await else {
                 return;
             };
@@ -8817,6 +9769,478 @@ fn command_status_text(status: CommandStatus) -> &'static str {
 #[cfg(test)]
 mod security_hardening_tests {
     use super::*;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn call_json(
+        app: &Router,
+        method: axum::http::Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Option<Value>,
+    ) -> (StatusCode, HeaderMap, Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let body = body.map(|body| body.to_string());
+        if body.is_some() {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        let request = builder
+            .body(body.map_or_else(Body::empty, Body::from))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, headers, body)
+    }
+
+    async fn authenticated_settings_app(
+        settings_path: PathBuf,
+        environment: HashMap<String, String>,
+    ) -> (Router, String) {
+        let mut state = AppState::new();
+        state.settings_path = Some(settings_path);
+        state.settings_environment = Arc::new(environment);
+        let mut auth = AdminAuth::memory();
+        let code = auth.setup_code().unwrap().to_owned();
+        let session = auth.setup(&code, "correct horse battery staple").unwrap();
+        state.admin_auth = Arc::new(Mutex::new(auth));
+        (router(state), session)
+    }
+
+    fn same_origin_headers(session: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("host", "somaris.test".into()),
+            ("origin", "http://somaris.test".into()),
+            ("cookie", format!("{ADMIN_SESSION_COOKIE}={session}")),
+        ]
+    }
+
+    fn settings_headers<'a>(
+        session: &'a str,
+        etag: Option<&'a str>,
+    ) -> Vec<(&'static str, String)> {
+        let mut headers = same_origin_headers(session);
+        if let Some(etag) = etag {
+            headers.push(("if-match", etag.to_owned()));
+        }
+        headers
+    }
+
+    #[tokio::test]
+    async fn admin_auth_setup_requires_same_origin_and_returns_a_strict_session_cookie() {
+        let state = AppState::new();
+        let setup_code = state
+            .admin_auth
+            .lock()
+            .await
+            .setup_code()
+            .unwrap()
+            .to_owned();
+        let uri: axum::http::Uri = "/api/control/v1/auth/setup".parse().unwrap();
+        let payload = Ok(Json(AdminSetupRequest {
+            code: setup_code,
+            passphrase: "correct horse battery staple".into(),
+        }));
+        let denied = setup_admin_auth(
+            State(state.clone()),
+            OriginalUri(uri.clone()),
+            HeaderMap::new(),
+            payload,
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("somaris.test"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://somaris.test"),
+        );
+        let setup_code = state
+            .admin_auth
+            .lock()
+            .await
+            .setup_code()
+            .unwrap()
+            .to_owned();
+        let response = setup_admin_auth(
+            State(state.clone()),
+            OriginalUri(uri),
+            headers.clone(),
+            Ok(Json(AdminSetupRequest {
+                code: setup_code,
+                passphrase: "correct horse battery staple".into(),
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(cookie.starts_with("somaris-admin-session="));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Max-Age=43200"));
+        assert!(!cookie.contains("Secure"));
+
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(cookie.split(';').next().unwrap()).unwrap(),
+        );
+        let auth_status = get_admin_auth_status(State(state), headers).await;
+        assert_eq!(auth_status.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn settings_updates_require_current_etag_and_persist_only_valid_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings_path = directory.path().join("settings.json");
+        let (app, session) =
+            authenticated_settings_app(settings_path.clone(), HashMap::new()).await;
+        let (status, headers, current) = call_json(
+            &app,
+            axum::http::Method::GET,
+            "/api/control/v1/settings",
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let etag = headers[header::ETAG].to_str().unwrap().to_owned();
+        assert!(!etag.starts_with("W/"));
+
+        let update = serde_json::json!({"queue_max_outstanding": 40});
+        let headers = same_origin_headers(&session);
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect::<Vec<_>>();
+        let (status, _, body) = call_json(
+            &app,
+            axum::http::Method::PUT,
+            "/api/control/v1/settings",
+            &headers,
+            Some(update.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(body["error"]["code"], "if_match_required");
+
+        let headers = settings_headers(&session, Some("\"old-settings\""));
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect::<Vec<_>>();
+        let (status, _, body) = call_json(
+            &app,
+            axum::http::Method::PUT,
+            "/api/control/v1/settings",
+            &headers,
+            Some(update.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["error"]["code"], "settings_changed");
+
+        let headers = settings_headers(&session, Some(&etag));
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect::<Vec<_>>();
+        let (status, headers, body) = call_json(
+            &app,
+            axum::http::Method::PUT,
+            "/api/control/v1/settings",
+            &headers,
+            Some(update),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["data"]["applied"],
+            serde_json::json!(["queue_max_outstanding"])
+        );
+        assert_eq!(
+            body["data"]["settings"]["values"]["queue_max_outstanding"]["value"],
+            40
+        );
+        assert_eq!(
+            body["data"]["settings"]["pending_restart"],
+            serde_json::json!([])
+        );
+        assert_ne!(headers[header::ETAG], etag);
+        let document: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(document["version"], 1);
+        assert_eq!(document["queue_max_outstanding"], 40);
+        let etag = headers[header::ETAG].to_str().unwrap();
+        let headers = settings_headers(&session, Some(etag));
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect::<Vec<_>>();
+        let (status, reset_headers, body) = call_json(
+            &app,
+            axum::http::Method::POST,
+            "/api/control/v1/settings/reset",
+            &headers,
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["data"]["applied"],
+            serde_json::json!(["queue_max_outstanding"])
+        );
+        assert_eq!(
+            body["data"]["settings"]["values"]["queue_max_outstanding"]["value"],
+            1000
+        );
+        let etag = reset_headers[header::ETAG].to_str().unwrap();
+        let headers = settings_headers(&session, Some(etag));
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect::<Vec<_>>();
+        let (status, _, _) = call_json(
+            &app,
+            axum::http::Method::PUT,
+            "/api/control/v1/settings",
+            &headers,
+            Some(serde_json::json!({
+                "queue_max_outstanding": 12,
+                "queue_max_queued_per_device": 32
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let document: Value = serde_json::from_slice(&fs::read(settings_path).unwrap()).unwrap();
+        assert!(document.get("queue_max_outstanding").is_none());
+        let _ = current;
+    }
+
+    #[tokio::test]
+    async fn environment_settings_are_locked_and_demo_does_not_register_write_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let environment = HashMap::from([("SOMARIS_SIMULATOR".into(), "true".into())]);
+        let (app, session) =
+            authenticated_settings_app(directory.path().join("settings.json"), environment).await;
+        let (_, headers, _) = call_json(
+            &app,
+            axum::http::Method::GET,
+            "/api/control/v1/settings",
+            &[],
+            None,
+        )
+        .await;
+        let etag = headers[header::ETAG].to_str().unwrap();
+        let headers = settings_headers(&session, Some(etag));
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect::<Vec<_>>();
+        let (status, _, body) = call_json(
+            &app,
+            axum::http::Method::PUT,
+            "/api/control/v1/settings",
+            &headers,
+            Some(serde_json::json!({"simulator_enabled": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "setting_locked");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("SOMARIS_SIMULATOR")
+        );
+
+        let demo = router(AppState::demo());
+        let (status, _, _) = call_json(
+            &demo,
+            axum::http::Method::PUT,
+            "/api/control/v1/settings",
+            &[("host", "somaris.test"), ("origin", "http://somaris.test")],
+            Some(serde_json::json!({"simulator_enabled": false})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn live_settings_update_queue_simulator_history_and_cors_and_defer_concurrency() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let history_path = state_path.with_extension("history.jsonl");
+        let history = (1..=150)
+            .map(|cursor| HistoryObservation {
+                cursor,
+                device_id: "simulator-1".into(),
+                logical_id: Some("simulator:simulator-1".into()),
+                observed_at: Utc::now(),
+                rssi_dbm: -70,
+                position_status: PositionStatus::Observed,
+                position: Some(HistoryPosition {
+                    current_closed_percent: 50,
+                    target_closed_percent: 50,
+                }),
+            })
+            .collect::<Vec<_>>();
+        fs::write(&history_path, serialize_history(&history).unwrap()).unwrap();
+        let settings_path = directory.path().join("settings.json");
+        let mut state = AppState::from_data_path(&state_path).await.unwrap();
+        let applied_log_levels = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reloaded_log_levels = Arc::clone(&applied_log_levels);
+        state
+            .install_log_level_reloader(move |level| {
+                reloaded_log_levels
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(level.to_owned());
+                Ok(())
+            })
+            .await;
+        let mut auth = AdminAuth::memory();
+        let setup_code = auth.setup_code().unwrap().to_owned();
+        let session = auth
+            .setup(&setup_code, "correct horse battery staple")
+            .unwrap();
+        state.admin_auth = Arc::new(Mutex::new(auth));
+        assert_eq!(
+            state.settings_path.as_deref(),
+            Some(settings_path.as_path())
+        );
+        let app = router(state);
+        let (_, headers, _) = call_json(
+            &app,
+            axum::http::Method::GET,
+            "/api/control/v1/settings",
+            &[],
+            None,
+        )
+        .await;
+        let etag = headers[header::ETAG].to_str().unwrap().to_owned();
+        let headers = settings_headers(&session, Some(&etag));
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect::<Vec<_>>();
+        let (status, _, body) = call_json(
+            &app,
+            axum::http::Method::PUT,
+            "/api/control/v1/settings",
+            &headers,
+            Some(serde_json::json!({
+                "simulator_enabled": false,
+                "allowed_origins": ["https://client.example"],
+                "history_api_enabled": true,
+                "history_retention": 100,
+                "log_level": "debug",
+                "queue_max_outstanding": 9,
+                "queue_max_queued_per_device": 9,
+                "adapter_concurrency": 3
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            applied_log_levels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .last()
+                .map(String::as_str),
+            Some("debug")
+        );
+        assert_eq!(
+            body["data"]["settings"]["pending_restart"],
+            serde_json::json!(["adapter_concurrency"])
+        );
+
+        let (_, _, queue) = call_json(
+            &app,
+            axum::http::Method::GET,
+            "/api/control/v1/queue",
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(queue["data"]["max_outstanding_commands"], 9);
+        assert_eq!(queue["data"]["adapter_concurrency"], 1);
+        let (_, _, diagnostics) = call_json(
+            &app,
+            axum::http::Method::GET,
+            "/api/v1/diagnostics",
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(diagnostics["data"]["simulator_ready"], false);
+        assert_eq!(diagnostics["data"]["history_enabled"], true);
+        let (status, _, history_response) =
+            call_json(&app, axum::http::Method::GET, "/api/v1/history", &[], None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(history_response["meta"]["count"], 100);
+        let (status, headers, _) = call_json(
+            &app,
+            axum::http::Method::OPTIONS,
+            "/api/v1/health",
+            &[
+                ("origin", "https://client.example"),
+                ("access-control-request-method", "GET"),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            headers[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://client.example"
+        );
+        drop(app);
+        assert_eq!(read_history(&history_path).unwrap().len(), 100);
+        let restarted = AppState::from_data_path(&state_path).await.unwrap();
+        assert_eq!(restarted.queue_config_snapshot().adapter_concurrency, 3);
+        assert!(
+            restarted
+                .settings_document
+                .read()
+                .await
+                .adapter_concurrency
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_checks_report_storage_and_network_guidance() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let app = router(AppState::from_data_path(&state_path).await.unwrap());
+        let (status, _, body) = call_json(
+            &app,
+            axum::http::Method::GET,
+            "/api/control/v1/setup-checks",
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let checks = body["data"]["checks"].as_array().unwrap();
+        assert!(
+            checks
+                .iter()
+                .any(|check| { check["key"] == "data_directory" && check["status"] == "ok" })
+        );
+        assert!(
+            checks.iter().any(|check| {
+                check["key"] == "network_scope" && check["status"] == "local_only"
+            })
+        );
+    }
 
     struct UnavailableDriver;
 
@@ -9265,7 +10689,7 @@ mod security_hardening_tests {
         let mut command = make_command(
             "managed-1",
             Action::SetPosition,
-            state.queue_config.queue_wait_timeout_seconds,
+            state.queue_config_snapshot().queue_wait_timeout_seconds,
         );
         command.status = CommandStatus::Connecting;
         command.started_at = Some(Utc::now());

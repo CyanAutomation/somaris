@@ -59,7 +59,7 @@ function panelMarkup({longLabels = false, notices = false}: {longLabels?: boolea
   }).join('');
   const toolbar = renderBatchControls({blindCount:4, eligibleCount:4, panelMode:true});
   const devices = renderDeviceList({count:4, panelMode:true, cardsMarkup:cards, toolbarMarkup:toolbar});
-  const topbar = renderTopbarActions({blindCount:4, panelMode:true, displayPreference:'panel', demoMode:true});
+  const topbar = renderTopbarActions({blindCount:4, panelMode:true, demoMode:true});
   const clock = renderClock(new Date(2026, 10, 19, 17, 42));
 
   return `<!doctype html><html lang="en" data-display-mode="panel"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><div class="topbar-brand"><a class="brand" href="#home">somaris.</a></div><div id="header-clock-slot" class="topbar-clock">${clock}</div><div class="top-actions">${topbar}</div></header><main id="app"><section class="demo-banner"><span>Explore a simulated smart home.</span><button class="icon-button">Reset</button></section>${devices}</main></div></body></html>`;
@@ -83,7 +83,7 @@ async function openMobile(width: number): Promise<Page> {
     movementStatus:'at_target',
     controlsMarkup:controls,
   });
-  const toolbar = renderTopbarActions({blindCount:1, displayPreference:'mobile'});
+  const toolbar = renderTopbarActions({blindCount:1});
   const clock = renderClock(new Date(2026, 10, 19, 17, 42));
   await page.setContent(`<!doctype html><html lang="en" data-display-mode="mobile"><head><meta name="viewport" content="width=device-width, initial-scale=1"><style>${styles}</style></head><body><div class="app-shell"><header class="topbar"><div class="topbar-brand"><a class="brand" href="#home"><span class="brand-mark"><i></i><i></i><i></i></span><span>somaris<span class="brand-dot">.</span></span></a></div><div id="header-clock-slot" class="topbar-clock">${clock}</div><div class="top-actions">${toolbar}</div></header><main id="app"><section class="demo-banner"><div>Demo</div><button class="button icon-button icon-action">↻</button></section><section class="hero"><div>Welcome</div><button class="button icon-button hero-dismiss icon-action">×</button></section><section class="device-list"><div class="grid">${card}</div></section></main></div></body></html>`);
   return page;
