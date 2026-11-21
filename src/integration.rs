@@ -14,7 +14,7 @@ use std::{
 
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, redirect::Policy};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::broadcast;
 use url::Url;
@@ -163,8 +163,6 @@ pub struct ShellyCoverDriver {
     allowed_origins: HashMap<String, Url>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ShellyCoverConfig {
     base_url: String,
     component_id: u32,
@@ -214,9 +212,25 @@ impl ShellyCoverDriver {
     }
 
     fn parse_config(&self, config: &Value) -> Result<(ShellyCoverConfig, Url), DriverFailure> {
-        let config: ShellyCoverConfig = serde_json::from_value(config.clone()).map_err(|_| {
-            DriverFailure::new(DriverFailureKind::InvalidResponse, "invalid_driver_config")
-        })?;
+        let invalid_config =
+            || DriverFailure::new(DriverFailureKind::InvalidResponse, "invalid_driver_config");
+        let fields = config.as_object().ok_or_else(invalid_config)?;
+        if fields.len() != 2 {
+            return Err(invalid_config());
+        }
+        let base_url = fields
+            .get("base_url")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid_config)?;
+        let component_id = fields
+            .get("component_id")
+            .and_then(Value::as_u64)
+            .and_then(|id| u32::try_from(id).ok())
+            .ok_or_else(invalid_config)?;
+        let config = ShellyCoverConfig {
+            base_url: base_url.to_owned(),
+            component_id,
+        };
         let url = Url::parse(&config.base_url).map_err(|_| {
             DriverFailure::new(DriverFailureKind::InvalidResponse, "invalid_driver_config")
         })?;
@@ -509,6 +523,24 @@ mod tests {
                 .is_err()
         );
         assert!(ShellyCoverDriver::with_allowed_origins(["http://localhost:8123"]).is_err());
+    }
+
+    #[test]
+    fn shelly_config_accepts_only_its_two_typed_fields() {
+        let driver = ShellyCoverDriver::with_allowed_origins(["http://192.168.1.20"]).unwrap();
+        for config in [
+            serde_json::json!({"base_url": "http://192.168.1.20"}),
+            serde_json::json!({"base_url": "http://192.168.1.20", "component_id": -1}),
+            serde_json::json!({"base_url": "http://192.168.1.20", "component_id": 1.5}),
+            serde_json::json!({"base_url": "http://192.168.1.20", "component_id": "0"}),
+            serde_json::json!({"base_url": "http://192.168.1.20", "component_id": 0, "extra": true}),
+            serde_json::json!({"base_url": false, "component_id": 0}),
+        ] {
+            assert!(
+                driver.validate_config(&config).is_err(),
+                "accepted {config}"
+            );
+        }
     }
 
     #[tokio::test]
