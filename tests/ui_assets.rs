@@ -17,6 +17,7 @@ async fn dashboard_and_assets_are_served_with_correct_content_types() {
         ),
         ("/sw.js", "text/javascript", "precache-manifest"),
         ("/ui/app.mjs", "text/javascript", "resolveDisplayMode"),
+        ("/ui/lazy-module.mjs", "text/javascript", "createLazyModule"),
         ("/ui/clock.mjs", "text/javascript", "formatClockTime"),
         (
             "/ui/api-docs.mjs",
@@ -77,6 +78,7 @@ async fn service_worker_is_allowed_to_control_the_root_scope_and_skips_api_respo
     assert!(worker.contains("url.pathname.startsWith('/api/')"));
     assert!(worker.contains("precache-manifest"));
     assert!(worker.contains("'/ui/clock.mjs'"));
+    assert!(worker.contains("'/ui/lazy-module.mjs'"));
 }
 
 #[tokio::test]

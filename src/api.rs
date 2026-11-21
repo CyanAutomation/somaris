@@ -1790,6 +1790,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/components.css", get(ui_components_style))
         .route("/ui/panel.css", get(ui_panel_style))
         .route("/ui/app.mjs", get(ui_app))
+        .route("/ui/lazy-module.mjs", get(ui_lazy_module))
         .route("/ui/clock.mjs", get(ui_clock))
         .route("/ui/api-docs.mjs", get(ui_api_docs))
         .route("/ui/components.mjs", get(ui_components))
@@ -1951,6 +1952,13 @@ async fn ui_app() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../ui/app.mjs"),
+    )
+}
+
+async fn ui_lazy_module() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/lazy-module.mjs"),
     )
 }
 

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'somaris-shell-v2';
+const CACHE_NAME = 'somaris-shell-v3';
 // precache-manifest for the versioned, same-origin static app shell.
 const PRECACHE = [
   '/',
@@ -7,6 +7,7 @@ const PRECACHE = [
   '/ui/components.css',
   '/ui/panel.css',
   '/ui/app.mjs',
+  '/ui/lazy-module.mjs',
   '/ui/clock.mjs',
   '/ui/components.mjs',
   '/ui/escape.mjs',
