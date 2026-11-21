@@ -104,6 +104,8 @@ const MAX_DEMO_COMMANDS: usize = 128;
 const MAX_DEMO_BATCHES: usize = 64;
 const MAX_DEMO_HISTORY: usize = 5_000;
 const MAX_SIMULATOR_ENROLLMENTS: usize = 2;
+const MAX_LAN_INTEGRATION_ENROLLMENTS: usize = 32;
+const MAX_CONCURRENT_LAN_ENROLLMENT_PROBES: usize = 4;
 const MAX_COMMANDS: usize = 1000;
 const MAX_BATCH_TARGETS: usize = MAX_COMMANDS;
 const MAX_BATCHES: usize = 1000;
@@ -251,6 +253,7 @@ pub struct AppState {
     ble_adapter: Arc<RwLock<Option<Arc<dyn BleAdapter>>>>,
     blind_drivers: Arc<DriverRegistry>,
     integration_poll_attempts: Arc<Mutex<HashMap<String, Instant>>>,
+    integration_enrollment_probes: Arc<Semaphore>,
     ble_enabled: bool,
     queue_config: QueueConfig,
     allowed_origins: Vec<HeaderValue>,
@@ -383,6 +386,7 @@ struct Inner {
 struct IntegrationObservation {
     state: BlindObservation,
     observed_at: DateTime<Utc>,
+    poll_failed: bool,
 }
 
 #[derive(Serialize)]
@@ -577,9 +581,6 @@ impl AppState {
             .await;
 
         for (device_id, driver_id, config, result) in results.into_iter().flatten() {
-            let Ok(Ok(observation)) = result else {
-                continue;
-            };
             let mut inner = self.inner.lock().await;
             let still_same_device = inner.enrollments.get(&device_id).is_some_and(|enrollment| {
                 enrollment.driver_id.as_deref() == Some(driver_id.as_str())
@@ -588,17 +589,34 @@ impl AppState {
             if !still_same_device {
                 continue;
             }
-            let changed = inner
-                .integration_observations
-                .get(&device_id)
-                .is_none_or(|previous| previous.state != observation);
-            inner.integration_observations.insert(
-                device_id,
-                IntegrationObservation {
-                    state: observation,
-                    observed_at: Utc::now(),
-                },
-            );
+            let changed = match result {
+                Ok(Ok(observation)) => {
+                    let changed =
+                        inner
+                            .integration_observations
+                            .get(&device_id)
+                            .is_none_or(|previous| {
+                                previous.state != observation || previous.poll_failed
+                            });
+                    inner.integration_observations.insert(
+                        device_id,
+                        IntegrationObservation {
+                            state: observation,
+                            observed_at: Utc::now(),
+                            poll_failed: false,
+                        },
+                    );
+                    changed
+                }
+                Ok(Err(_)) | Err(_) => inner
+                    .integration_observations
+                    .get_mut(&device_id)
+                    .is_some_and(|previous| {
+                        let changed = !previous.poll_failed;
+                        previous.poll_failed = true;
+                        changed
+                    }),
+            };
             if changed {
                 self.state_changes.publish();
             }
@@ -795,6 +813,9 @@ impl AppState {
             ble_adapter: Arc::new(RwLock::new(None)),
             blind_drivers: Arc::new(DriverRegistry::with_builtins()),
             integration_poll_attempts: Arc::new(Mutex::new(HashMap::new())),
+            integration_enrollment_probes: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_LAN_ENROLLMENT_PROBES,
+            )),
             ble_enabled: false,
             queue_config,
             allowed_origins: Vec::new(),
@@ -5368,6 +5389,28 @@ async fn enroll_integrated_device(
             "The driver configuration is invalid.",
         );
     }
+    let config_bytes = serde_json::to_vec(&driver_config).unwrap_or_default();
+    let logical_id = format!("{driver_id}:{}", hex::encode(Sha256::digest(config_bytes)));
+    {
+        let inner = state.inner.lock().await;
+        if let Some(response) = integration_enrollment_guard(&inner, &driver_id, &logical_id) {
+            return response;
+        }
+    }
+    let probe_permit = match state
+        .integration_enrollment_probes
+        .clone()
+        .try_acquire_owned()
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "integration_probe_busy",
+                "Too many LAN device enrollments are being checked. Retry shortly.",
+            );
+        }
+    };
     let observation =
         match tokio::time::timeout(StdDuration::from_secs(5), driver.observe(&driver_config)).await
         {
@@ -5387,17 +5430,10 @@ async fn enroll_integrated_device(
                 );
             }
         };
-    let config_bytes = serde_json::to_vec(&driver_config).unwrap_or_default();
-    let logical_id = format!("{driver_id}:{}", hex::encode(Sha256::digest(config_bytes)));
+    drop(probe_permit);
     let mut inner = state.inner.lock().await;
-    if inner.enrollments.values().any(|entry| {
-        entry.driver_id.as_deref() == Some(driver_id.as_str()) && entry.logical_id == logical_id
-    }) {
-        return error_response(
-            StatusCode::CONFLICT,
-            "duplicate_device",
-            "This integrated device is already enrolled.",
-        );
+    if let Some(response) = integration_enrollment_guard(&inner, &driver_id, &logical_id) {
+        return response;
     }
     let room = requested_room
         .as_deref()
@@ -5422,6 +5458,7 @@ async fn enroll_integrated_device(
         IntegrationObservation {
             state: observation,
             observed_at: Utc::now(),
+            poll_failed: false,
         },
     );
     inner
@@ -5447,6 +5484,34 @@ async fn enroll_integrated_device(
     (StatusCode::CREATED, Json(envelope(enrollment, None))).into_response()
 }
 
+fn integration_enrollment_guard(
+    inner: &Inner,
+    driver_id: &str,
+    logical_id: &str,
+) -> Option<Response> {
+    if inner.enrollments.values().any(|entry| {
+        entry.driver_id.as_deref() == Some(driver_id) && entry.logical_id == logical_id
+    }) {
+        return Some(error_response(
+            StatusCode::CONFLICT,
+            "duplicate_device",
+            "This integrated device is already enrolled.",
+        ));
+    }
+    let count = inner
+        .enrollments
+        .values()
+        .filter(|entry| entry.driver_id.is_some())
+        .count();
+    (count >= MAX_LAN_INTEGRATION_ENROLLMENTS).then(|| {
+        error_response(
+            StatusCode::CONFLICT,
+            "integration_limit_reached",
+            "The LAN integration enrollment limit has been reached.",
+        )
+    })
+}
+
 fn config_contains_secret_material(config: &Value) -> bool {
     match config {
         Value::Object(object) => object.iter().any(|(key, value)| {
@@ -5454,14 +5519,14 @@ fn config_contains_secret_material(config: &Value) -> bool {
             let secret_key = [
                 "password",
                 "passphrase",
-                "token",
                 "secret",
                 "apikey",
                 "authorization",
                 "credential",
             ]
             .iter()
-            .any(|needle| normalized.contains(needle));
+            .any(|needle| normalized.contains(needle))
+                || (normalized.contains("token") && !normalized.ends_with("id"));
             (secret_key && !normalized.ends_with("ref")) || config_contains_secret_material(value)
         }),
         Value::Array(values) => values.iter().any(config_contains_secret_material),
@@ -5515,6 +5580,7 @@ async fn remove_enrollment(
         None,
         None,
     );
+    state.integration_poll_attempts.lock().await.remove(&id);
     if state.persist(&inner).await.is_err() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5522,7 +5588,6 @@ async fn remove_enrollment(
             "Enrollment removal may have completed; refresh the managed-device list.",
         );
     }
-    state.integration_poll_attempts.lock().await.remove(&id);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -8322,7 +8387,7 @@ fn integrated_managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDe
         Some(latest) => {
             let age = now.signed_duration_since(latest.observed_at);
             (
-                if age <= ChronoDuration::seconds(60) {
+                if !latest.poll_failed && age <= ChronoDuration::seconds(60) {
                     "ready"
                 } else {
                     "stale"
@@ -8366,7 +8431,9 @@ fn integrated_managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDe
         PositionStatus::NotObserved
     });
     let position_freshness = latest.map(|latest| {
-        if now.signed_duration_since(latest.observed_at) <= ChronoDuration::seconds(60) {
+        if !latest.poll_failed
+            && now.signed_duration_since(latest.observed_at) <= ChronoDuration::seconds(60)
+        {
             Freshness::Fresh
         } else {
             Freshness::Stale
@@ -8718,6 +8785,235 @@ fn command_status_text(status: CommandStatus) -> &'static str {
 #[cfg(test)]
 mod security_hardening_tests {
     use super::*;
+
+    struct UnavailableDriver;
+
+    #[async_trait::async_trait]
+    impl BlindDriver for UnavailableDriver {
+        fn id(&self) -> &'static str {
+            "unavailable_test"
+        }
+
+        fn validate_config(&self, _config: &Value) -> Result<(), DriverFailure> {
+            Ok(())
+        }
+
+        async fn observe(&self, _config: &Value) -> Result<BlindObservation, DriverFailure> {
+            Err(DriverFailure::new(
+                DriverFailureKind::NotSent,
+                "test_device_unavailable",
+            ))
+        }
+
+        async fn execute(
+            &self,
+            _config: &Value,
+            _command: BlindCommand,
+        ) -> Result<(), DriverFailure> {
+            Ok(())
+        }
+    }
+
+    struct CountingDriver(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl BlindDriver for CountingDriver {
+        fn id(&self) -> &'static str {
+            "counting_test"
+        }
+
+        fn validate_config(&self, _config: &Value) -> Result<(), DriverFailure> {
+            Ok(())
+        }
+
+        async fn observe(&self, _config: &Value) -> Result<BlindObservation, DriverFailure> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(BlindObservation {
+                current_closed_percent: Some(50),
+                target_closed_percent: Some(50),
+                motion: BlindMotion::AtTarget,
+                position_control: true,
+            })
+        }
+
+        async fn execute(
+            &self,
+            _config: &Value,
+            _command: BlindCommand,
+        ) -> Result<(), DriverFailure> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn config_secret_guard_allows_identifiers_and_rejects_secret_values() {
+        assert!(!config_contains_secret_material(&serde_json::json!({
+            "component_id": 0,
+            "token_id": "shelly-token-id",
+            "api_key_ref": "vault://shelly/api-key"
+        })));
+        assert!(config_contains_secret_material(&serde_json::json!({
+            "access_token": "actual-secret"
+        })));
+    }
+
+    #[tokio::test]
+    async fn failed_integration_poll_marks_the_last_observation_stale() {
+        let state = AppState::new().with_blind_driver(Arc::new(UnavailableDriver));
+        let id = "integration-failure-test";
+        let enrollment = Enrollment {
+            id: id.into(),
+            label: "Test blind".into(),
+            advertised_name: "Test blind".into(),
+            logical_id: "unavailable_test:device".into(),
+            is_simulated: false,
+            created_at: Utc::now(),
+            room: None,
+            driver_id: Some("unavailable_test".into()),
+            driver_config: Some(serde_json::json!({})),
+        };
+        {
+            let mut inner = state.inner.lock().await;
+            inner.enrollments.insert(id.into(), enrollment.clone());
+            inner.integration_observations.insert(
+                id.into(),
+                IntegrationObservation {
+                    state: BlindObservation {
+                        current_closed_percent: Some(50),
+                        target_closed_percent: Some(50),
+                        motion: BlindMotion::AtTarget,
+                        position_control: true,
+                    },
+                    observed_at: Utc::now(),
+                    poll_failed: false,
+                },
+            );
+        }
+
+        state.refresh_integration_observations(Some(id), true).await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(managed_device(&inner, enrollment).availability, "stale");
+    }
+
+    #[tokio::test]
+    async fn lan_enrollment_limit_is_checked_before_the_network_probe() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let state = AppState::new().with_blind_driver(Arc::new(CountingDriver(probes.clone())));
+        {
+            let mut inner = state.inner.lock().await;
+            for index in 0..MAX_LAN_INTEGRATION_ENROLLMENTS {
+                let id = format!("integration-limit-{index}");
+                inner.enrollments.insert(
+                    id.clone(),
+                    Enrollment {
+                        id,
+                        label: "Existing blind".into(),
+                        advertised_name: "Existing blind".into(),
+                        logical_id: format!("counting_test:{index}"),
+                        is_simulated: false,
+                        created_at: Utc::now(),
+                        room: None,
+                        driver_id: Some("counting_test".into()),
+                        driver_config: Some(serde_json::json!({"device": index})),
+                    },
+                );
+            }
+        }
+
+        let response = enroll_integrated_device(
+            state,
+            EnrollmentRequest {
+                observed_device_id: String::new(),
+                label: "New blind".into(),
+                room: None,
+                driver_id: Some("counting_test".into()),
+                driver_config: Some(serde_json::json!({"device": "new"})),
+            },
+            "New blind".into(),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn lan_enrollment_probes_are_bounded_and_do_not_queue() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let state = AppState::new().with_blind_driver(Arc::new(CountingDriver(probes.clone())));
+        let permits = (0..MAX_CONCURRENT_LAN_ENROLLMENT_PROBES)
+            .map(|_| {
+                state
+                    .integration_enrollment_probes
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let response = enroll_integrated_device(
+            state,
+            EnrollmentRequest {
+                observed_device_id: String::new(),
+                label: "New blind".into(),
+                room: None,
+                driver_id: Some("counting_test".into()),
+                driver_config: Some(serde_json::json!({"device": "new"})),
+            },
+            "New blind".into(),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn removal_clears_poll_cache_when_state_persistence_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked_parent = directory.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "block").unwrap();
+        let data_path = blocked_parent.join("state.json");
+        let state = AppState::configured(true, None, Some(data_path));
+        let id = "integration-removal-test";
+        {
+            let mut inner = state.inner.lock().await;
+            inner.enrollments.insert(
+                id.into(),
+                Enrollment {
+                    id: id.into(),
+                    label: "Test blind".into(),
+                    advertised_name: "Test blind".into(),
+                    logical_id: "shelly_cover:test".into(),
+                    is_simulated: false,
+                    created_at: Utc::now(),
+                    room: None,
+                    driver_id: Some("shelly_cover".into()),
+                    driver_config: Some(serde_json::json!({})),
+                },
+            );
+        }
+        state
+            .integration_poll_attempts
+            .lock()
+            .await
+            .insert(id.into(), Instant::now());
+
+        let response = remove_enrollment(RequestState(state.clone()), RoutePath(id.into())).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !state
+                .integration_poll_attempts
+                .lock()
+                .await
+                .contains_key(id)
+        );
+    }
 
     #[test]
     fn secure_cookie_flag_uses_forwarded_transport_not_origin_scheme() {

@@ -20,6 +20,16 @@ use tower::ServiceExt;
 
 type RpcRequests = Arc<Mutex<Vec<Value>>>;
 
+fn shelly_app(base_url: &str) -> Router {
+    let driver = ShellyCoverDriver::with_allowed_origins([base_url]).unwrap();
+    router(AppState::new().with_blind_driver(Arc::new(driver)))
+}
+
+fn shelly_app_with_state(state: AppState, base_url: &str) -> Router {
+    let driver = ShellyCoverDriver::with_allowed_origins([base_url]).unwrap();
+    router(state.with_blind_driver(Arc::new(driver)))
+}
+
 async fn mock_rpc(
     State(requests): State<RpcRequests>,
     Path(method): Path<String>,
@@ -70,14 +80,15 @@ async fn shelly_rpc_server_error_leaves_command_outcome_unknown() {
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let base_url = format!("http://{address}");
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    let driver = ShellyCoverDriver::new();
+    let driver = ShellyCoverDriver::with_allowed_origins([base_url.as_str()]).unwrap();
     let failure = driver
         .execute(
             &json!({
-                "base_url": format!("http://{address}"),
+                "base_url": base_url,
                 "component_id": 0
             }),
             BlindCommand::Open,
@@ -137,7 +148,7 @@ async fn enroll_shelly_component(app: &Router, base_url: &str, component_id: u32
 #[tokio::test]
 async fn uncalibrated_shelly_covers_reject_position_commands_by_capability() {
     let (base_url, requests, server) = mock_shelly().await;
-    let app = router(AppState::new());
+    let app = shelly_app(&base_url);
     let enrollment_id = enroll_shelly_component(&app, &base_url, 2).await;
     let (status, body) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
@@ -174,7 +185,7 @@ async fn uncalibrated_shelly_covers_reject_position_commands_by_capability() {
 #[tokio::test]
 async fn shelly_cover_can_be_enrolled_and_its_position_is_normalized() {
     let (base_url, requests, server) = mock_shelly().await;
-    let app = router(AppState::new());
+    let app = shelly_app(&base_url);
     let (status, body) = request(&app, Method::GET, "/api/control/v1/drivers", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -212,7 +223,7 @@ async fn shelly_cover_can_be_enrolled_and_its_position_is_normalized() {
 #[tokio::test]
 async fn set_position_dispatches_through_shelly_rpc_with_inverted_position() {
     let (base_url, requests, server) = mock_shelly().await;
-    let app = router(AppState::new());
+    let app = shelly_app(&base_url);
     let enrollment_id = enroll_shelly(&app, &base_url).await;
     let path = format!("/api/control/v1/devices/{enrollment_id}/commands");
     let (status, accepted) = request(
@@ -257,9 +268,35 @@ async fn set_position_dispatches_through_shelly_rpc_with_inverted_position() {
 }
 
 #[tokio::test]
+async fn shelly_rejects_unallowlisted_origins_before_making_rpc_requests() {
+    let (base_url, requests, server) = mock_shelly().await;
+    let driver = ShellyCoverDriver::with_allowed_origins(std::iter::empty::<&str>()).unwrap();
+    let app = router(AppState::new().with_blind_driver(Arc::new(driver)));
+    let (status, body) = request(
+        &app,
+        Method::POST,
+        "/api/control/v1/devices",
+        &[(header::CONTENT_TYPE.as_str(), "application/json")],
+        Some(json!({
+            "label": "Office Shade",
+            "driver_id": "shelly_cover",
+            "driver_config": {
+                "base_url": base_url,
+                "component_id": 0
+            }
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(requests.lock().unwrap().is_empty());
+    server.abort();
+}
+
+#[tokio::test]
 async fn unsupported_driver_and_unsafe_urls_are_rejected_before_rpc() {
     let (base_url, requests, server) = mock_shelly().await;
-    let app = router(AppState::new());
+    let app = shelly_app(&base_url);
     let payload = |driver_id: &str, base_url: &str| {
         json!({
             "label": "Office Shade",
@@ -298,11 +335,17 @@ async fn driver_configuration_persists_and_reconnects_after_restart() {
     let (base_url, _requests, server) = mock_shelly().await;
     let directory = tempfile::tempdir().unwrap();
     let state_path: PathBuf = directory.path().join("state.json");
-    let app = router(AppState::from_data_path(&state_path).await.unwrap());
+    let app = shelly_app_with_state(
+        AppState::from_data_path(&state_path).await.unwrap(),
+        &base_url,
+    );
     let enrollment_id = enroll_shelly(&app, &base_url).await;
     drop(app);
 
-    let restored = router(AppState::from_data_path(&state_path).await.unwrap());
+    let restored = shelly_app_with_state(
+        AppState::from_data_path(&state_path).await.unwrap(),
+        &base_url,
+    );
     let (status, body) =
         request(&restored, Method::GET, "/api/control/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);

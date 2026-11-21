@@ -722,7 +722,7 @@
       "post": {
         "operationId": "enrollManagedDevice",
         "summary": "Enroll a freshly observed SOMA blind or a configured driver-backed blind",
-        "description": "For SOMA and simulator enrollment, send observed_device_id and label. For a LAN integration, send label, driver_id, and driver_config instead. The built-in shelly_cover driver accepts {\"base_url\":\"http://192.168.1.20\",\"component_id\":0}; it probes Cover.GetStatus before saving. Enrollment configuration must not include credentials. HTTPS certificate verification is enabled and redirects are not followed. Integrated state is polled with bounded HTTP requests; command acknowledgements do not confirm movement. The service API has no authentication, so keep it on loopback or a trusted network.",
+        "description": "For SOMA and simulator enrollment, send observed_device_id and label. For a LAN integration, send label, driver_id, and driver_config instead. The built-in shelly_cover driver accepts {\"base_url\":\"http://192.168.1.20\",\"component_id\":0}; base_url must be an IP-literal HTTP(S) origin listed in SOMARIS_LAN_DRIVER_ALLOWED_ORIGINS. The default allowlist is empty, DNS names are rejected, HTTPS certificate verification is enabled, and redirects are not followed. Enrollment probes Cover.GetStatus before saving, allows at most 32 LAN integrations and four concurrent enrollment probes, and rejects duplicate devices. Enrollment configuration must not include credentials. Integrated state is polled with bounded HTTP requests; command acknowledgements do not confirm movement. The service API has no authentication, so keep it on loopback or a trusted network.",
         "requestBody": {
           "required": true,
           "content": {
@@ -752,7 +752,7 @@
           },
           "409": {
             "$ref": "#/components/responses/Error",
-            "description": "Conflict. Includes duplicate_device, ambiguous_device, or simulator_limit_reached when two simulators are already enrolled."
+            "description": "Conflict. Includes duplicate_device, integration_limit_reached, ambiguous_device, or simulator_limit_reached."
           },
           "415": {
             "$ref": "#/components/responses/Error"
@@ -767,6 +767,9 @@
             "$ref": "#/components/responses/Error"
           },
           "504": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
             "$ref": "#/components/responses/Error"
           }
         }
@@ -2761,7 +2764,8 @@
             "properties": {
               "base_url": {
                 "type": "string",
-                "format": "uri"
+                "format": "uri",
+                "description": "IP-literal HTTP(S) origin that must exactly match an origin in SOMARIS_LAN_DRIVER_ALLOWED_ORIGINS."
               },
               "component_id": {
                 "type": "integer",

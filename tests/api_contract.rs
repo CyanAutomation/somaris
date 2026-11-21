@@ -1620,6 +1620,7 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
             .get("driver_config")
             .is_some()
     );
+    assert!(contract["paths"]["/api/control/v1/devices"]["post"]["responses"]["429"].is_object());
     assert!(contract["components"]["schemas"]["DriverListEnvelope"].is_object());
     assert!(
         contract["components"]["schemas"]["MovementStatus"]["enum"]
