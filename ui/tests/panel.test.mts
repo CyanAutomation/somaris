@@ -259,7 +259,7 @@ test('square desk panel keeps all blind cards and controls visible at 480px', as
     assert.ok(layout.cards.every(card => card.top >= layout.appTop && card.bottom <= layout.appBottom));
     assert.ok(layout.controls.every(control => control.top >= layout.appTop && control.bottom <= layout.appBottom));
     assert.ok(layout.controls.every(control => control.width >= 44 && control.height >= 44));
-    assert.equal(layout.topbarControls.length, 5);
+    assert.equal(layout.topbarControls.length, 4);
     assert.equal(layout.demoBannerHeight, 0);
     assert.equal(layout.demoResetLabel,'Reset demo');
     assert.ok(layout.topbarControls.every(control => control.left >= layout.topbarLeft && control.right <= layout.topbarRight));
