@@ -240,9 +240,6 @@ export function renderServiceHealthSummary({ summary, fields, notUsedMarkup = ''
     const unused = notUsedMarkup ? `<details class="service-unused"><summary>Not used in demo</summary>${notUsedMarkup}</details>` : '';
     return `<section class="service-health"><h2 class="service-health__summary">${escapeHtml(summary)}</h2><div class="service-health__details">${renderInfoGrid(fields)}</div>${unused}</section>`;
 }
-export function renderSettingsPage({ themePreference = 'auto', serviceSummary, serviceFields, notUsedMarkup = '', simulatorMarkup = '' }) {
-    return `${renderBackButton()}<h1 class="page-title">Settings</h1>${renderThemePreferenceControl(themePreference)}<section class="settings-service"><h2>Service status</h2>${renderServiceHealthSummary({ summary: serviceSummary, fields: serviceFields, notUsedMarkup })}${simulatorMarkup}</section>`;
-}
 export function renderActivitySection({ count, expanded, listMarkup }) {
     const collapsed = !expanded;
     const countMarkup = count > 0 ? `<span class="count">${count} changes</span>` : '';
