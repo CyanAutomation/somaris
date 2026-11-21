@@ -140,14 +140,6 @@ export function renderBatteryReading({ battery, now = Date.now() }) {
     const reading = battery?.observed_at ? `<span class="battery-reading__age">Last reading ${renderRelativeTime(battery.observed_at, now)}</span>` : '';
     return `<div class="battery-reading" aria-label="Estimated battery ${percentage}%"><span class="battery-reading__icon">${iconMarkup('battery')}</span><span class="battery-reading__value">~${percentage}%</span>${reading}</div>`;
 }
-function renderLayoutControl({ displayPreference = 'auto' } = {}) {
-    const selectedIndex = DISPLAY_MODE_OPTIONS.findIndex(([value]) => value === displayPreference);
-    const safeIndex = selectedIndex < 0 ? 0 : selectedIndex;
-    const [currentPreference, currentLabel] = DISPLAY_MODE_OPTIONS[safeIndex] ?? DISPLAY_MODE_OPTIONS[0];
-    const modeIcons = { auto: 'display', mobile: 'mobile', panel: 'panel', desktop: 'desktop' };
-    const label = `Layout: ${currentLabel}`;
-    return renderIconButton({ label, action: 'layout-cycle', icon: modeIcons[currentPreference] || 'display', variant: 'topbar-action topbar-icon-button layout-mode-toggle' }).replace('<button ', `<button id="layout-mode-toggle" data-layout-mode="${escapeHtml(currentPreference)}" `);
-}
 function renderThemeControl({ themePreference = 'auto' } = {}) {
     const isDark = themePreference === 'dark';
     const nextLabel = isDark ? 'Light' : 'Dark';
@@ -155,11 +147,14 @@ function renderThemeControl({ themePreference = 'auto' } = {}) {
     const label = `Switch to ${nextLabel.toLowerCase()} theme`;
     return renderIconButton({ label, action: 'theme-toggle', icon: icons[themePreference] || 'display', variant: 'topbar-action topbar-icon-button theme-toggle' }).replace('<button ', `<button id="theme-toggle" data-theme-preference="${escapeHtml(themePreference)}" `);
 }
-export function renderThemePreferenceControl(themePreference = 'auto') {
+export function renderThemePreferenceControl(themePreference = 'auto', displayPreference) {
     const choices = [['auto', 'Automatic'], ['dark', 'Dark'], ['light', 'Light'], ['high-contrast', 'High contrast']];
     const selected = choices.some(([value]) => value === themePreference) ? themePreference : 'auto';
     const options = choices.map(([value, label]) => `<option value="${value}"${value === selected ? ' selected' : ''}>${label}</option>`).join('');
-    return `<section class="panel appearance-settings"><h2>Appearance</h2><label class="field" for="theme-preference">Theme<select id="theme-preference" name="theme" aria-label="Theme" data-theme-preference>${options}</select></label><p class="subtle">The header theme button switches directly between light and dark. Automatic and high contrast are available here.</p></section>`;
+    const displayOptions = DISPLAY_MODE_OPTIONS.map(([value, label]) => `<option value="${value}"${value === displayPreference ? ' selected' : ''}>${label}</option>`).join('');
+    const displayControl = displayPreference === undefined ? '' : `<label class="field" for="display-preference">Display mode<select id="display-preference" name="display_mode" aria-label="Display mode" data-display-preference>${displayOptions}</select></label>`;
+    const heading = displayPreference === undefined ? 'Appearance' : 'This device';
+    return `<section class="panel appearance-settings"><h2>${heading}</h2>${displayControl}<label class="field" for="theme-preference">Theme<select id="theme-preference" name="theme" aria-label="Theme" data-theme-preference>${options}</select></label><p class="subtle">Display mode and theme are saved on this device.</p></section>`;
 }
 export function renderFreshnessIndicator(label) {
     const name = escapeHtml(label || 'Last heard time unavailable');
@@ -376,18 +371,17 @@ export function renderPositionControl({ deviceId, blindLabel, positionClosedPerc
         .join('');
     return `<div class="position-control" role="group" aria-label="Set position for ${escapeHtml(blindLabel)}"><div class="position-control__label"><label for="position-${id}">Set position</label><span><output data-position-output="${id}">${positionOpenPercent}%</output> open</span></div><div class="position-range"><span class="position-end position-end--closed">Closed</span><input id="position-${id}" type="range" min="0" max="100" step="1" value="${positionOpenPercent}" data-position-input="${id}" aria-label="Target position for ${escapeHtml(blindLabel)} in percent open"${disabled ? ' disabled' : ''}><span class="position-end position-end--open">Open</span></div><div class="position-presets" role="group" aria-label="Position presets for ${escapeHtml(blindLabel)}">${presets}</div></div>`;
 }
-export function renderTopbarActions({ blindCount = 0, panelMode = false, demoMode = false, displayPreference = 'auto', serviceLabel = 'Connecting', serviceTone = '', themePreference = 'auto', serviceShortLabel, route = 'home', } = {}) {
+export function renderTopbarActions({ blindCount = 0, panelMode = false, demoMode = false, serviceLabel = 'Connecting', serviceTone = '', themePreference = 'auto', serviceShortLabel, route = 'home', } = {}) {
     const count = Number.isInteger(blindCount) && blindCount >= 0 ? blindCount : 0;
     const countLabel = `${count} ${count === 1 ? 'blind' : 'blinds'}`;
     const shortLabel = serviceShortLabel || (serviceTone === 'good' ? 'Ready' : serviceTone === 'bad' ? 'Offline' : 'Check');
     const status = `<span id="service-status" class="service-status"><span class="status-dot${serviceTone ? ` ${escapeHtml(serviceTone)}` : ''}" aria-hidden="true"></span><span class="service-status__full">${escapeHtml(serviceLabel)}</span><span class="service-status__short">${escapeHtml(shortLabel)}</span></span>`;
     const panelCount = panelMode ? `<span class="topbar-device-count">${escapeHtml(countLabel)}</span>` : '';
-    const layoutControl = renderLayoutControl({ displayPreference });
     const themeControl = renderThemeControl({ themePreference });
     const refreshButton = renderButton({ label: 'Refresh', accessibleLabel: 'Refresh', action: 'refresh', icon: 'refresh', variant: 'topbar-action topbar-icon-button topbar-action--compact-label' });
     const serviceButton = !panelMode ? renderIconButton({ label: 'Settings', action: 'settings', icon: 'settings', variant: 'topbar-action topbar-icon-button' }) : '';
     const demoReset = panelMode && demoMode ? renderIconButton({ label: 'Reset demo', action: 'demo-reset', icon: 'reset', variant: 'topbar-action topbar-icon-button' }) : '';
-    return `${status}${panelCount}${serviceButton}${demoReset}${renderAddBlindButton()}${layoutControl}${themeControl}${refreshButton}`;
+    return `${status}${panelCount}${serviceButton}${demoReset}${renderAddBlindButton()}${themeControl}${refreshButton}`;
 }
 export function renderMobileTabs(route = 'home') {
     const active = route.startsWith('details/') || route === 'add' ? 'home' : route === 'service' ? 'settings' : route;

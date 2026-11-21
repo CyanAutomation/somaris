@@ -785,7 +785,6 @@ function updateTopbar() {
         blindCount: state.managed.length,
         panelMode: document.documentElement.dataset.displayMode === 'panel',
         demoMode: state.demoMode,
-        displayPreference,
         themePreference,
         route: page(),
         ...topbarStatus(),
@@ -818,10 +817,63 @@ function restoreAppFocus(appRoot, focusedAction) {
 let pageRenderRevision = 0;
 const addPageModule = createLazyModule(() => import('./add-page.mjs'));
 const settingsPageModule = createLazyModule(() => import('./settings-page.mjs'));
+let serverSettings = null;
+let serverSettingsError = null;
+let serverSettingsLoad = null;
+let serverSettingsEtag = null;
+let adminAuth = null;
+let adminAuthError = null;
+let setupChecks = null;
+function loadServerSettings(force = false) {
+    if (serverSettingsLoad)
+        return serverSettingsLoad;
+    if (!force && (serverSettings || serverSettingsError))
+        return Promise.resolve();
+    if (force) {
+        serverSettings = null;
+        serverSettingsError = null;
+        serverSettingsEtag = null;
+        adminAuthError = null;
+    }
+    serverSettingsLoad = (async () => {
+        try {
+            const response = await fetch('/api/control/v1/settings', { cache: 'no-store', credentials: 'same-origin' });
+            const body = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                const error = isRecord(body) && isRecord(body.error) ? body.error : {};
+                throw new Error(String(error.message ?? `Request failed (${response.status})`));
+            }
+            if (!isRecord(body) || !isRecord(body.data))
+                throw new Error('The service returned invalid settings.');
+            serverSettings = body.data;
+            serverSettingsEtag = response.headers.get('ETag');
+        }
+        catch (error) {
+            serverSettingsError = `Service settings could not be loaded: ${errorMessage(error)}`;
+        }
+        const [authResult, checksResult] = await Promise.allSettled([
+            api('/api/control/v1/auth'),
+            api('/api/control/v1/setup-checks'),
+        ]);
+        if (authResult.status === 'fulfilled') {
+            adminAuth = authResult.value;
+            adminAuthError = null;
+        }
+        else {
+            adminAuth = null;
+            adminAuthError = state.demoMode ? null : `Administrator access could not be checked: ${errorMessage(authResult.reason)}`;
+        }
+        setupChecks = checksResult.status === 'fulfilled' ? checksResult.value : null;
+    })().finally(() => { serverSettingsLoad = null; if (page() === 'settings' || page() === 'service')
+        render(); });
+    return serverSettingsLoad;
+}
 function render() {
     if (!app)
         return;
     const route = page();
+    if ((route === 'settings' || route === 'service') && !serverSettings && !serverSettingsError)
+        loadServerSettings();
     const revision = ++pageRenderRevision;
     const scrollY = window.scrollY;
     const activeElement = document.activeElement;
@@ -867,11 +919,17 @@ function render() {
     if ((route === 'settings' || route === 'service') && settingsPageModule.loaded) {
         commit(settingsPageModule.loaded.renderSettingsPage({
             themePreference,
+            displayPreference,
             demoMode: state.demoMode,
             diagnostics: state.diagnostics,
             simulators: state.simulators,
             managedCount: state.managed.length,
             serviceError: state.serviceError,
+            serverSettings,
+            serverSettingsError,
+            adminAuth,
+            adminAuthError,
+            setupChecks,
         }));
         return;
     }
@@ -890,11 +948,17 @@ function render() {
             }))
             : settingsPageModule.load().then(({ renderSettingsPage }) => renderSettingsPage({
                 themePreference,
+                displayPreference,
                 demoMode: state.demoMode,
                 diagnostics: state.diagnostics,
                 simulators: state.simulators,
                 managedCount: state.managed.length,
                 serviceError: state.serviceError,
+                serverSettings,
+                serverSettingsError,
+                adminAuth,
+                adminAuthError,
+                setupChecks,
             }));
         void content.then(commit).catch(() => commit('<div class="notice" role="alert">This page could not be loaded. Try opening it again.</div>'));
         return;
@@ -1606,7 +1670,7 @@ export function dispatchBlindCommand(action, encodedId, send = sendCommand) {
     void send(decodeURIComponent(encodedId), action);
     return true;
 }
-function changeDisplayMode(preference, applyDisplayMode) {
+function changeDisplayMode(preference, applyDisplayMode, focusTargetId = 'layout-mode-toggle') {
     if (!displayModes.has(preference))
         return;
     displayPreference = preference;
@@ -1616,7 +1680,7 @@ function changeDisplayMode(preference, applyDisplayMode) {
     catch { /* The current selection still applies until the page reloads. */ }
     applyDisplayMode();
     render();
-    document.getElementById('layout-mode-toggle')?.focus({ preventScroll: true });
+    document.getElementById(focusTargetId)?.focus({ preventScroll: true });
 }
 function changeTheme(preference, focusTargetId = 'theme-toggle') {
     if (!isThemePreference(preference))
@@ -1682,7 +1746,6 @@ function handleRoomRemovalClick(room, confirm) {
 }
 const clickActionHandlers = {
     'snackbar-dismiss': (_argument, _id, deviceId) => { snackbarQueue.dismiss(deviceId); return true; },
-    'layout-cycle': (_argument, _id, _deviceId, applyDisplayMode) => { changeDisplayMode(nextDisplayPreference(displayPreference), applyDisplayMode); return true; },
     'theme-toggle': () => { toggleTheme(); return true; },
     command: (argument, id) => dispatchBlindCommand(argument, id),
     batch: argument => handleBatchClick(argument),
@@ -1715,6 +1778,9 @@ const clickActionHandlers = {
         void resetDemo(state, api, () => refreshService(state, api), () => globalThis.confirm('Reset your demo? This restores all four blinds and clears this session’s activity.')).then(() => render());
         return true;
     },
+    'admin-logout': () => { void logoutAdmin(); return true; },
+    'settings-reset': () => { void resetServiceSettings(); return true; },
+    'service-restart': () => { void restartService(); return true; },
     remove: (_argument, _id, deviceId) => handleRemovalClick('remove', deviceId),
     'remove-confirm': (_argument, _id, deviceId) => handleRemovalClick('remove-confirm', deviceId),
     'remove-cancel': (_argument, _id, deviceId) => handleRemovalClick('remove-cancel', deviceId),
@@ -1868,6 +1934,21 @@ async function handleFormSubmit(event) {
     const form = event.target instanceof HTMLFormElement ? event.target : null;
     if (!form)
         return;
+    if (form.matches('[data-admin-setup]')) {
+        event.preventDefault();
+        await submitAdminSetup(form);
+        return;
+    }
+    if (form.matches('[data-admin-login]')) {
+        event.preventDefault();
+        await submitAdminLogin(form);
+        return;
+    }
+    if (form.matches('[data-service-settings]')) {
+        event.preventDefault();
+        await submitServiceSettings(form);
+        return;
+    }
     if (form.matches('[data-simulator]')) {
         event.preventDefault();
         await saveSimulatorSettings(form);
@@ -1892,6 +1973,127 @@ async function handleFormSubmit(event) {
         return;
     event.preventDefault();
     await submitEnrollmentForm(form);
+}
+function settingsFailure(body, status) {
+    const value = isRecord(body) && isRecord(body.error) ? body.error : {};
+    const error = new Error(String(value.message ?? `Request failed (${status})`));
+    error.status = status;
+    if (typeof value.code === 'string')
+        error.code = value.code;
+    return error;
+}
+async function settingsMutation(path, method, payload) {
+    if (!serverSettingsEtag)
+        await loadServerSettings(true);
+    if (!serverSettingsEtag)
+        throw new Error('Refresh the settings before saving changes.');
+    const response = await fetch(path, {
+        method,
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'If-Match': serverSettingsEtag },
+        body: JSON.stringify(payload),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+        const error = settingsFailure(body, response.status);
+        if (response.status === 412)
+            await loadServerSettings(true);
+        throw error;
+    }
+    if (!isRecord(body) || !isRecord(body.data) || !isRecord(body.data.settings))
+        throw new Error('The service returned invalid settings.');
+    serverSettings = body.data.settings;
+    serverSettingsEtag = response.headers.get('ETag');
+}
+async function submitServiceSettings(form) {
+    const update = {};
+    for (const [key, raw] of new FormData(form).entries()) {
+        if (key === 'simulator_enabled' || key === 'history_api_enabled')
+            update[key] = raw === 'true';
+        else if (key === 'allowed_origins')
+            update[key] = raw.toString().split(',').map(value => value.trim()).filter(Boolean);
+        else if (key === 'log_level')
+            update[key] = raw.toString();
+        else {
+            const value = Number(raw);
+            if (Number.isSafeInteger(value))
+                update[key] = value;
+        }
+    }
+    const button = form.querySelector('button[type="submit"]');
+    if (button)
+        button.disabled = true;
+    try {
+        await settingsMutation('/api/control/v1/settings', 'PUT', update);
+        await refresh();
+        snackbarQueue.push({ message: 'Service settings saved.', tone: 'success' });
+    }
+    catch (error) {
+        snackbarQueue.push({ message: `Settings could not be saved: ${errorMessage(error)}`, tone: 'error' });
+        render();
+    }
+    finally {
+        if (button)
+            button.disabled = false;
+    }
+}
+async function submitAdminSetup(form) {
+    const values = new FormData(form);
+    try {
+        await api('/api/control/v1/auth/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: String(values.get('code') || ''), passphrase: String(values.get('passphrase') || '') }) });
+        await loadServerSettings(true);
+        snackbarQueue.push({ message: 'Administrator passphrase set.', tone: 'success' });
+    }
+    catch (error) {
+        snackbarQueue.push({ message: `Could not set the passphrase: ${errorMessage(error)}`, tone: 'error' });
+        render();
+    }
+}
+async function submitAdminLogin(form) {
+    const values = new FormData(form);
+    try {
+        await api('/api/control/v1/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ passphrase: String(values.get('passphrase') || '') }) });
+        await loadServerSettings(true);
+        snackbarQueue.push({ message: 'Signed in to service settings.', tone: 'success' });
+    }
+    catch (error) {
+        snackbarQueue.push({ message: `Sign in failed: ${errorMessage(error)}`, tone: 'error' });
+        render();
+    }
+}
+async function logoutAdmin() {
+    try {
+        await api('/api/control/v1/auth/logout', { method: 'POST' });
+        await loadServerSettings(true);
+    }
+    catch (error) {
+        snackbarQueue.push({ message: `Could not sign out: ${errorMessage(error)}`, tone: 'error' });
+        render();
+    }
+}
+async function resetServiceSettings() {
+    if (!globalThis.confirm('Reset service settings to their built-in defaults? Environment overrides will remain active.'))
+        return;
+    try {
+        await settingsMutation('/api/control/v1/settings/reset', 'POST', {});
+        await refresh();
+        snackbarQueue.push({ message: 'Service settings reset.', tone: 'success' });
+    }
+    catch (error) {
+        snackbarQueue.push({ message: `Settings could not be reset: ${errorMessage(error)}`, tone: 'error' });
+        render();
+    }
+}
+async function restartService() {
+    if (!globalThis.confirm('Restart Somaris now? The deployment needs a restart policy or supervisor to start it again.'))
+        return;
+    try {
+        await api('/api/control/v1/service/restart', { method: 'POST' });
+        snackbarQueue.push({ message: 'Somaris is restarting.', tone: 'info', duration: 10000 });
+    }
+    catch (error) {
+        snackbarQueue.push({ message: `Restart failed: ${errorMessage(error)}`, tone: 'error' });
+    }
 }
 if (app) {
     const actionRoot = document.querySelector('.app-shell');
@@ -2109,6 +2311,11 @@ if (app) {
             previewPosition(id, Number(range.value));
         });
         app.addEventListener('change', (event) => {
+            const displayPreferenceControl = closestHtmlElement(event.target, '[data-display-preference]');
+            if (displayPreferenceControl instanceof HTMLSelectElement) {
+                changeDisplayMode(displayPreferenceControl.value, applyDisplayMode, displayPreferenceControl.id);
+                return;
+            }
             const themePreferenceControl = closestHtmlElement(event.target, '[data-theme-preference]');
             if (themePreferenceControl instanceof HTMLSelectElement) {
                 changeTheme(themePreferenceControl.value, themePreferenceControl.id);
