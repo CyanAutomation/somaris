@@ -1,5 +1,6 @@
 import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderRoomCollection, renderRoomPicker, roomFromChoice, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderBatteryReading, renderRelativeTime, relativeTimeLabel, renderActivitySection, renderBackButton, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderHomeContent, renderDisclosure, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
 import { UI_PAGE_SIZE, windowPage, renderLoadMore } from './pagination.mjs';
+import { createLazyModule } from './lazy-module.mjs';
 import { SnackbarQueue } from './snackbar.mjs';
 import { mountClock } from './clock.mjs';
 export { escapeHtml };
@@ -815,6 +816,8 @@ function restoreAppFocus(appRoot, focusedAction) {
     actionTargets.find(element => element.dataset.action === preferredAction)?.focus({ preventScroll: true });
 }
 let pageRenderRevision = 0;
+const addPageModule = createLazyModule(() => import('./add-page.mjs'));
+const settingsPageModule = createLazyModule(() => import('./settings-page.mjs'));
 function render() {
     if (!app)
         return;
@@ -850,12 +853,34 @@ function render() {
             document.getElementById(focusedInputId)?.focus({ preventScroll: true });
         window.scrollTo({ top: scrollY, behavior: 'instant' });
     };
+    if (route === 'add' && addPageModule.loaded) {
+        commit(addPageModule.loaded.renderAddDevicePage({
+            observations: state.observations,
+            managed: state.managed,
+            rooms: roomNamesFromDevices(state.managed),
+            demoMode: state.demoMode,
+            adapterAvailable: state.diagnostics?.scanner?.adapter_available === true,
+            visibleCount: visibleNearbyCount,
+        }));
+        return;
+    }
+    if ((route === 'settings' || route === 'service') && settingsPageModule.loaded) {
+        commit(settingsPageModule.loaded.renderSettingsPage({
+            themePreference,
+            demoMode: state.demoMode,
+            diagnostics: state.diagnostics,
+            simulators: state.simulators,
+            managedCount: state.managed.length,
+            serviceError: state.serviceError,
+        }));
+        return;
+    }
     if (route === 'add' || route === 'settings' || route === 'service') {
         app.setAttribute('aria-busy', 'true');
         app.innerHTML = '<p class="page-loading" role="status">Loading page…</p>';
         updateTopbar();
         const content = route === 'add'
-            ? import('./add-page.mjs').then(({ renderAddDevicePage }) => renderAddDevicePage({
+            ? addPageModule.load().then(({ renderAddDevicePage }) => renderAddDevicePage({
                 observations: state.observations,
                 managed: state.managed,
                 rooms: roomNamesFromDevices(state.managed),
@@ -863,7 +888,7 @@ function render() {
                 adapterAvailable: state.diagnostics?.scanner?.adapter_available === true,
                 visibleCount: visibleNearbyCount,
             }))
-            : import('./settings-page.mjs').then(({ renderSettingsPage }) => renderSettingsPage({
+            : settingsPageModule.load().then(({ renderSettingsPage }) => renderSettingsPage({
                 themePreference,
                 demoMode: state.demoMode,
                 diagnostics: state.diagnostics,

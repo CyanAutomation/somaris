@@ -1,9 +1,30 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {windowPage} from '../pagination.mjs';
+import {createLazyModule} from '../lazy-module.mjs';
 import {renderAddDevicePage} from '../add-page.mjs';
 import {refreshService, shouldPauseRefresh} from '../app.mjs';
 import type {ApiRequest, Observation} from '../types.mjs';
+
+test('lazy module stays available synchronously after its first load',async()=>{
+ let loads=0;
+ const module={render:()=>'<main>ready</main>'};
+ const lazyModule=createLazyModule(async()=>{
+  loads++;
+  return module;
+ });
+
+ assert.equal(lazyModule.loaded,undefined);
+ const first=lazyModule.load();
+ const second=lazyModule.load();
+ assert.strictEqual(first,second);
+ assert.equal(loads,1);
+ assert.strictEqual(await first,module);
+ assert.strictEqual(lazyModule.loaded,module);
+ assert.equal(lazyModule.loaded?.render(),'<main>ready</main>');
+ assert.strictEqual(await lazyModule.load(),module);
+ assert.equal(loads,1);
+});
 
 test('windowPage returns only the requested prefix and a bounded next page',()=>{
  const items=Array.from({length:100},(_,index)=>index);
@@ -48,12 +69,15 @@ test('background refresh pauses while the document is hidden',()=>{
  assert.equal(shouldPauseRefresh({documentHidden:false}),false);
 });
 
-test('concurrent service refreshes share one request batch',async()=>{
+test('concurrent service refreshes share one request batch', {timeout:5000}, async()=>{
  let release!:()=>void;
  const gate=new Promise<void>(resolve=>{release=resolve;});
+ let announceStarted!:()=>void;
+ const requestsStarted=new Promise<void>(resolve=>{announceStarted=resolve;});
  const calls:string[]=[];
  const request:ApiRequest=async path=>{
   calls.push(path);
+  if(calls.length===5)announceStarted();
   await gate;
   return path==='/api/v1/diagnostics'?{scanner:{adapter_available:true}}:[];
  };
@@ -61,6 +85,8 @@ test('concurrent service refreshes share one request batch',async()=>{
 
  const first=refreshService(target,request);
  const second=refreshService(target,request);
+ assert.strictEqual(first,second);
+ await requestsStarted;
  assert.equal(calls.length,5);
  release();
  await Promise.all([first,second]);

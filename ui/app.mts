@@ -38,6 +38,7 @@ import {
   renderSnackbarRegion,
 } from './components.mjs';
 import {UI_PAGE_SIZE, windowPage, renderLoadMore} from './pagination.mjs';
+import {createLazyModule} from './lazy-module.mjs';
 import {SnackbarQueue} from './snackbar.mjs';
 import {mountClock} from './clock.mjs';
 import type {
@@ -866,6 +867,8 @@ function restoreAppFocus(appRoot: HTMLElement, focusedAction: string | null): vo
  actionTargets.find(element=>element.dataset.action===preferredAction)?.focus({preventScroll:true});
 }
 let pageRenderRevision = 0;
+const addPageModule=createLazyModule(()=>import('./add-page.mjs'));
+const settingsPageModule=createLazyModule(()=>import('./settings-page.mjs'));
 function render(): void {
  if(!app)return;
  const route=page();
@@ -895,12 +898,34 @@ function render(): void {
   else if(focusedInputId)document.getElementById(focusedInputId)?.focus({preventScroll:true});
   window.scrollTo({top:scrollY,behavior:'instant'});
  };
+ if(route==='add'&&addPageModule.loaded){
+  commit(addPageModule.loaded.renderAddDevicePage({
+   observations:state.observations,
+   managed:state.managed,
+   rooms:roomNamesFromDevices(state.managed),
+   demoMode:state.demoMode,
+   adapterAvailable:state.diagnostics?.scanner?.adapter_available===true,
+   visibleCount:visibleNearbyCount,
+  }));
+  return;
+ }
+ if((route==='settings'||route==='service')&&settingsPageModule.loaded){
+  commit(settingsPageModule.loaded.renderSettingsPage({
+   themePreference,
+   demoMode:state.demoMode,
+   diagnostics:state.diagnostics,
+   simulators:state.simulators,
+   managedCount:state.managed.length,
+   serviceError:state.serviceError,
+  }));
+  return;
+ }
  if(route==='add'||route==='settings'||route==='service'){
   app.setAttribute('aria-busy','true');
   app.innerHTML='<p class="page-loading" role="status">Loading page…</p>';
   updateTopbar();
   const content=route==='add'
-   ? import('./add-page.mjs').then(({renderAddDevicePage})=>renderAddDevicePage({
+   ? addPageModule.load().then(({renderAddDevicePage})=>renderAddDevicePage({
      observations:state.observations,
      managed:state.managed,
      rooms:roomNamesFromDevices(state.managed),
@@ -908,7 +933,7 @@ function render(): void {
      adapterAvailable:state.diagnostics?.scanner?.adapter_available===true,
      visibleCount:visibleNearbyCount,
    }))
-   : import('./settings-page.mjs').then(({renderSettingsPage})=>renderSettingsPage({
+   : settingsPageModule.load().then(({renderSettingsPage})=>renderSettingsPage({
      themePreference,
      demoMode:state.demoMode,
      diagnostics:state.diagnostics,
