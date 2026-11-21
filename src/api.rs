@@ -1790,7 +1790,10 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/components.css", get(ui_components_style))
         .route("/ui/panel.css", get(ui_panel_style))
         .route("/ui/app.mjs", get(ui_app))
+        .route("/ui/add-page.mjs", get(ui_add_page))
         .route("/ui/lazy-module.mjs", get(ui_lazy_module))
+        .route("/ui/pagination.mjs", get(ui_pagination))
+        .route("/ui/settings-page.mjs", get(ui_settings_page))
         .route("/ui/clock.mjs", get(ui_clock))
         .route("/ui/api-docs.mjs", get(ui_api_docs))
         .route("/ui/components.mjs", get(ui_components))
@@ -1955,10 +1958,31 @@ async fn ui_app() -> impl IntoResponse {
     )
 }
 
+async fn ui_add_page() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/add-page.mjs"),
+    )
+}
+
 async fn ui_lazy_module() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../ui/lazy-module.mjs"),
+    )
+}
+
+async fn ui_pagination() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/pagination.mjs"),
+    )
+}
+
+async fn ui_settings_page() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_str!("../ui/settings-page.mjs"),
     )
 }
 
