@@ -1,4 +1,5 @@
-import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderRoomCollection, renderRoomPicker, roomFromChoice, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderBatteryReading, renderRelativeTime, relativeTimeLabel, renderActivitySection, renderBackButton, renderSettingsPage, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderAddDeviceEmptyState, renderHomeContent, renderDisclosure, movementStatusFromPositions, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
+import { escapeHtml, renderBlindActions, renderBlindCard, renderBlindStatus, renderIcon, renderButton, renderIconButton, renderDismissButton, renderDemoBanner, renderRoomGroup, renderRoomCollection, renderRoomPicker, roomFromChoice, renderServiceSummary, renderIconLinkButton, renderDestructiveButton, renderConfirmationPanel, renderDeviceList, renderTopbarActions, DISPLAY_MODE_OPTIONS, renderHomeSupportingSections, renderBatchControls, renderPanelNotice, renderInfoGrid, renderBatteryReading, renderRelativeTime, relativeTimeLabel, renderActivitySection, renderBackButton, renderMotorSpeedControl, renderCalibrationControls, renderEmptyState, renderHomeContent, renderDisclosure, renderMobileTabs, renderSnackbar, renderSnackbarRegion, } from './components.mjs';
+import { UI_PAGE_SIZE, windowPage, renderLoadMore } from './pagination.mjs';
 import { SnackbarQueue } from './snackbar.mjs';
 import { mountClock } from './clock.mjs';
 export { escapeHtml };
@@ -96,8 +97,17 @@ export function activityMessage(activity) {
 }
 export function observationFor(managed, observations) {
     const e = managed.enrollment;
-    const matches = observations.filter(o => o.logical_id === e.logical_id && o.advertised_name === e.advertised_name && !!o.is_simulated === !!e.is_simulated);
-    return matches.length === 1 ? matches[0] ?? null : null;
+    let match = null;
+    for (const observation of observations) {
+        if (observation.logical_id !== e.logical_id
+            || observation.advertised_name !== e.advertised_name
+            || !!observation.is_simulated !== !!e.is_simulated)
+            continue;
+        if (match)
+            return null;
+        match = observation;
+    }
+    return match;
 }
 export function batteryDisplay(battery, now = Date.now()) {
     return renderBatteryReading({ battery, now });
@@ -108,6 +118,8 @@ const snackbarRoot = typeof document === 'undefined' ? null : document.querySele
 let renderSnackbars = () => { };
 const snackbarQueue = new SnackbarQueue({ onChange: items => renderSnackbars(items) });
 const state = { demoMode: false, managed: [], observations: [], diagnostics: null, activity: [], commands: {}, batch: null, serviceError: null, confirmingRemovalId: null, pendingRemovalFocusId: null, removingEnrollmentId: null, busy: new Set(), reconciliationRequired: new Set(), tokens: {}, simulators: null, notify: item => snackbarQueue.push(item), dismissNotification: key => snackbarQueue.dismissByKey(key) };
+let visibleManagedCount = UI_PAGE_SIZE;
+let visibleNearbyCount = UI_PAGE_SIZE;
 let demoSessionRecovery = null;
 let displayPreference = storedDisplayPreference();
 function storedPreference(key, fallback) {
@@ -273,8 +285,8 @@ const availabilityLabels = {
 export function availability(value) {
     return value ? availabilityLabels[value] : availabilityLabels.unavailable;
 }
-export function shouldPauseRefresh({ dragging = false, focusedTag = '', confirmationOpen = false } = {}) {
-    return dragging || confirmationOpen || ['INPUT', 'SELECT', 'TEXTAREA'].includes(focusedTag.toUpperCase());
+export function shouldPauseRefresh({ dragging = false, focusedTag = '', confirmationOpen = false, documentHidden = false } = {}) {
+    return documentHidden || dragging || confirmationOpen || ['INPUT', 'SELECT', 'TEXTAREA'].includes(focusedTag.toUpperCase());
 }
 export function validateDisplayName(value) {
     const label = value.trim();
@@ -622,21 +634,37 @@ function home() {
         batch: state.batch,
     });
     const loadingError = state.serviceError && !state.managed.length ? `<div class="panel error-state" role="alert"><span class="error-state__icon" role="img" aria-label="Connection problem">${renderIcon('warning')}</span><h3>Somaris is disconnected</h3><p>${esc(globalThis.navigator?.onLine === false ? 'You are offline. Reconnect and try again.' : 'Could not load your blinds. Check the connection and try again.')}</p>${renderIconButton({ label: 'Retry loading blinds', action: 'refresh', icon: 'refresh', variant: 'secondary' })}</div>` : '';
+    const page = windowPage(state.managed, visibleManagedCount);
+    const visibleIds = new Set(page.items.map(device => device.enrollment.id));
+    const roomMap = new Map();
+    const unassigned = [];
+    if (!panelMode) {
+        for (const device of state.managed) {
+            const room = device.enrollment.room?.trim();
+            if (!room) {
+                unassigned.push(device);
+                continue;
+            }
+            const key = room.toLowerCase();
+            let group = roomMap.get(key);
+            if (!group) {
+                group = { room, devices: [] };
+                roomMap.set(key, group);
+            }
+            group.devices.push(device);
+        }
+    }
     const roomGroups = !panelMode && state.managed.length
-        ? [...roomNamesFromDevices(state.managed).map(room => ({
-                room,
-                devices: state.managed.filter(device => device.enrollment.room?.toLowerCase() === room.toLowerCase()),
-            })), {
-                room: 'Unassigned',
-                devices: state.managed.filter(device => !device.enrollment.room),
-            }].filter(group => group.devices.length)
+        ? [...[...roomMap.values()].sort((left, right) => left.room.localeCompare(right.room, undefined, { sensitivity: 'base' })), ...(unassigned.length ? [{ room: 'Unassigned', devices: unassigned }] : [])]
         : [];
-    const roomGroupsMarkup = roomGroups.map(group => roomGroupMarkup(group.room, group.devices)).join('');
-    const roomCardsMarkup = roomGroups.flatMap(group => group.devices).map(device => card(device, true)).join('');
-    const groupsMarkup = roomGroups.length ? renderRoomCollection({ groupsMarkup: roomGroupsMarkup, cardsMarkup: roomCardsMarkup }) : '';
+    const visibleRoomGroups = roomGroups.filter(group => group.devices.some(device => visibleIds.has(device.enrollment.id)));
+    const roomGroupsMarkup = visibleRoomGroups.map(group => roomGroupMarkup(group.room, group.devices)).join('');
+    const roomCardsMarkup = visibleRoomGroups.flatMap(group => group.devices.filter(device => visibleIds.has(device.enrollment.id))).map(device => card(device, true)).join('');
+    const groupsMarkup = visibleRoomGroups.length ? renderRoomCollection({ groupsMarkup: roomGroupsMarkup, cardsMarkup: roomCardsMarkup }) : '';
     const listMarkup = renderDeviceList({
         count: state.managed.length, panelMode,
-        cardsMarkup: state.managed.map(device => card(device)).join(''), emptyMarkup: loadingError || empty, toolbarMarkup: batchControls,
+        cardsMarkup: panelMode ? page.items.map(device => card(device)).join('') : '', emptyMarkup: loadingError || empty, toolbarMarkup: batchControls,
+        paginationMarkup: renderLoadMore({ shown: page.items.length, total: page.total, action: 'more-managed', singular: 'blind', plural: 'blinds' }),
         groupsMarkup,
     });
     const serviceMarkup = renderServiceSummary(scannerSummary());
@@ -652,17 +680,6 @@ function scannerSummary() { const s = state.diagnostics?.scanner; if (state.demo
     return state.diagnostics?.simulator_ready ? 'Everything is working' : 'Simulator unavailable'; if (!s)
     return 'Service status unavailable'; return s.adapter_available ? (s.scan_active ? 'Bluetooth adapter available · scanning' : 'Bluetooth adapter available') : 'Bluetooth adapter unavailable · retrying'; }
 function back() { return renderBackButton(); }
-function addPage() {
-    const available = state.observations.filter(o => !state.managed.some(m => m.enrollment.logical_id === o.logical_id && !!m.enrollment.is_simulated === !!o.is_simulated));
-    const intro = state.demoMode ? 'This demo lists simulated blinds only; Bluetooth discovery is unavailable here.' : 'Choose a recently discovered blind to make it available for control.';
-    const nearby = available.length ? `<div class="section-heading"><h2>Nearby devices</h2><span class="count">${available.length} found</span></div><div class="stack">${available.map(o => {
-        const deviceName = o.advertised_name || o.device_name || 'Unnamed blind';
-        const fieldId = `display-name-${encodeURIComponent(o.id)}`;
-        const errorId = `${fieldId}-error`;
-        return `<form class="panel device-row" data-enroll="${esc(o.id)}" novalidate><div><h3>${esc(deviceName)}</h3><p class="subtle">${o.is_simulated ? 'Simulator · ' : ''}${esc(relative(o.last_seen_at))} · ${esc(o.freshness)}</p><label class="field" for="${esc(fieldId)}">Display name<input id="${esc(fieldId)}" name="label" maxlength="64" required value="${esc(o.advertised_name || o.device_name || 'Blind')}" aria-describedby="${esc(errorId)}" aria-invalid="false" data-display-name><span class="field-error" id="${esc(errorId)}" hidden role="alert"></span></label>${renderRoomPicker({ id: `room-choice-${encodeURIComponent(o.id)}`, rooms: roomNamesFromDevices(state.managed) })}</div>${renderButton({ label: 'Add blind', accessibleLabel: `Add ${deviceName}`, title: `Add ${deviceName}`, type: 'submit', icon: 'add', iconOnly: true, variant: 'secondary', disabled: o.freshness !== 'fresh' })}</form>`;
-    }).join('')}</div>` : state.demoMode ? renderAddDeviceEmptyState({ demoMode: true, adapterAvailable: false }) : `<div class="section-heading"><h2>Nearby devices</h2><span class="count">0 found</span></div>${renderAddDeviceEmptyState({ demoMode: false, adapterAvailable: state.diagnostics?.scanner?.adapter_available === true })}`;
-    return `${back()}<h1 class="page-title">Add a blind</h1><p class="page-intro">${intro}</p>${nearby}`;
-}
 export function deviceDetailFields(device, observation, now = Date.now()) {
     const fields = [
         { label: 'Availability', value: availability(device.availability)[0] },
@@ -738,64 +755,8 @@ function detailPage(id) {
     const enrollment = enrollmentConfirmation(id, device);
     return `${back()}<h1 class="page-title">${esc(device.enrollment.label ?? 'Blind')}</h1><p class="page-intro">The latest observations reported by your blind.</p>${roomAssignmentSection(device)}${fields}<p class="message">Position is observed telemetry and may not reflect the current physical position.</p>${advanced}${motorSettings}${calibration}<section class="panel enrollment-actions"><h2>Manage enrollment</h2><p>Remove this blind from your Somaris dashboard. If it is still nearby, it will remain discoverable and can be added again.</p>${enrollment}</section>`;
 }
-function simulatorControls() {
-    if (!state.simulators?.length)
-        return '';
-    const options = (values, current) => values.map(([value, label]) => `<option value="${value}" ${value === current ? 'selected' : ''}>${label}</option>`).join('');
-    const scenarios = [['normal', 'Normal'], ['pre_write_failure', 'Connection failure'], ['outcome_unknown', 'Unknown outcome'], ['gatt_write_error', 'Write error'], ['telemetry_paused', 'Telemetry paused']];
-    const profiles = [['standard', 'Standard'], ['hallway_observed', 'Hallway observed'], ['hallway_slow_link', 'Hallway slow link']];
-    const batteries = [['unsupported', 'Unsupported'], ['unavailable', 'Unavailable'], ['observed_sample', 'Observed sample']];
-    const instances = state.simulators.map(simulator => {
-        const movementStatus = movementStatusFromPositions(simulator.current_closed_percent, simulator.target_closed_percent);
-        const position = renderBlindStatus({ positionPercent: simulator.current_closed_percent, movementStatus, compact: true });
-        return `<div class="simulator-controls"><h3>${esc(simulator.advertised_name)}</h3><div class="simulator-position">${position}<span class="subtle">Simulator ID ${esc(simulator.id)}</span></div><form data-simulator="${esc(simulator.id)}"><label class="field">Scenario<select name="scenario">${options(scenarios, simulator.scenario ?? '')}</select></label><label class="field">Wireless profile<select name="wireless_profile">${options(profiles, simulator.wireless_profile ?? '')}</select></label><label class="field">Battery state<select name="battery_state">${options(batteries, simulator.battery_state ?? '')}</select></label><button class="button">Apply settings</button></form><button class="button secondary" style="margin-top:12px" data-action="sim-reset:${esc(simulator.id)}">Reset to closed</button></div>`;
-    }).join('');
-    return `<section class="panel" style="margin-top:28px"><p class="eyebrow">Development</p><h2>Simulator controls</h2><p class="subtle">Settings and resets apply only to the selected simulator.</p>${instances}</section>`;
-}
-function serviceStatusFields() {
-    const scanner = state.diagnostics?.scanner;
-    if (state.demoMode) {
-        return {
-            fields: [{ label: 'Simulated blinds', value: state.simulators?.length ?? state.managed.length }],
-            notUsed: [
-                { label: 'Bluetooth adapter', value: 'Not used here' },
-                { label: 'Scanner', value: 'Not used here' },
-                { label: 'Blind signals found', value: 'Not collected' },
-                { label: 'Scanner errors', value: 'Not applicable' },
-                { label: 'Telemetry history', value: state.diagnostics?.history_enabled ? 'Enabled' : 'Not used here' },
-            ],
-        };
-    }
-    return { fields: [
-            { label: 'Bluetooth adapter', value: scanner?.adapter_available ? 'Available' : 'Unavailable' },
-            { label: 'Scanner', value: scanner?.status || 'Unavailable' },
-            { label: 'Blind signals found', value: scanner?.soma_advertisements_seen ?? '—' },
-            { label: 'Last scan issue', value: scanner?.last_error_code || 'None reported' },
-            { label: 'Telemetry history', value: state.diagnostics?.history_enabled ? 'Enabled' : 'Not enabled' },
-            { label: 'Simulators', value: state.simulators?.length ?? 'Unavailable' },
-        ], notUsed: [] };
-}
-function serviceStatusSummary() {
-    if (state.serviceError)
-        return 'The service connection needs attention';
-    if (state.demoMode)
-        return state.diagnostics?.simulator_ready ? 'Everything is working' : 'The simulator is unavailable';
-    return state.diagnostics?.scanner?.adapter_available ? 'Everything is working' : 'Bluetooth scanning is unavailable';
-}
-function settingsPage() {
-    const data = serviceStatusFields();
-    const notUsedMarkup = state.demoMode ? renderInfoGrid(data.notUsed) : '';
-    return renderSettingsPage({ themePreference, serviceSummary: serviceStatusSummary(), serviceFields: data.fields, notUsedMarkup, simulatorMarkup: simulatorControlsForMode() });
-}
-function simulatorControlsForMode() {
-    return state.demoMode ? '' : simulatorControls();
-}
 function page() { return location.hash.slice(1) || 'home'; }
 function pageContent(route) {
-    if (route === 'add')
-        return addPage();
-    if (route === 'settings' || route === 'service')
-        return settingsPage();
     if (route.startsWith('details/'))
         return detailPage(decodeURIComponent(route.slice(8)));
     return home();
@@ -853,9 +814,12 @@ function restoreAppFocus(appRoot, focusedAction) {
         return;
     actionTargets.find(element => element.dataset.action === preferredAction)?.focus({ preventScroll: true });
 }
+let pageRenderRevision = 0;
 function render() {
     if (!app)
         return;
+    const route = page();
+    const revision = ++pageRenderRevision;
     const scrollY = window.scrollY;
     const activeElement = document.activeElement;
     const focusedPositionGraphic = activeElement instanceof HTMLElement ? activeElement.dataset.positionGraphic : null;
@@ -864,49 +828,88 @@ function render() {
     const focusedAction = activeElement instanceof HTMLElement && app.contains(activeElement)
         ? activeElement.dataset.action ?? null
         : null;
-    const content = pageContent(page());
     document.documentElement.dataset.theme = themePreference;
-    app.removeAttribute('aria-busy');
-    app.removeAttribute('aria-label');
-    app.innerHTML = `${state.demoMode ? renderDemoBanner() : ''}${content}${document.documentElement.dataset.displayMode === 'panel' ? '' : renderMobileTabs(page())}`;
-    for (const popover of app.querySelectorAll('[popover]'))
-        popover.addEventListener('toggle', () => {
-            const trigger = app?.querySelector(`[aria-controls="${CSS.escape(popover.id)}"]`);
-            trigger?.setAttribute('aria-expanded', String(popover.matches(':popover-open')));
-        });
-    updateTopbar();
-    restoreAppFocus(app, focusedAction);
-    if (focusedPositionGraphic)
-        app.querySelector(`[data-position-graphic="${CSS.escape(focusedPositionGraphic)}"]`)?.focus({ preventScroll: true });
-    else if (focusedPositionInput)
-        app.querySelector(`[data-position-input="${CSS.escape(focusedPositionInput)}"]`)?.focus({ preventScroll: true });
-    else if (focusedInputId)
-        document.getElementById(focusedInputId)?.focus({ preventScroll: true });
-    window.scrollTo({ top: scrollY, behavior: 'instant' });
+    const commit = (content) => {
+        if (!app || revision !== pageRenderRevision || route !== page())
+            return;
+        app.removeAttribute('aria-busy');
+        app.removeAttribute('aria-label');
+        app.innerHTML = `${state.demoMode ? renderDemoBanner() : ''}${content}${document.documentElement.dataset.displayMode === 'panel' ? '' : renderMobileTabs(route)}`;
+        for (const popover of app.querySelectorAll('[popover]'))
+            popover.addEventListener('toggle', () => {
+                const trigger = app?.querySelector(`[aria-controls="${CSS.escape(popover.id)}"]`);
+                trigger?.setAttribute('aria-expanded', String(popover.matches(':popover-open')));
+            });
+        updateTopbar();
+        restoreAppFocus(app, focusedAction);
+        if (focusedPositionGraphic)
+            app.querySelector(`[data-position-graphic="${CSS.escape(focusedPositionGraphic)}"]`)?.focus({ preventScroll: true });
+        else if (focusedPositionInput)
+            app.querySelector(`[data-position-input="${CSS.escape(focusedPositionInput)}"]`)?.focus({ preventScroll: true });
+        else if (focusedInputId)
+            document.getElementById(focusedInputId)?.focus({ preventScroll: true });
+        window.scrollTo({ top: scrollY, behavior: 'instant' });
+    };
+    if (route === 'add' || route === 'settings' || route === 'service') {
+        app.setAttribute('aria-busy', 'true');
+        app.innerHTML = '<p class="page-loading" role="status">Loading page…</p>';
+        updateTopbar();
+        const content = route === 'add'
+            ? import('./add-page.mjs').then(({ renderAddDevicePage }) => renderAddDevicePage({
+                observations: state.observations,
+                managed: state.managed,
+                rooms: roomNamesFromDevices(state.managed),
+                demoMode: state.demoMode,
+                adapterAvailable: state.diagnostics?.scanner?.adapter_available === true,
+                visibleCount: visibleNearbyCount,
+            }))
+            : import('./settings-page.mjs').then(({ renderSettingsPage }) => renderSettingsPage({
+                themePreference,
+                demoMode: state.demoMode,
+                diagnostics: state.diagnostics,
+                simulators: state.simulators,
+                managedCount: state.managed.length,
+                serviceError: state.serviceError,
+            }));
+        void content.then(commit).catch(() => commit('<div class="notice" role="alert">This page could not be loaded. Try opening it again.</div>'));
+        return;
+    }
+    commit(pageContent(route));
 }
-export async function refreshService(target, request) {
-    try {
-        const [managed, observations, diagnostics, simulators, activity] = await Promise.all([
-            request('/api/control/v1/devices'), request('/api/v1/devices'),
-            request('/api/v1/diagnostics'), request('/api/dev/simulators').catch(() => null),
-            request('/api/control/v1/audit-log'),
-        ]);
-        Object.assign(target, {
-            managed: managed,
-            observations: observations,
-            diagnostics: diagnostics,
-            demoMode: diagnostics.demo_mode === true,
-            simulators: simulators,
-            activity: activity,
-        });
-        serviceRecovered(target);
-        const released = releaseReconciledCommandLocks(target);
-        if (released)
-            notifyTarget(target, { message: 'A fresh position is available. Verify it before trying again.', tone: 'warning' });
-    }
-    catch (error) {
-        serviceFailure(target, error);
-    }
+const inFlightRefreshes = new WeakMap();
+export function refreshService(target, request) {
+    const inFlight = inFlightRefreshes.get(target);
+    if (inFlight)
+        return inFlight;
+    const refreshPromise = (async () => {
+        try {
+            const [managed, observations, diagnostics, simulators, activity] = await Promise.all([
+                request('/api/control/v1/devices'), request('/api/v1/devices'),
+                request('/api/v1/diagnostics'), request('/api/dev/simulators').catch(() => null),
+                request('/api/control/v1/audit-log'),
+            ]);
+            Object.assign(target, {
+                managed: managed,
+                observations: observations,
+                diagnostics: diagnostics,
+                demoMode: diagnostics.demo_mode === true,
+                simulators: simulators,
+                activity: activity,
+            });
+            serviceRecovered(target);
+            const released = releaseReconciledCommandLocks(target);
+            if (released)
+                notifyTarget(target, { message: 'A fresh position is available. Verify it before trying again.', tone: 'warning' });
+        }
+        catch (error) {
+            serviceFailure(target, error);
+        }
+    })();
+    inFlightRefreshes.set(target, refreshPromise);
+    void refreshPromise.then(() => { if (inFlightRefreshes.get(target) === refreshPromise)
+        inFlightRefreshes.delete(target); }, () => { if (inFlightRefreshes.get(target) === refreshPromise)
+        inFlightRefreshes.delete(target); });
+    return refreshPromise;
 }
 export async function resetDemo(target, request, refreshData, confirmReset = () => true) {
     if (!confirmReset())
@@ -1120,9 +1123,11 @@ export async function removeEnrolledBlind(target, request, refreshData, managedD
 }
 async function refresh(quiet = false) {
     const active = document.activeElement;
-    if (quiet && (shouldPauseRefresh({ dragging: positionInteraction, focusedTag: active?.tagName || '', confirmationOpen: !!state.confirmingRemovalId }) || active instanceof HTMLElement && active.matches('button,a,summary,[role="slider"]')))
+    if (quiet && (shouldPauseRefresh({ dragging: positionInteraction, focusedTag: active?.tagName || '', confirmationOpen: !!state.confirmingRemovalId, documentHidden: document.hidden }) || active instanceof HTMLElement && active.matches('button,a,summary,[role="slider"]')))
         return;
     await refreshService(state, api);
+    if (quiet && document.hidden)
+        return;
     updatePositionFeedback();
     if (quiet)
         patchCards();
@@ -1274,8 +1279,10 @@ function patchCards() {
     }
     const panelMode = document.documentElement.dataset.displayMode === 'panel';
     const oldCards = [...app.querySelectorAll('[data-device-card]')];
-    const expectedIds = state.managed.map(device => device.enrollment.id);
-    if (oldCards.map(card => card.dataset.deviceCard).join('|') !== expectedIds.join('|')) {
+    const visibleDevices = windowPage(state.managed, visibleManagedCount).items;
+    const expectedIds = visibleDevices.map(device => device.enrollment.id);
+    const oldIds = new Set(oldCards.map(card => card.dataset.deviceCard));
+    if (oldCards.length !== expectedIds.length || expectedIds.some(id => !oldIds.has(id))) {
         render();
         return;
     }
@@ -1287,7 +1294,7 @@ function patchCards() {
         render();
         return;
     }
-    for (const device of state.managed) {
+    for (const device of visibleDevices) {
         const id = device.enrollment.id;
         const current = app.querySelector(`[data-device-card="${CSS.escape(id)}"]`);
         if (!current)
@@ -1656,6 +1663,8 @@ const clickActionHandlers = {
     batch: argument => handleBatchClick(argument),
     position: (_argument, id, deviceId) => handlePositionClick(deviceId, id),
     'activity-toggle': () => { const expanded = activityCollapsedByUser ?? document.documentElement.dataset.displayMode !== 'mobile'; activityCollapsedByUser = !expanded; render(); return true; },
+    'more-managed': () => { visibleManagedCount += UI_PAGE_SIZE; render(); return true; },
+    'more-nearby': () => { visibleNearbyCount += UI_PAGE_SIZE; render(); return true; },
     'demo-hint-dismiss': () => { hintDismissed = true; try {
         globalThis.localStorage?.setItem('somaris-demo-hint-dismissed', 'true');
     }
@@ -1873,6 +1882,20 @@ if (app) {
         applyDisplayMode();
         void registerServiceWorker();
         let initialized = false;
+        let refreshTimer = null;
+        const stopPeriodicRefresh = () => {
+            if (refreshTimer !== null)
+                clearTimeout(refreshTimer);
+            refreshTimer = null;
+        };
+        const schedulePeriodicRefresh = () => {
+            if (!initialized || document.hidden || refreshTimer !== null)
+                return;
+            refreshTimer = setTimeout(() => {
+                refreshTimer = null;
+                void refresh(true).finally(schedulePeriodicRefresh);
+            }, 5000);
+        };
         window.addEventListener('resize', () => { if (applyDisplayMode() && initialized)
             render(); });
         window.addEventListener('hashchange', () => {
@@ -1886,6 +1909,16 @@ if (app) {
         });
         window.addEventListener('offline', () => { serviceFailure(state, new Error('Network unavailable')); render(); });
         window.addEventListener('online', () => { void refresh(); });
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                stopPeriodicRefresh();
+                return;
+            }
+            if (initialized) {
+                stopPeriodicRefresh();
+                void refresh(true).finally(schedulePeriodicRefresh);
+            }
+        });
         document.addEventListener('keydown', (event) => {
             const graphic = closestHtmlElement(event.target, '[data-position-graphic]');
             const range = closestHtmlElement(event.target, '[data-position-input]');
@@ -2096,10 +2129,9 @@ if (app) {
             }
             finally {
                 initialized = true;
+                schedulePeriodicRefresh();
             }
         };
         void initializeDashboard();
-        setInterval(() => { if (initialized)
-            void refresh(true); }, 5000);
     }
 }

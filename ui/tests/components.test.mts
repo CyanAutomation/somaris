@@ -23,7 +23,6 @@ import {
   renderRoomGroup,
   renderRoomCollection,
   renderThemePreferenceControl,
-  renderSettingsPage,
   renderDemoBanner,
   renderPositionPreset,
   renderServiceSummary,
@@ -632,9 +631,10 @@ test('theme preferences remain available as a native settings control',()=>{
   ['auto','dark','light','high-contrast']);
 });
 
-test('settings page reuses the icon-only back control and retains service diagnostics',()=>{
+test('settings page reuses the icon-only back control and retains service diagnostics',async()=>{
+ const {renderSettingsPage}=await import('../settings-page.mjs');
  const page=parseMarkup(renderSettingsPage({
-  themePreference:'dark',serviceSummary:'Everything is working',serviceFields:[{label:'Simulated blinds',value:4}],
+  themePreference:'dark',demoMode:true,diagnostics:{demo_mode:true,simulator_ready:true},simulators:[{id:'simulator-1',advertised_name:'Demo blind'}],managedCount:1,serviceError:null,
  }));
  assert.equal(page.querySelector('h1')?.textContent,'Settings');
  const back=page.querySelector('[data-action="home"]');
@@ -643,7 +643,7 @@ test('settings page reuses the icon-only back control and retains service diagno
  assert.equal(back?.querySelector('svg')?.getAttribute('data-icon'),'back');
  assert.equal(page.querySelector('.settings-service>h2')?.textContent,'Service status');
  assert.equal(page.querySelector('.service-health__summary')?.textContent,'Everything is working');
- assert.equal(page.querySelector('.service-health .info-item strong')?.textContent,'4');
+ assert.equal(page.querySelector('.service-health .info-item strong')?.textContent,'1');
 });
 
 test('battery and relative-time primitives show the last reading without cached jargon or duplicate info controls',()=>{

@@ -6,6 +6,7 @@ interface DeviceListOptions {
   cardsMarkup?: string;
   emptyMarkup?: string;
   toolbarMarkup?: string;
+  paginationMarkup?: string;
   groupsMarkup?: string;
   title?: string;
 }
@@ -16,12 +17,12 @@ interface InfoItemOptions {
   contentMarkup?: string;
 }
 
-export function renderDeviceList({count, panelMode = false, cardsMarkup = '', emptyMarkup = '', toolbarMarkup = '', groupsMarkup = '', title = 'Your blinds'}: DeviceListOptions): string {
+export function renderDeviceList({count, panelMode = false, cardsMarkup = '', emptyMarkup = '', toolbarMarkup = '', paginationMarkup = '', groupsMarkup = '', title = 'Your blinds'}: DeviceListOptions): string {
   const titleContent = panelMode ? '' : `<h2>${escapeHtml(title)}</h2>`;
   const countLabel = panelMode ? '' : `<span class="count">${count} ${count === 1 ? 'blind' : 'blinds'}</span>`;
   const content = groupsMarkup || (cardsMarkup ? `<div class="grid">${cardsMarkup}</div>` : emptyMarkup);
   const heading = panelMode ? '' : `<div class="section-heading device-list-heading">${titleContent}${countLabel}</div>`;
-  return `<section class="device-list${panelMode ? ' device-list--panel' : ''}" aria-label="${escapeHtml(title)}">${heading}${toolbarMarkup}${content}</section>`;
+  return `<section class="device-list${panelMode ? ' device-list--panel' : ''}" aria-label="${escapeHtml(title)}">${heading}${toolbarMarkup}${content}${paginationMarkup}</section>`;
 }
 
 export function renderHomeSupportingSections({panelMode = false, activityMarkup = '', serviceMarkup = ''}: {panelMode?: boolean; activityMarkup?: string; serviceMarkup?: string}): string {

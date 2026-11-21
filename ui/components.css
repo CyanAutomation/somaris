@@ -45,6 +45,9 @@
 .blind-state--compact .blind-state__label{font-size:20px}
 .blind-state--compact .blind-state__percent{font-size:13px}
 .device-list-heading .count{margin-left:auto}
+.list-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:16px 0}
+.list-pagination .subtle{font-size:13px}
+.page-loading{padding:18px 0;color:var(--color-muted)}
 .simulator-position{display:flex;align-items:baseline;gap:16px;margin:10px 0 16px;flex-wrap:wrap}
 .simulator-position .blind-state--compact{margin:0}
 .button.danger{background:var(--token-danger-button);color:var(--token-white)}
