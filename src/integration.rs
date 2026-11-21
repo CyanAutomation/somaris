@@ -160,7 +160,7 @@ const SHELLY_COVER_DRIVER_ID: &str = "shelly_cover";
 #[derive(Clone)]
 pub struct ShellyCoverDriver {
     client: Client,
-    allowed_origins: Vec<String>,
+    allowed_origins: HashMap<String, Url>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,7 +178,7 @@ impl ShellyCoverDriver {
             Ok(origins) => origins,
             Err(error) => {
                 tracing::warn!(%error, "Invalid LAN driver allowlist; Shelly enrollment is disabled");
-                Vec::new()
+                HashMap::new()
             }
         };
         Self::with_canonical_allowed_origins(allowed_origins)
@@ -200,7 +200,7 @@ impl ShellyCoverDriver {
         Ok(Self::with_canonical_allowed_origins(allowed_origins))
     }
 
-    fn with_canonical_allowed_origins(allowed_origins: Vec<String>) -> Self {
+    fn with_canonical_allowed_origins(allowed_origins: HashMap<String, Url>) -> Self {
         // Reqwest's default HTTPS certificate validation remains enabled.
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
@@ -223,13 +223,16 @@ impl ShellyCoverDriver {
         let origin = canonical_shelly_origin(&url).map_err(|_| {
             DriverFailure::new(DriverFailureKind::InvalidResponse, "invalid_driver_config")
         })?;
-        if !self.allowed_origins.contains(&origin) {
+        let Some(allowed_origin) = self.allowed_origins.get(&origin) else {
             return Err(DriverFailure::new(
                 DriverFailureKind::InvalidResponse,
                 "destination_not_allowed",
             ));
-        }
-        Ok((config, url))
+        };
+        // Use the trusted URL parsed from service configuration for the request.
+        // The caller's URL only selects an allowlisted origin and never reaches
+        // the HTTP client.
+        Ok((config, allowed_origin.clone()))
     }
 
     async fn rpc(
@@ -404,20 +407,20 @@ impl BlindDriver for ShellyCoverDriver {
     }
 }
 
-fn parse_shelly_allowed_origins(value: &str) -> Result<Vec<String>, String> {
+fn parse_shelly_allowed_origins(value: &str) -> Result<HashMap<String, Url>, String> {
     if value.trim().is_empty() {
-        return Ok(Vec::new());
+        return Ok(HashMap::new());
     }
     value
         .split(',')
         .map(str::trim)
-        .map(|origin| {
-            canonical_shelly_origin(
-                &Url::parse(origin)
-                    .map_err(|_| format!("Invalid LAN driver allowed origin: {origin}"))?,
-            )
+        .try_fold(HashMap::new(), |mut allowed, origin| {
+            let url = Url::parse(origin)
+                .map_err(|_| format!("Invalid LAN driver allowed origin: {origin}"))?;
+            let canonical = canonical_shelly_origin(&url)?;
+            allowed.insert(canonical, url);
+            Ok(allowed)
         })
-        .collect()
 }
 
 fn canonical_shelly_origin(url: &Url) -> Result<String, String> {
