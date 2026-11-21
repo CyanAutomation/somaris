@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn built_in_defaults_have_default_source() {
         let settings = resolve(&SettingsDocument::default(), &HashMap::new()).unwrap();
-        assert_eq!(settings.values.simulator_enabled.value, true);
+        assert!(settings.values.simulator_enabled.value);
         assert_eq!(
             settings.values.simulator_enabled.source,
             SettingSource::Default
