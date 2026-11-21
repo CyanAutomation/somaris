@@ -20,7 +20,10 @@ use crate::{
         SOMA_MANUFACTURER_ID, decode_ba71_voltage, parse_soma_payload,
     },
     controller::ServiceAction,
-    integration::{DeviceCapabilities, StateChange, StateChangePublisher},
+    integration::{
+        BlindCommand, BlindDriver, BlindMotion, BlindObservation, DeviceCapabilities,
+        DriverFailure, DriverFailureKind, DriverRegistry, StateChange, StateChangePublisher,
+    },
 };
 use axum::{
     Json, Router,
@@ -35,6 +38,7 @@ use axum::{
     routing::{get, patch, post, put},
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -100,6 +104,8 @@ const MAX_DEMO_COMMANDS: usize = 128;
 const MAX_DEMO_BATCHES: usize = 64;
 const MAX_DEMO_HISTORY: usize = 5_000;
 const MAX_SIMULATOR_ENROLLMENTS: usize = 2;
+const MAX_LAN_INTEGRATION_ENROLLMENTS: usize = 32;
+const MAX_CONCURRENT_LAN_ENROLLMENT_PROBES: usize = 4;
 const MAX_COMMANDS: usize = 1000;
 const MAX_BATCH_TARGETS: usize = MAX_COMMANDS;
 const MAX_BATCHES: usize = 1000;
@@ -245,6 +251,9 @@ pub struct AppState {
     pending_adapter_commands: watch::Sender<usize>,
     scan_window_generation: watch::Sender<u64>,
     ble_adapter: Arc<RwLock<Option<Arc<dyn BleAdapter>>>>,
+    blind_drivers: Arc<DriverRegistry>,
+    integration_poll_attempts: Arc<Mutex<HashMap<String, Instant>>>,
+    integration_enrollment_probes: Arc<Semaphore>,
     ble_enabled: bool,
     queue_config: QueueConfig,
     allowed_origins: Vec<HeaderValue>,
@@ -369,6 +378,15 @@ struct Inner {
     scanner: ScannerCounters,
     #[serde(skip)]
     devices: HashMap<String, Device>,
+    #[serde(skip)]
+    integration_observations: HashMap<String, IntegrationObservation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntegrationObservation {
+    state: BlindObservation,
+    observed_at: DateTime<Utc>,
+    poll_failed: bool,
 }
 
 #[derive(Serialize)]
@@ -507,6 +525,104 @@ impl AppState {
         devices
     }
 
+    async fn refresh_integration_observations(&self, only_device_id: Option<&str>, force: bool) {
+        let now = Utc::now();
+        let targets = {
+            let inner = self.inner.lock().await;
+            inner
+                .enrollments
+                .values()
+                .filter(|enrollment| {
+                    only_device_id.is_none_or(|id| id == enrollment.id)
+                        && enrollment.driver_id.is_some()
+                        && enrollment.driver_config.is_some()
+                        && (force
+                            || inner
+                                .integration_observations
+                                .get(&enrollment.id)
+                                .is_none_or(|observation| {
+                                    now.signed_duration_since(observation.observed_at)
+                                        >= ChronoDuration::seconds(5)
+                                }))
+                })
+                .filter_map(|enrollment| {
+                    Some((
+                        enrollment.id.clone(),
+                        enrollment.driver_id.clone()?,
+                        enrollment.driver_config.clone()?,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let results = futures_util::stream::iter(targets)
+            .map(|(device_id, driver_id, config)| async move {
+                let should_attempt = {
+                    let mut attempts = self.integration_poll_attempts.lock().await;
+                    let should_attempt = force
+                        || attempts
+                            .get(&device_id)
+                            .is_none_or(|attempt| attempt.elapsed() >= StdDuration::from_secs(5));
+                    if should_attempt {
+                        attempts.insert(device_id.clone(), Instant::now());
+                    }
+                    should_attempt
+                };
+                if !should_attempt {
+                    return None;
+                }
+                let driver = self.blind_drivers.get(&driver_id)?;
+                let result =
+                    tokio::time::timeout(StdDuration::from_secs(5), driver.observe(&config)).await;
+                Some((device_id, driver_id, config, result))
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (device_id, driver_id, config, result) in results.into_iter().flatten() {
+            let mut inner = self.inner.lock().await;
+            let still_same_device = inner.enrollments.get(&device_id).is_some_and(|enrollment| {
+                enrollment.driver_id.as_deref() == Some(driver_id.as_str())
+                    && enrollment.driver_config.as_ref() == Some(&config)
+            });
+            if !still_same_device {
+                continue;
+            }
+            let changed = match result {
+                Ok(Ok(observation)) => {
+                    let changed =
+                        inner
+                            .integration_observations
+                            .get(&device_id)
+                            .is_none_or(|previous| {
+                                previous.state != observation || previous.poll_failed
+                            });
+                    inner.integration_observations.insert(
+                        device_id,
+                        IntegrationObservation {
+                            state: observation,
+                            observed_at: Utc::now(),
+                            poll_failed: false,
+                        },
+                    );
+                    changed
+                }
+                Ok(Err(_)) | Err(_) => inner
+                    .integration_observations
+                    .get_mut(&device_id)
+                    .is_some_and(|previous| {
+                        let changed = !previous.poll_failed;
+                        previous.poll_failed = true;
+                        changed
+                    }),
+            };
+            if changed {
+                self.state_changes.publish();
+            }
+        }
+    }
+
     fn pending_history(&self, history: &VecDeque<HistoryObservation>) -> Vec<HistoryObservation> {
         let cursor = self.history_persisted_cursor.load(Ordering::Acquire);
         let first = history.partition_point(|record| record.cursor <= cursor);
@@ -560,6 +676,14 @@ impl AppState {
     pub fn with_ble_adapter(mut self, adapter: Arc<dyn BleAdapter>) -> Self {
         self.ble_adapter = Arc::new(RwLock::new(Some(adapter)));
         self.ble_enabled = true;
+        self
+    }
+
+    /// Register an additional in-process provider without changing the command
+    /// API or queue. A provider with the same ID replaces the built-in one,
+    /// which also makes deterministic test doubles possible.
+    pub fn with_blind_driver(mut self, driver: Arc<dyn BlindDriver>) -> Self {
+        Arc::make_mut(&mut self.blind_drivers).register(driver);
         self
     }
 
@@ -657,6 +781,7 @@ impl AppState {
             next_cursor: 1,
             scanner: ScannerCounters::unavailable(),
             devices: HashMap::new(),
+            integration_observations: HashMap::new(),
         };
         if let Some(path) = &history_storage_path {
             inner.history = read_history(path).unwrap_or_default().into();
@@ -686,6 +811,11 @@ impl AppState {
             pending_adapter_commands,
             scan_window_generation,
             ble_adapter: Arc::new(RwLock::new(None)),
+            blind_drivers: Arc::new(DriverRegistry::with_builtins()),
+            integration_poll_attempts: Arc::new(Mutex::new(HashMap::new())),
+            integration_enrollment_probes: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_LAN_ENROLLMENT_PROBES,
+            )),
             ble_enabled: false,
             queue_config,
             allowed_origins: Vec::new(),
@@ -1843,6 +1973,10 @@ pub fn router(state: AppState) -> Router {
                 .options(preflight),
         )
         .route(
+            "/api/control/v1/drivers",
+            get(list_blind_drivers).options(preflight),
+        )
+        .route(
             "/api/control/v1/devices/{id}",
             patch(update_device_room)
                 .delete(remove_enrollment)
@@ -2851,6 +2985,7 @@ pub enum Freshness {
 pub enum Source {
     BleAdvertisement,
     Simulator,
+    LanIntegration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2867,6 +3002,7 @@ pub enum PositionStatus {
 pub enum MovementStatus {
     Closing,
     Opening,
+    Stopped,
     AtTarget,
     Unavailable,
 }
@@ -2876,6 +3012,7 @@ pub enum MovementStatus {
 pub enum PositionConfidence {
     ProjectConfirmed,
     Simulated,
+    IntegrationReported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3216,6 +3353,13 @@ pub struct Enrollment {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room: Option<String>,
+    /// Registered provider ID for a LAN or other integrated blind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_id: Option<String>,
+    /// Provider-owned, non-secret endpoint configuration. Credentials are not
+    /// accepted in or persisted with enrollment configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_config: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3317,10 +3461,15 @@ pub struct ControlPosition {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnrollmentRequest {
+    #[serde(default)]
     observed_device_id: String,
     label: String,
     #[serde(default)]
     room: Option<String>,
+    #[serde(default)]
+    driver_id: Option<String>,
+    #[serde(default)]
+    driver_config: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3874,6 +4023,8 @@ fn seed_demo_household(inner: &mut Inner, now: DateTime<Utc>) {
             is_simulated: true,
             created_at: now,
             room: Some(room.to_owned()),
+            driver_id: None,
+            driver_config: None,
         };
         inner.enrollments.insert(enrollment.id.clone(), enrollment);
     }
@@ -4506,11 +4657,21 @@ fn device_snapshot(simulator: &Device) -> Device {
 }
 
 async fn list_managed_devices(RequestState(state): RequestState, headers: HeaderMap) -> Response {
+    state.refresh_integration_observations(None, false).await;
     let devices = state.managed_devices_snapshot().await;
     conditional_json(
         &headers,
         devices.clone(),
         envelope(devices.clone(), Some(devices.len() as u64)),
+    )
+}
+
+async fn list_blind_drivers(RequestState(state): RequestState, headers: HeaderMap) -> Response {
+    let drivers = state.blind_drivers.driver_ids();
+    conditional_json(
+        &headers,
+        drivers.clone(),
+        envelope(drivers.clone(), Some(drivers.len() as u64)),
     )
 }
 
@@ -4873,7 +5034,7 @@ async fn get_motor_settings(
                 "Managed device was not found.",
             );
         };
-        if enrollment.is_simulated {
+        if enrollment.is_simulated || enrollment.driver_id.is_some() {
             return error_response(
                 StatusCode::CONFLICT,
                 "physical_device_required",
@@ -5021,7 +5182,7 @@ async fn enroll_device(
         Ok(value) => value,
         Err(response) => return *response,
     };
-    let label = request.label.trim();
+    let label = request.label.trim().to_owned();
     if label.is_empty() || label.chars().count() > 64 {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -5042,6 +5203,9 @@ async fn enroll_device(
         },
         None => None,
     };
+    if request.driver_id.is_some() || request.driver_config.is_some() {
+        return enroll_integrated_device(state, request, label.clone(), requested_room).await;
+    }
     let mut inner = state.inner.lock().await;
     prune_registry(&mut inner, Utc::now());
     let observed = if inner.simulator_enabled {
@@ -5142,8 +5306,8 @@ async fn enroll_device(
         .map(|room| canonical_room_name(&inner.enrollments, room));
     let label = room
         .as_deref()
-        .map(|room| strip_room_prefix(label, room))
-        .unwrap_or_else(|| label.to_owned());
+        .map(|room| strip_room_prefix(&label, room))
+        .unwrap_or(label);
     let enrollment = Enrollment {
         id: Uuid::new_v4().to_string(),
         label,
@@ -5152,6 +5316,8 @@ async fn enroll_device(
         is_simulated: observed.is_simulated,
         created_at: Utc::now(),
         room,
+        driver_id: None,
+        driver_config: None,
     };
     inner
         .enrollments
@@ -5173,6 +5339,199 @@ async fn enroll_device(
         );
     }
     (StatusCode::CREATED, Json(envelope(enrollment, None))).into_response()
+}
+
+async fn enroll_integrated_device(
+    state: AppState,
+    request: EnrollmentRequest,
+    requested_label: String,
+    requested_room: Option<String>,
+) -> Response {
+    let (Some(driver_id), Some(driver_config)) = (request.driver_id, request.driver_config) else {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_driver_config",
+            "driver_id and driver_config must be supplied together.",
+        );
+    };
+    if !request.observed_device_id.is_empty() {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ambiguous_enrollment_request",
+            "Use either observed_device_id or driver_id with driver_config.",
+        );
+    }
+    if state.demo_mode {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "physical_control_disabled",
+            "LAN devices cannot be enrolled in demo mode.",
+        );
+    }
+    if config_contains_secret_material(&driver_config) {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credentials_not_allowed",
+            "Store credentials outside enrollment configuration and pass a credential reference instead.",
+        );
+    }
+    let Some(driver) = state.blind_drivers.get(&driver_id) else {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown_driver",
+            "The requested blind driver is not registered.",
+        );
+    };
+    if driver.validate_config(&driver_config).is_err() {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_driver_config",
+            "The driver configuration is invalid.",
+        );
+    }
+    let config_bytes = serde_json::to_vec(&driver_config).unwrap_or_default();
+    let logical_id = format!("{driver_id}:{}", hex::encode(Sha256::digest(config_bytes)));
+    {
+        let inner = state.inner.lock().await;
+        if let Some(response) = integration_enrollment_guard(&inner, &driver_id, &logical_id) {
+            return response;
+        }
+    }
+    let probe_permit = match state
+        .integration_enrollment_probes
+        .clone()
+        .try_acquire_owned()
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "integration_probe_busy",
+                "Too many LAN device enrollments are being checked. Retry shortly.",
+            );
+        }
+    };
+    let observation =
+        match tokio::time::timeout(StdDuration::from_secs(5), driver.observe(&driver_config)).await
+        {
+            Ok(Ok(observation)) => observation,
+            Ok(Err(_)) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "integration_unavailable",
+                    "The device did not return a valid status response.",
+                );
+            }
+            Err(_) => {
+                return error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "integration_timeout",
+                    "The device did not respond before the enrollment timeout.",
+                );
+            }
+        };
+    drop(probe_permit);
+    let mut inner = state.inner.lock().await;
+    if let Some(response) = integration_enrollment_guard(&inner, &driver_id, &logical_id) {
+        return response;
+    }
+    let room = requested_room
+        .as_deref()
+        .map(|room| canonical_room_name(&inner.enrollments, room));
+    let label = room
+        .as_deref()
+        .map(|room| strip_room_prefix(&requested_label, room))
+        .unwrap_or(requested_label);
+    let enrollment = Enrollment {
+        id: Uuid::new_v4().to_string(),
+        label: label.clone(),
+        advertised_name: label.clone(),
+        logical_id,
+        is_simulated: false,
+        created_at: Utc::now(),
+        room,
+        driver_id: Some(driver_id),
+        driver_config: Some(driver_config),
+    };
+    inner.integration_observations.insert(
+        enrollment.id.clone(),
+        IntegrationObservation {
+            state: observation,
+            observed_at: Utc::now(),
+            poll_failed: false,
+        },
+    );
+    inner
+        .enrollments
+        .insert(enrollment.id.clone(), enrollment.clone());
+    record_activity(
+        &mut inner,
+        None,
+        ActivityKind::EnrollmentAdded,
+        Some(label),
+        None,
+        None,
+        None,
+    );
+    state.state_changes.publish();
+    if state.persist(&inner).await.is_err() {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistence_outcome_unknown",
+            "Enrollment may have been saved; refresh the managed-device list.",
+        );
+    }
+    (StatusCode::CREATED, Json(envelope(enrollment, None))).into_response()
+}
+
+fn integration_enrollment_guard(
+    inner: &Inner,
+    driver_id: &str,
+    logical_id: &str,
+) -> Option<Response> {
+    if inner.enrollments.values().any(|entry| {
+        entry.driver_id.as_deref() == Some(driver_id) && entry.logical_id == logical_id
+    }) {
+        return Some(error_response(
+            StatusCode::CONFLICT,
+            "duplicate_device",
+            "This integrated device is already enrolled.",
+        ));
+    }
+    let count = inner
+        .enrollments
+        .values()
+        .filter(|entry| entry.driver_id.is_some())
+        .count();
+    (count >= MAX_LAN_INTEGRATION_ENROLLMENTS).then(|| {
+        error_response(
+            StatusCode::CONFLICT,
+            "integration_limit_reached",
+            "The LAN integration enrollment limit has been reached.",
+        )
+    })
+}
+
+fn config_contains_secret_material(config: &Value) -> bool {
+    match config {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
+            let secret_key = [
+                "password",
+                "passphrase",
+                "secret",
+                "apikey",
+                "authorization",
+                "credential",
+            ]
+            .iter()
+            .any(|needle| normalized.contains(needle))
+                || (normalized.contains("token") && !normalized.ends_with("id"));
+            (secret_key && !normalized.ends_with("ref")) || config_contains_secret_material(value)
+        }),
+        Value::Array(values) => values.iter().any(config_contains_secret_material),
+        _ => false,
+    }
 }
 
 async fn remove_enrollment(
@@ -5211,6 +5570,7 @@ async fn remove_enrollment(
         .enrollments
         .remove(&id)
         .expect("the enrollment was checked above");
+    inner.integration_observations.remove(&id);
     record_activity(
         &mut inner,
         None,
@@ -5220,6 +5580,7 @@ async fn remove_enrollment(
         None,
         None,
     );
+    state.integration_poll_attempts.lock().await.remove(&id);
     if state.persist(&inner).await.is_err() {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5240,6 +5601,9 @@ async fn queue_command(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    state
+        .refresh_integration_observations(Some(&id), false)
+        .await;
     if request
         .expected_label
         .as_deref()
@@ -5367,6 +5731,9 @@ async fn toggle_device(
             .unwrap_or(command);
         return (StatusCode::ACCEPTED, Json(envelope(command, None))).into_response();
     }
+    state
+        .refresh_integration_observations(Some(&id), false)
+        .await;
     if expected_label
         .as_deref()
         .is_some_and(|label| !valid_expected_label(label))
@@ -5444,6 +5811,7 @@ async fn queue_batch(
         Ok(value) => value,
         Err(response) => return *response,
     };
+    state.refresh_integration_observations(None, false).await;
     if !matches!(request.action, Action::Open | Action::Close | Action::Stop) {
         return error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -6003,6 +6371,26 @@ async fn submit_command(
         };
         return Err(ApiFailure::new(StatusCode::CONFLICT, code, message));
     }
+    let supported = match action {
+        Action::Open => managed.capabilities.open,
+        Action::Close => managed.capabilities.close,
+        Action::Stop => managed.capabilities.stop,
+        Action::SetPosition => managed.capabilities.set_position,
+        Action::SetMotorSpeed => managed.capabilities.set_motor_speed,
+        Action::CalibrationStart
+        | Action::CalibrationStop
+        | Action::CalibrationNudgeOpen
+        | Action::CalibrationNudgeClosed
+        | Action::CalibrationSetOpenLimit
+        | Action::CalibrationSetClosedLimit => managed.capabilities.calibrate_endpoints,
+    };
+    if !supported {
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            "unsupported_action",
+            "This blind does not support the requested action.",
+        ));
+    }
     let calibration_session = inner.calibration_sessions.get(managed_device_id).copied();
     if action == Action::CalibrationStop && calibration_session.is_none() {
         return Err(ApiFailure::new(
@@ -6376,6 +6764,18 @@ async fn process_command_with_retry_budget(
         state.command_controls.lock().await.remove(&command_id);
         return;
     };
+    let driver_target = {
+        let inner = state.inner.lock().await;
+        inner
+            .enrollments
+            .get(&managed_device_id)
+            .and_then(|enrollment| {
+                Some((
+                    enrollment.driver_id.clone()?,
+                    enrollment.driver_config.clone()?,
+                ))
+            })
+    };
     let lock = {
         let mut locks = state.device_locks.lock().await;
         locks
@@ -6387,9 +6787,9 @@ async fn process_command_with_retry_budget(
         state.command_controls.lock().await.remove(&command_id);
         return;
     };
-    let adapter_waiter = (!adapter_slot_reserved)
+    let adapter_waiter = (!adapter_slot_reserved && driver_target.is_none())
         .then(|| AdapterCommandWaiter::new(state.pending_adapter_commands.clone()));
-    let adapter_permit = if adapter_slot_reserved {
+    let adapter_permit = if adapter_slot_reserved || driver_target.is_some() {
         None
     } else {
         let Ok(permit) = state.adapter_slots.clone().acquire_owned().await else {
@@ -6539,6 +6939,23 @@ async fn process_command_with_retry_budget(
             failure_streak,
         )
     };
+    if let Some((driver_id, driver_config)) = driver_target {
+        drop(adapter_permit);
+        process_integrated_command(
+            &state,
+            IntegratedCommandExecution {
+                command_id: &command_id,
+                driver_id: &driver_id,
+                driver_config: &driver_config,
+                action,
+                target_closed_percent: command_target_closed_percent,
+                deadline: execution_deadline,
+                control,
+            },
+        )
+        .await;
+        return;
+    }
     let Some(simulator_id) = simulator_id else {
         process_physical_command(
             &state,
@@ -6784,6 +7201,184 @@ async fn process_command_with_retry_budget(
     state.command_controls.lock().await.remove(&command_id);
 }
 
+struct IntegratedCommandExecution<'a> {
+    command_id: &'a str,
+    driver_id: &'a str,
+    driver_config: &'a Value,
+    action: Action,
+    target_closed_percent: Option<u8>,
+    deadline: tokio::time::Instant,
+    control: BleCommandControl,
+}
+
+async fn process_integrated_command(state: &AppState, execution: IntegratedCommandExecution<'_>) {
+    let IntegratedCommandExecution {
+        command_id,
+        driver_id,
+        driver_config,
+        action,
+        target_closed_percent,
+        deadline,
+        control,
+    } = execution;
+    let driver_command = match action {
+        Action::Open => Some(BlindCommand::Open),
+        Action::Close => Some(BlindCommand::Close),
+        Action::Stop => Some(BlindCommand::Stop),
+        Action::SetPosition => {
+            target_closed_percent.map(|closed_percent| BlindCommand::SetPosition { closed_percent })
+        }
+        Action::SetMotorSpeed
+        | Action::CalibrationStart
+        | Action::CalibrationStop
+        | Action::CalibrationNudgeOpen
+        | Action::CalibrationNudgeClosed
+        | Action::CalibrationSetOpenLimit
+        | Action::CalibrationSetClosedLimit => None,
+    };
+    let result = if let Some(driver_command) = driver_command {
+        if !control.begin_write() {
+            Err(DriverFailure::new(
+                DriverFailureKind::NotSent,
+                "preempted_by_stop",
+            ))
+        } else if let Some(driver) = state.blind_drivers.get(driver_id) {
+            match tokio::time::timeout_at(deadline, driver.execute(driver_config, driver_command))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(DriverFailure::new(
+                    DriverFailureKind::OutcomeUnknown,
+                    "integration_timeout",
+                )),
+            }
+        } else {
+            Err(DriverFailure::new(
+                DriverFailureKind::NotSent,
+                "driver_unavailable",
+            ))
+        }
+    } else {
+        Err(DriverFailure::new(
+            DriverFailureKind::NotSent,
+            "unsupported_action",
+        ))
+    };
+    let completed_at = Utc::now();
+    let mut inner = state.inner.lock().await;
+    if !inner
+        .commands
+        .get(command_id)
+        .is_some_and(|command| command.status == CommandStatus::Connecting)
+    {
+        return;
+    }
+    let managed_device_id = inner
+        .commands
+        .get(command_id)
+        .map(|command| command.managed_device_id.clone())
+        .unwrap_or_default();
+    let Some(command) = inner.commands.get_mut(command_id) else {
+        return;
+    };
+    command.completed_at = Some(completed_at);
+    command.duration_ms = Some(
+        completed_at
+            .signed_duration_since(command.started_at.unwrap_or(command.accepted_at))
+            .num_milliseconds()
+            .max(0) as u64,
+    );
+    if let Some(attempt) = command.attempts.last_mut() {
+        attempt.completed_at = Some(completed_at);
+        attempt.duration_ms = Some(
+            completed_at
+                .signed_duration_since(attempt.started_at)
+                .num_milliseconds()
+                .max(0) as u64,
+        );
+    }
+    match result {
+        Ok(()) => {
+            command.status = CommandStatus::WriteAcknowledged;
+            command.write_state = WriteState::Acknowledged;
+            command.retryable = false;
+            if let Some(attempt) = command.attempts.last_mut() {
+                attempt.phase = "rpc_acknowledged".into();
+                attempt.write_state = WriteState::Acknowledged;
+            }
+        }
+        Err(failure) => {
+            let (status, phase, write_state, retryable, stage) = match failure.kind {
+                DriverFailureKind::NotSent => (
+                    if failure.code == "preempted_by_stop" {
+                        CommandStatus::Cancelled
+                    } else {
+                        CommandStatus::ConnectionFailed
+                    },
+                    "rpc_not_sent",
+                    WriteState::NotSent,
+                    failure.code != "preempted_by_stop",
+                    "rpc_transport",
+                ),
+                DriverFailureKind::Rejected => (
+                    CommandStatus::WriteFailed,
+                    "rpc_rejected",
+                    WriteState::PossiblySent,
+                    false,
+                    "rpc_rejected",
+                ),
+                DriverFailureKind::OutcomeUnknown => (
+                    CommandStatus::OutcomeUnknown,
+                    "rpc_outcome_unknown",
+                    WriteState::PossiblySent,
+                    false,
+                    "rpc_outcome_unknown",
+                ),
+                DriverFailureKind::InvalidResponse => (
+                    CommandStatus::WriteFailed,
+                    "rpc_invalid_response",
+                    WriteState::NotSent,
+                    false,
+                    "driver_config",
+                ),
+            };
+            command.status = status;
+            command.error_code = Some(failure.code.clone());
+            command.failure_stage = Some(stage.into());
+            command.write_state = write_state;
+            command.retryable = retryable;
+            if let Some(attempt) = command.attempts.last_mut() {
+                attempt.phase = phase.into();
+                attempt.failure_stage = Some(stage.into());
+                attempt.error_code = Some(failure.code);
+                attempt.write_state = write_state;
+            }
+        }
+    }
+    let completed_status = command.status;
+    update_activity_status(
+        &mut inner,
+        command_id,
+        command_status_text(completed_status),
+        completed_at,
+    );
+    if state
+        .persist_with_operation(&inner, "integrated_command_completion")
+        .await
+        .is_err()
+    {
+        tracing::warn!(%command_id, "Integrated command result could not be persisted.");
+    }
+    drop(inner);
+    if completed_status == CommandStatus::WriteAcknowledged {
+        state
+            .refresh_integration_observations(Some(&managed_device_id), true)
+            .await;
+    }
+    state.state_changes.publish();
+    state.command_controls.lock().await.remove(command_id);
+}
+
 struct PhysicalTarget {
     peripheral_id: String,
     expected_name: String,
@@ -6828,7 +7423,7 @@ fn physical_target(inner: &Inner, managed_device_id: &str) -> Result<PhysicalTar
     let Some(enrollment) = inner.enrollments.get(managed_device_id) else {
         return Err("enrollment_not_found");
     };
-    if enrollment.is_simulated {
+    if enrollment.is_simulated || enrollment.driver_id.is_some() {
         return Err("device_not_ready");
     }
     let now = Utc::now();
@@ -7675,6 +8270,9 @@ async fn finish_batch(state: &AppState, batch_id: &str) {
 }
 
 fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
+    if enrollment.driver_id.is_some() {
+        return integrated_managed_device(inner, enrollment);
+    }
     let gatt_readiness = (!enrollment.is_simulated).then(|| gatt_readiness(inner, &enrollment.id));
     let calibration_mode_active = inner.calibration_sessions.contains_key(&enrollment.id);
     let capabilities = if enrollment.is_simulated {
@@ -7779,6 +8377,93 @@ fn managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
             requested_position_closed_percent,
             requested_command_status,
         },
+    }
+}
+
+fn integrated_managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDevice {
+    let latest = inner.integration_observations.get(&enrollment.id).copied();
+    let now = Utc::now();
+    let (availability, observed_at, observation) = match latest {
+        Some(latest) => {
+            let age = now.signed_duration_since(latest.observed_at);
+            (
+                if !latest.poll_failed && age <= ChronoDuration::seconds(60) {
+                    "ready"
+                } else {
+                    "stale"
+                },
+                Some(latest.observed_at),
+                Some(latest.state),
+            )
+        }
+        None => ("not_seen", None, None),
+    };
+    let capabilities = DeviceCapabilities {
+        open: true,
+        close: true,
+        stop: true,
+        set_position: observation.is_some_and(|state| state.position_control),
+        set_motor_speed: false,
+        calibrate_endpoints: false,
+        position_feedback: observation.is_some_and(|state| state.current_closed_percent.is_some()),
+    };
+    let position = observation.and_then(|state| {
+        state
+            .current_closed_percent
+            .map(|current_closed_percent| ControlPosition {
+                current_closed_percent,
+                target_closed_percent: state
+                    .target_closed_percent
+                    .unwrap_or(current_closed_percent),
+            })
+    });
+    let has_position = position.is_some();
+    let movement_status = observation.map(|state| match state.motion {
+        BlindMotion::Opening => MovementStatus::Opening,
+        BlindMotion::Closing => MovementStatus::Closing,
+        BlindMotion::AtTarget => MovementStatus::AtTarget,
+        BlindMotion::Stopped => MovementStatus::Stopped,
+        BlindMotion::Unknown => MovementStatus::Unavailable,
+    });
+    let position_status = Some(if position.is_some() {
+        PositionStatus::Observed
+    } else {
+        PositionStatus::NotObserved
+    });
+    let position_freshness = latest.map(|latest| {
+        if !latest.poll_failed
+            && now.signed_duration_since(latest.observed_at) <= ChronoDuration::seconds(60)
+        {
+            Freshness::Fresh
+        } else {
+            Freshness::Stale
+        }
+    });
+    let age_ms = observed_at.map(|observed_at| {
+        now.signed_duration_since(observed_at)
+            .num_milliseconds()
+            .max(0) as u64
+    });
+    let (requested_position_closed_percent, requested_command_status) =
+        requested_target(inner, &enrollment.id);
+    ManagedDevice {
+        enrollment,
+        availability: availability.into(),
+        capabilities,
+        calibration_mode_active: false,
+        gatt_readiness: None,
+        last_seen_at: observed_at,
+        advertisement_age_ms: age_ms,
+        position,
+        movement_status,
+        motion_feedback: None,
+        position_status,
+        position_freshness,
+        position_source: has_position.then_some(Source::LanIntegration),
+        position_confidence: has_position.then_some(PositionConfidence::IntegrationReported),
+        position_observed_at: observed_at.filter(|_| has_position),
+        requested_position_closed_percent,
+        requested_command_status,
     }
 }
 
@@ -8101,6 +8786,235 @@ fn command_status_text(status: CommandStatus) -> &'static str {
 mod security_hardening_tests {
     use super::*;
 
+    struct UnavailableDriver;
+
+    #[async_trait::async_trait]
+    impl BlindDriver for UnavailableDriver {
+        fn id(&self) -> &'static str {
+            "unavailable_test"
+        }
+
+        fn validate_config(&self, _config: &Value) -> Result<(), DriverFailure> {
+            Ok(())
+        }
+
+        async fn observe(&self, _config: &Value) -> Result<BlindObservation, DriverFailure> {
+            Err(DriverFailure::new(
+                DriverFailureKind::NotSent,
+                "test_device_unavailable",
+            ))
+        }
+
+        async fn execute(
+            &self,
+            _config: &Value,
+            _command: BlindCommand,
+        ) -> Result<(), DriverFailure> {
+            Ok(())
+        }
+    }
+
+    struct CountingDriver(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl BlindDriver for CountingDriver {
+        fn id(&self) -> &'static str {
+            "counting_test"
+        }
+
+        fn validate_config(&self, _config: &Value) -> Result<(), DriverFailure> {
+            Ok(())
+        }
+
+        async fn observe(&self, _config: &Value) -> Result<BlindObservation, DriverFailure> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(BlindObservation {
+                current_closed_percent: Some(50),
+                target_closed_percent: Some(50),
+                motion: BlindMotion::AtTarget,
+                position_control: true,
+            })
+        }
+
+        async fn execute(
+            &self,
+            _config: &Value,
+            _command: BlindCommand,
+        ) -> Result<(), DriverFailure> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn config_secret_guard_allows_identifiers_and_rejects_secret_values() {
+        assert!(!config_contains_secret_material(&serde_json::json!({
+            "component_id": 0,
+            "token_id": "shelly-token-id",
+            "api_key_ref": "vault://shelly/api-key"
+        })));
+        assert!(config_contains_secret_material(&serde_json::json!({
+            "access_token": "actual-secret"
+        })));
+    }
+
+    #[tokio::test]
+    async fn failed_integration_poll_marks_the_last_observation_stale() {
+        let state = AppState::new().with_blind_driver(Arc::new(UnavailableDriver));
+        let id = "integration-failure-test";
+        let enrollment = Enrollment {
+            id: id.into(),
+            label: "Test blind".into(),
+            advertised_name: "Test blind".into(),
+            logical_id: "unavailable_test:device".into(),
+            is_simulated: false,
+            created_at: Utc::now(),
+            room: None,
+            driver_id: Some("unavailable_test".into()),
+            driver_config: Some(serde_json::json!({})),
+        };
+        {
+            let mut inner = state.inner.lock().await;
+            inner.enrollments.insert(id.into(), enrollment.clone());
+            inner.integration_observations.insert(
+                id.into(),
+                IntegrationObservation {
+                    state: BlindObservation {
+                        current_closed_percent: Some(50),
+                        target_closed_percent: Some(50),
+                        motion: BlindMotion::AtTarget,
+                        position_control: true,
+                    },
+                    observed_at: Utc::now(),
+                    poll_failed: false,
+                },
+            );
+        }
+
+        state.refresh_integration_observations(Some(id), true).await;
+
+        let inner = state.inner.lock().await;
+        assert_eq!(managed_device(&inner, enrollment).availability, "stale");
+    }
+
+    #[tokio::test]
+    async fn lan_enrollment_limit_is_checked_before_the_network_probe() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let state = AppState::new().with_blind_driver(Arc::new(CountingDriver(probes.clone())));
+        {
+            let mut inner = state.inner.lock().await;
+            for index in 0..MAX_LAN_INTEGRATION_ENROLLMENTS {
+                let id = format!("integration-limit-{index}");
+                inner.enrollments.insert(
+                    id.clone(),
+                    Enrollment {
+                        id,
+                        label: "Existing blind".into(),
+                        advertised_name: "Existing blind".into(),
+                        logical_id: format!("counting_test:{index}"),
+                        is_simulated: false,
+                        created_at: Utc::now(),
+                        room: None,
+                        driver_id: Some("counting_test".into()),
+                        driver_config: Some(serde_json::json!({"device": index})),
+                    },
+                );
+            }
+        }
+
+        let response = enroll_integrated_device(
+            state,
+            EnrollmentRequest {
+                observed_device_id: String::new(),
+                label: "New blind".into(),
+                room: None,
+                driver_id: Some("counting_test".into()),
+                driver_config: Some(serde_json::json!({"device": "new"})),
+            },
+            "New blind".into(),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn lan_enrollment_probes_are_bounded_and_do_not_queue() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let state = AppState::new().with_blind_driver(Arc::new(CountingDriver(probes.clone())));
+        let permits = (0..MAX_CONCURRENT_LAN_ENROLLMENT_PROBES)
+            .map(|_| {
+                state
+                    .integration_enrollment_probes
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let response = enroll_integrated_device(
+            state,
+            EnrollmentRequest {
+                observed_device_id: String::new(),
+                label: "New blind".into(),
+                room: None,
+                driver_id: Some("counting_test".into()),
+                driver_config: Some(serde_json::json!({"device": "new"})),
+            },
+            "New blind".into(),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+        drop(permits);
+    }
+
+    #[tokio::test]
+    async fn removal_clears_poll_cache_when_state_persistence_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked_parent = directory.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, "block").unwrap();
+        let data_path = blocked_parent.join("state.json");
+        let state = AppState::configured(true, None, Some(data_path));
+        let id = "integration-removal-test";
+        {
+            let mut inner = state.inner.lock().await;
+            inner.enrollments.insert(
+                id.into(),
+                Enrollment {
+                    id: id.into(),
+                    label: "Test blind".into(),
+                    advertised_name: "Test blind".into(),
+                    logical_id: "shelly_cover:test".into(),
+                    is_simulated: false,
+                    created_at: Utc::now(),
+                    room: None,
+                    driver_id: Some("shelly_cover".into()),
+                    driver_config: Some(serde_json::json!({})),
+                },
+            );
+        }
+        state
+            .integration_poll_attempts
+            .lock()
+            .await
+            .insert(id.into(), Instant::now());
+
+        let response = remove_enrollment(RequestState(state.clone()), RoutePath(id.into())).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            !state
+                .integration_poll_attempts
+                .lock()
+                .await
+                .contains_key(id)
+        );
+    }
+
     #[test]
     fn secure_cookie_flag_uses_forwarded_transport_not_origin_scheme() {
         let mut headers = HeaderMap::new();
@@ -8385,6 +9299,8 @@ mod security_hardening_tests {
                     observed_device_id: id.into(),
                     label: label.into(),
                     room: None,
+                    driver_id: None,
+                    driver_config: None,
                 })),
             )
             .await;
@@ -8397,6 +9313,8 @@ mod security_hardening_tests {
                 observed_device_id: "simulator-3".into(),
                 label: third_name.into(),
                 room: None,
+                driver_id: None,
+                driver_config: None,
             })),
         )
         .await;
@@ -8413,6 +9331,8 @@ mod security_hardening_tests {
                 observed_device_id: "physical-1".into(),
                 label: "Physical Blind".into(),
                 room: None,
+                driver_id: None,
+                driver_config: None,
             })),
         )
         .await;
@@ -8453,6 +9373,8 @@ mod security_hardening_tests {
                 observed_device_id: "simulator-3".into(),
                 label: third_name.into(),
                 room: None,
+                driver_id: None,
+                driver_config: None,
             })),
         )
         .await;
@@ -8549,6 +9471,8 @@ mod security_hardening_tests {
                     is_simulated: true,
                     created_at: Utc::now(),
                     room: None,
+                    driver_id: None,
+                    driver_config: None,
                 },
             );
             let mut persisted = serde_json::to_value(&*inner).unwrap();
@@ -8801,6 +9725,8 @@ mod security_hardening_tests {
                     is_simulated: false,
                     created_at: Utc::now(),
                     room: None,
+                    driver_id: None,
+                    driver_config: None,
                 },
             );
         }
@@ -8835,6 +9761,8 @@ mod security_hardening_tests {
                     is_simulated: false,
                     created_at: Utc::now(),
                     room: None,
+                    driver_id: None,
+                    driver_config: None,
                 },
             );
         }
@@ -8873,6 +9801,8 @@ mod security_hardening_tests {
                     is_simulated: false,
                     created_at: Utc::now(),
                     room: None,
+                    driver_id: None,
+                    driver_config: None,
                 },
             );
         }
@@ -8915,6 +9845,8 @@ mod security_hardening_tests {
                     is_simulated: false,
                     created_at: Utc::now(),
                     room: None,
+                    driver_id: None,
+                    driver_config: None,
                 };
                 inner.enrollments.insert(enrollment.id.clone(), enrollment);
             }
@@ -9040,6 +9972,8 @@ mod security_hardening_tests {
                     is_simulated: false,
                     created_at: Utc::now(),
                     room: None,
+                    driver_id: None,
+                    driver_config: None,
                 },
             );
         }

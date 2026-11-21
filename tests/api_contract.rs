@@ -1537,6 +1537,7 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         ("/api/dev/simulators/{id}/scenario", &["put", "options"]),
         ("/api/dev/simulators/{id}/reset", &["post", "options"]),
         ("/api/control/v1/devices", &["get", "post", "options"]),
+        ("/api/control/v1/drivers", &["get", "options"]),
         (
             "/api/control/v1/devices/{id}",
             &["patch", "delete", "options"],
@@ -1604,6 +1605,28 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
     assert_eq!(
         contract["components"]["schemas"]["EnrollmentRequest"]["properties"]["room"]["type"][1],
         "null"
+    );
+    assert_eq!(
+        contract["components"]["schemas"]["EnrollmentRequest"]["required"],
+        json!(["label"])
+    );
+    assert!(
+        contract["components"]["schemas"]["EnrollmentRequest"]["properties"]
+            .get("driver_id")
+            .is_some()
+    );
+    assert!(
+        contract["components"]["schemas"]["EnrollmentRequest"]["properties"]
+            .get("driver_config")
+            .is_some()
+    );
+    assert!(contract["paths"]["/api/control/v1/devices"]["post"]["responses"]["429"].is_object());
+    assert!(contract["components"]["schemas"]["DriverListEnvelope"].is_object());
+    assert!(
+        contract["components"]["schemas"]["MovementStatus"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("stopped"))
     );
     assert_eq!(
         contract["components"]["schemas"]["RoomAssignmentRequest"]["required"][0],

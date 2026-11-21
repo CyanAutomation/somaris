@@ -154,6 +154,16 @@ impl RemoteApiClient {
         .await
     }
 
+    pub async fn get_blind_drivers(&self) -> Result<Value, String> {
+        self.send_json(
+            Method::GET,
+            self.endpoint_url(&["api", "control", "v1", "drivers"])?,
+            None,
+            "Failed to get blind drivers",
+        )
+        .await
+    }
+
     pub async fn get_rooms(&self) -> Result<Value, String> {
         self.send_json(
             Method::GET,
@@ -198,6 +208,30 @@ impl RemoteApiClient {
                 "room": room,
             })),
             "Failed to enroll device",
+        )
+        .await
+    }
+
+    pub async fn enroll_integration_device(
+        &self,
+        driver_id: &str,
+        driver_config: &Value,
+        label: &str,
+        room: Option<&str>,
+    ) -> Result<Value, String> {
+        if driver_id.trim().is_empty() || label.trim().is_empty() {
+            return Err("Driver ID and label must not be empty.".into());
+        }
+        self.send_json(
+            Method::POST,
+            self.endpoint_url(&["api", "control", "v1", "devices"])?,
+            Some(json!({
+                "driver_id": driver_id,
+                "driver_config": driver_config,
+                "label": label,
+                "room": room,
+            })),
+            "Failed to enroll integrated blind",
         )
         .await
     }
