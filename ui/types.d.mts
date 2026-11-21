@@ -64,7 +64,7 @@ export interface Observation {
   freshness?: string;
   last_seen_at?: string | null;
   advertisement_age_ms?: number | null;
-  movement_status?: 'opening' | 'closing' | 'at_target' | 'unavailable';
+  movement_status?: 'opening' | 'closing' | 'stopped' | 'at_target' | 'unavailable';
   rssi_dbm?: number | null;
   battery?: BatteryReading | null;
 }
