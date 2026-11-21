@@ -146,6 +146,43 @@ async fn control_client_posts_only_fixed_actions_with_idempotency_key() {
 }
 
 #[tokio::test]
+async fn client_lists_registered_drivers_and_enrolls_an_integration_device() {
+    let requests: Requests = Arc::default();
+    let client = test_client(requests.clone()).await;
+    client.get_blind_drivers().await.unwrap();
+    client
+        .enroll_integration_device(
+            "shelly_cover",
+            &json!({
+                "base_url": "http://192.168.1.20",
+                "component_id": 0
+            }),
+            "Office Shade",
+            Some("Office"),
+        )
+        .await
+        .unwrap();
+
+    let requests = requests.lock().await;
+    assert_eq!(requests[0].0, "GET");
+    assert_eq!(requests[0].1, "/api/control/v1/drivers");
+    assert_eq!(requests[1].0, "POST");
+    assert_eq!(requests[1].1, "/api/control/v1/devices");
+    assert_eq!(
+        requests[1].3,
+        json!({
+            "driver_id": "shelly_cover",
+            "driver_config": {
+                "base_url": "http://192.168.1.20",
+                "component_id": 0
+            },
+            "label": "Office Shade",
+            "room": "Office"
+        })
+    );
+}
+
+#[tokio::test]
 async fn control_client_sets_validated_closed_percent_targets() {
     let requests: Requests = Arc::default();
     let client = test_client(requests.clone()).await;

@@ -79,7 +79,7 @@ interface PanelNoticeOptions {
   tone?: VisualTone;
 }
 
-type MovementStatus = 'opening' | 'closing' | 'at_target' | 'unavailable' | 'stop_queued' | 'stopping';
+type MovementStatus = 'opening' | 'closing' | 'stopped' | 'at_target' | 'unavailable' | 'stop_queued' | 'stopping';
 
 interface BadgeOptions {
   label: string;
