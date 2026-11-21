@@ -521,11 +521,7 @@ impl AppState {
         devices
     }
 
-    async fn refresh_integration_observations(
-        &self,
-        only_device_id: Option<&str>,
-        force: bool,
-    ) {
+    async fn refresh_integration_observations(&self, only_device_id: Option<&str>, force: bool) {
         let now = Utc::now();
         let targets = {
             let inner = self.inner.lock().await;
@@ -560,9 +556,9 @@ impl AppState {
                 let should_attempt = {
                     let mut attempts = self.integration_poll_attempts.lock().await;
                     let should_attempt = force
-                        || attempts.get(&device_id).is_none_or(|attempt| {
-                            attempt.elapsed() >= StdDuration::from_secs(5)
-                        });
+                        || attempts
+                            .get(&device_id)
+                            .is_none_or(|attempt| attempt.elapsed() >= StdDuration::from_secs(5));
                     if should_attempt {
                         attempts.insert(device_id.clone(), Instant::now());
                     }
@@ -572,11 +568,8 @@ impl AppState {
                     return None;
                 }
                 let driver = self.blind_drivers.get(&driver_id)?;
-                let result = tokio::time::timeout(
-                    StdDuration::from_secs(5),
-                    driver.observe(&config),
-                )
-                .await;
+                let result =
+                    tokio::time::timeout(StdDuration::from_secs(5), driver.observe(&config)).await;
                 Some((device_id, driver_id, config, result))
             })
             .buffer_unordered(8)
@@ -5190,13 +5183,7 @@ async fn enroll_device(
         None => None,
     };
     if request.driver_id.is_some() || request.driver_config.is_some() {
-        return enroll_integrated_device(
-            state,
-            request,
-            label.clone(),
-            requested_room,
-        )
-        .await;
+        return enroll_integrated_device(state, request, label.clone(), requested_room).await;
     }
     let mut inner = state.inner.lock().await;
     prune_registry(&mut inner, Utc::now());
@@ -5381,37 +5368,30 @@ async fn enroll_integrated_device(
             "The driver configuration is invalid.",
         );
     }
-    let observation = match tokio::time::timeout(
-        StdDuration::from_secs(5),
-        driver.observe(&driver_config),
-    )
-    .await
-    {
-        Ok(Ok(observation)) => observation,
-        Ok(Err(_)) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "integration_unavailable",
-                "The device did not return a valid status response.",
-            );
-        }
-        Err(_) => {
-            return error_response(
-                StatusCode::GATEWAY_TIMEOUT,
-                "integration_timeout",
-                "The device did not respond before the enrollment timeout.",
-            );
-        }
-    };
+    let observation =
+        match tokio::time::timeout(StdDuration::from_secs(5), driver.observe(&driver_config)).await
+        {
+            Ok(Ok(observation)) => observation,
+            Ok(Err(_)) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "integration_unavailable",
+                    "The device did not return a valid status response.",
+                );
+            }
+            Err(_) => {
+                return error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "integration_timeout",
+                    "The device did not respond before the enrollment timeout.",
+                );
+            }
+        };
     let config_bytes = serde_json::to_vec(&driver_config).unwrap_or_default();
-    let logical_id = format!(
-        "{driver_id}:{}",
-        hex::encode(Sha256::digest(config_bytes))
-    );
+    let logical_id = format!("{driver_id}:{}", hex::encode(Sha256::digest(config_bytes)));
     let mut inner = state.inner.lock().await;
     if inner.enrollments.values().any(|entry| {
-        entry.driver_id.as_deref() == Some(driver_id.as_str())
-            && entry.logical_id == logical_id
+        entry.driver_id.as_deref() == Some(driver_id.as_str()) && entry.logical_id == logical_id
     }) {
         return error_response(
             StatusCode::CONFLICT,
@@ -5471,9 +5451,17 @@ fn config_contains_secret_material(config: &Value) -> bool {
     match config {
         Value::Object(object) => object.iter().any(|(key, value)| {
             let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
-            let secret_key = ["password", "passphrase", "token", "secret", "apikey", "authorization", "credential"]
-                .iter()
-                .any(|needle| normalized.contains(needle));
+            let secret_key = [
+                "password",
+                "passphrase",
+                "token",
+                "secret",
+                "apikey",
+                "authorization",
+                "credential",
+            ]
+            .iter()
+            .any(|needle| normalized.contains(needle));
             (secret_key && !normalized.ends_with("ref")) || config_contains_secret_material(value)
         }),
         Value::Array(values) => values.iter().any(config_contains_secret_material),
@@ -5548,7 +5536,9 @@ async fn queue_command(
         Ok(value) => value,
         Err(response) => return *response,
     };
-    state.refresh_integration_observations(Some(&id), false).await;
+    state
+        .refresh_integration_observations(Some(&id), false)
+        .await;
     if request
         .expected_label
         .as_deref()
@@ -5676,7 +5666,9 @@ async fn toggle_device(
             .unwrap_or(command);
         return (StatusCode::ACCEPTED, Json(envelope(command, None))).into_response();
     }
-    state.refresh_integration_observations(Some(&id), false).await;
+    state
+        .refresh_integration_observations(Some(&id), false)
+        .await;
     if expected_label
         .as_deref()
         .is_some_and(|label| !valid_expected_label(label))
@@ -6886,13 +6878,15 @@ async fn process_command_with_retry_budget(
         drop(adapter_permit);
         process_integrated_command(
             &state,
-            &command_id,
-            &driver_id,
-            &driver_config,
-            action,
-            command_target_closed_percent,
-            execution_deadline,
-            control,
+            IntegratedCommandExecution {
+                command_id: &command_id,
+                driver_id: &driver_id,
+                driver_config: &driver_config,
+                action,
+                target_closed_percent: command_target_closed_percent,
+                deadline: execution_deadline,
+                control,
+            },
         )
         .await;
         return;
@@ -7142,22 +7136,33 @@ async fn process_command_with_retry_budget(
     state.command_controls.lock().await.remove(&command_id);
 }
 
-async fn process_integrated_command(
-    state: &AppState,
-    command_id: &str,
-    driver_id: &str,
-    driver_config: &Value,
+struct IntegratedCommandExecution<'a> {
+    command_id: &'a str,
+    driver_id: &'a str,
+    driver_config: &'a Value,
     action: Action,
     target_closed_percent: Option<u8>,
     deadline: tokio::time::Instant,
     control: BleCommandControl,
-) {
+}
+
+async fn process_integrated_command(state: &AppState, execution: IntegratedCommandExecution<'_>) {
+    let IntegratedCommandExecution {
+        command_id,
+        driver_id,
+        driver_config,
+        action,
+        target_closed_percent,
+        deadline,
+        control,
+    } = execution;
     let driver_command = match action {
         Action::Open => Some(BlindCommand::Open),
         Action::Close => Some(BlindCommand::Close),
         Action::Stop => Some(BlindCommand::Stop),
-        Action::SetPosition => target_closed_percent
-            .map(|closed_percent| BlindCommand::SetPosition { closed_percent }),
+        Action::SetPosition => {
+            target_closed_percent.map(|closed_percent| BlindCommand::SetPosition { closed_percent })
+        }
         Action::SetMotorSpeed
         | Action::CalibrationStart
         | Action::CalibrationStop
@@ -7302,10 +7307,7 @@ async fn process_integrated_command(
     drop(inner);
     if completed_status == CommandStatus::WriteAcknowledged {
         state
-            .refresh_integration_observations(
-                Some(&managed_device_id),
-                true,
-            )
+            .refresh_integration_observations(Some(&managed_device_id), true)
             .await;
     }
     state.state_changes.publish();
@@ -8338,18 +8340,17 @@ fn integrated_managed_device(inner: &Inner, enrollment: Enrollment) -> ManagedDe
         set_position: observation.is_some_and(|state| state.position_control),
         set_motor_speed: false,
         calibrate_endpoints: false,
-        position_feedback: observation
-            .is_some_and(|state| state.current_closed_percent.is_some()),
+        position_feedback: observation.is_some_and(|state| state.current_closed_percent.is_some()),
     };
     let position = observation.and_then(|state| {
-        state.current_closed_percent.map(|current_closed_percent| {
-            ControlPosition {
+        state
+            .current_closed_percent
+            .map(|current_closed_percent| ControlPosition {
                 current_closed_percent,
                 target_closed_percent: state
                     .target_closed_percent
                     .unwrap_or(current_closed_percent),
-            }
-        })
+            })
     });
     let has_position = position.is_some();
     let movement_status = observation.map(|state| match state.motion {

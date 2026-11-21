@@ -139,14 +139,7 @@ async fn uncalibrated_shelly_covers_reject_position_commands_by_capability() {
     let (base_url, requests, server) = mock_shelly().await;
     let app = router(AppState::new());
     let enrollment_id = enroll_shelly_component(&app, &base_url, 2).await;
-    let (status, body) = request(
-        &app,
-        Method::GET,
-        "/api/control/v1/devices",
-        &[],
-        None,
-    )
-    .await;
+    let (status, body) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     let device = body.unwrap()["data"][0].clone();
     assert_eq!(device["enrollment"]["id"], enrollment_id);
@@ -193,14 +186,7 @@ async fn shelly_cover_can_be_enrolled_and_its_position_is_normalized() {
     );
     let enrollment_id = enroll_shelly(&app, &base_url).await;
 
-    let (status, body) = request(
-        &app,
-        Method::GET,
-        "/api/control/v1/devices",
-        &[],
-        None,
-    )
-    .await;
+    let (status, body) = request(&app, Method::GET, "/api/control/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     let device = body.unwrap()["data"]
         .as_array()
@@ -215,9 +201,11 @@ async fn shelly_cover_can_be_enrolled_and_its_position_is_normalized() {
     assert_eq!(device["position"]["target_closed_percent"], 40);
     assert_eq!(device["movement_status"], "closing");
     assert_eq!(device["position_source"], "lan_integration");
-    assert!(requests.lock().unwrap().iter().any(|request| {
-        request["method"] == "Cover.GetStatus" && request["params"]["id"] == 1
-    }));
+    assert!(
+        requests.lock().unwrap().iter().any(|request| {
+            request["method"] == "Cover.GetStatus" && request["params"]["id"] == 1
+        })
+    );
     server.abort();
 }
 
@@ -242,10 +230,7 @@ async fn set_position_dispatches_through_shelly_rpc_with_inverted_position() {
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{accepted:?}");
-    let command_id = accepted.unwrap()["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let command_id = accepted.unwrap()["data"]["id"].as_str().unwrap().to_owned();
 
     let command_path = format!("/api/control/v1/commands/{command_id}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -256,7 +241,10 @@ async fn set_position_dispatches_through_shelly_rpc_with_inverted_position() {
         if command["status"] != "queued" && command["status"] != "connecting" {
             break command;
         }
-        assert!(tokio::time::Instant::now() < deadline, "command did not finish");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "command did not finish"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     };
     assert_eq!(command["status"], "write_acknowledged");
@@ -294,7 +282,10 @@ async fn unsupported_driver_and_unsafe_urls_are_rejected_before_rpc() {
         Method::POST,
         "/api/control/v1/devices",
         &[(header::CONTENT_TYPE.as_str(), "application/json")],
-        Some(payload("shelly_cover", "http://user:password@127.0.0.1:8123")),
+        Some(payload(
+            "shelly_cover",
+            "http://user:password@127.0.0.1:8123",
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -312,22 +303,13 @@ async fn driver_configuration_persists_and_reconnects_after_restart() {
     drop(app);
 
     let restored = router(AppState::from_data_path(&state_path).await.unwrap());
-    let (status, body) = request(
-        &restored,
-        Method::GET,
-        "/api/control/v1/devices",
-        &[],
-        None,
-    )
-    .await;
+    let (status, body) =
+        request(&restored, Method::GET, "/api/control/v1/devices", &[], None).await;
     assert_eq!(status, StatusCode::OK);
     let device = body.unwrap()["data"][0].clone();
     assert_eq!(device["enrollment"]["id"], enrollment_id);
     assert_eq!(device["enrollment"]["driver_id"], "shelly_cover");
-    assert_eq!(
-        device["enrollment"]["driver_config"]["component_id"],
-        1
-    );
+    assert_eq!(device["enrollment"]["driver_config"]["component_id"], 1);
     assert_eq!(device["availability"], "ready");
     server.abort();
 }
