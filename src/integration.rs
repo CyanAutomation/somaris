@@ -3,11 +3,14 @@
 //! Events are bounded notifications that state changed. They are not a durable
 //! log; consumers must refresh authoritative state after subscribing or lagging.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
 use std::{collections::HashMap, time::Duration};
+use std::{
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode, redirect::Policy};
@@ -157,6 +160,7 @@ const SHELLY_COVER_DRIVER_ID: &str = "shelly_cover";
 #[derive(Clone)]
 pub struct ShellyCoverDriver {
     client: Client,
+    allowed_origins: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,32 +172,61 @@ struct ShellyCoverConfig {
 
 impl ShellyCoverDriver {
     pub fn new() -> Self {
+        let configured_origins =
+            std::env::var("SOMARIS_LAN_DRIVER_ALLOWED_ORIGINS").unwrap_or_default();
+        let allowed_origins = match parse_shelly_allowed_origins(&configured_origins) {
+            Ok(origins) => origins,
+            Err(error) => {
+                tracing::warn!(%error, "Invalid LAN driver allowlist; Shelly enrollment is disabled");
+                Vec::new()
+            }
+        };
+        Self::with_canonical_allowed_origins(allowed_origins)
+    }
+
+    /// Build a Shelly provider restricted to the explicitly configured HTTP
+    /// origins. Each origin must use an IP literal and contain no path or auth.
+    pub fn with_allowed_origins<I, S>(origins: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let configured = origins
+            .into_iter()
+            .map(|origin| origin.as_ref().to_owned())
+            .collect::<Vec<_>>()
+            .join(",");
+        let allowed_origins = parse_shelly_allowed_origins(&configured)?;
+        Ok(Self::with_canonical_allowed_origins(allowed_origins))
+    }
+
+    fn with_canonical_allowed_origins(allowed_origins: Vec<String>) -> Self {
+        // Reqwest's default HTTPS certificate validation remains enabled.
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
             .redirect(Policy::none())
             .build()
             .expect("static Shelly HTTP client configuration should be valid");
-        Self { client }
+        Self {
+            client,
+            allowed_origins,
+        }
     }
 
-    fn parse_config(config: &Value) -> Result<(ShellyCoverConfig, Url), DriverFailure> {
+    fn parse_config(&self, config: &Value) -> Result<(ShellyCoverConfig, Url), DriverFailure> {
         let config: ShellyCoverConfig = serde_json::from_value(config.clone()).map_err(|_| {
             DriverFailure::new(DriverFailureKind::InvalidResponse, "invalid_driver_config")
         })?;
         let url = Url::parse(&config.base_url).map_err(|_| {
             DriverFailure::new(DriverFailureKind::InvalidResponse, "invalid_driver_config")
         })?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || !matches!(url.path(), "" | "/")
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
+        let origin = canonical_shelly_origin(&url).map_err(|_| {
+            DriverFailure::new(DriverFailureKind::InvalidResponse, "invalid_driver_config")
+        })?;
+        if !self.allowed_origins.contains(&origin) {
             return Err(DriverFailure::new(
                 DriverFailureKind::InvalidResponse,
-                "invalid_driver_config",
+                "destination_not_allowed",
             ));
         }
         Ok((config, url))
@@ -330,11 +363,11 @@ impl BlindDriver for ShellyCoverDriver {
     }
 
     fn validate_config(&self, config: &Value) -> Result<(), DriverFailure> {
-        Self::parse_config(config).map(|_| ())
+        self.parse_config(config).map(|_| ())
     }
 
     async fn observe(&self, config: &Value) -> Result<BlindObservation, DriverFailure> {
-        let (config, base_url) = Self::parse_config(config)?;
+        let (config, base_url) = self.parse_config(config)?;
         let status = self
             .rpc(
                 base_url,
@@ -347,7 +380,7 @@ impl BlindDriver for ShellyCoverDriver {
     }
 
     async fn execute(&self, config: &Value, command: BlindCommand) -> Result<(), DriverFailure> {
-        let (config, base_url) = Self::parse_config(config)?;
+        let (config, base_url) = self.parse_config(config)?;
         let (method, params) = match command {
             BlindCommand::Open => ("Cover.Open", Self::component_params(&config)),
             BlindCommand::Close => ("Cover.Close", Self::component_params(&config)),
@@ -369,6 +402,40 @@ impl BlindDriver for ShellyCoverDriver {
         self.rpc(base_url, method, params, true).await?;
         Ok(())
     }
+}
+
+fn parse_shelly_allowed_origins(value: &str) -> Result<Vec<String>, String> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|origin| {
+            canonical_shelly_origin(
+                &Url::parse(origin)
+                    .map_err(|_| format!("Invalid LAN driver allowed origin: {origin}"))?,
+            )
+        })
+        .collect()
+}
+
+fn canonical_shelly_origin(url: &Url) -> Result<String, String> {
+    let host_is_ip = url
+        .host_str()
+        .and_then(|host| host.parse::<IpAddr>().ok())
+        .is_some();
+    if !matches!(url.scheme(), "http" | "https")
+        || !host_is_ip
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("LAN driver origins must be bare HTTP(S) IP origins".into());
+    }
+    Ok(url.origin().ascii_serialization())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +476,37 @@ impl StateChangePublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shelly_driver_requires_an_exact_ip_origin_allowlist() {
+        let driver = ShellyCoverDriver::with_allowed_origins(["http://192.168.1.20:8123"]).unwrap();
+        assert!(
+            driver
+                .validate_config(&serde_json::json!({
+                    "base_url": "http://192.168.1.20:8123",
+                    "component_id": 0
+                }))
+                .is_ok()
+        );
+
+        let denied = driver
+            .validate_config(&serde_json::json!({
+                "base_url": "http://192.168.1.21:8123",
+                "component_id": 0
+            }))
+            .unwrap_err();
+        assert_eq!(denied.code, "destination_not_allowed");
+
+        assert!(
+            driver
+                .validate_config(&serde_json::json!({
+                    "base_url": "http://localhost:8123",
+                    "component_id": 0
+                }))
+                .is_err()
+        );
+        assert!(ShellyCoverDriver::with_allowed_origins(["http://localhost:8123"]).is_err());
+    }
 
     #[tokio::test]
     async fn subscribers_receive_revisions_and_lag_is_reported() {
