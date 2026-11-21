@@ -122,11 +122,7 @@ pub trait BlindDriver: Send + Sync {
     fn id(&self) -> &'static str;
     fn validate_config(&self, config: &Value) -> Result<(), DriverFailure>;
     async fn observe(&self, config: &Value) -> Result<BlindObservation, DriverFailure>;
-    async fn execute(
-        &self,
-        config: &Value,
-        command: BlindCommand,
-    ) -> Result<(), DriverFailure>;
+    async fn execute(&self, config: &Value, command: BlindCommand) -> Result<(), DriverFailure>;
 }
 
 #[derive(Clone, Default)]
@@ -283,9 +279,15 @@ impl ShellyCoverDriver {
             match status.get(key) {
                 None | Some(Value::Null) => Ok(None),
                 Some(value) => {
-                    let percent = value.as_f64().filter(|value| value.is_finite() && (0.0..=100.0).contains(value)).ok_or_else(|| {
-                        DriverFailure::new(DriverFailureKind::InvalidResponse, "rpc_invalid_position")
-                    })?;
+                    let percent = value
+                        .as_f64()
+                        .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+                        .ok_or_else(|| {
+                            DriverFailure::new(
+                                DriverFailureKind::InvalidResponse,
+                                "rpc_invalid_position",
+                            )
+                        })?;
                     Ok(Some((100.0 - percent).round() as u8))
                 }
             }
@@ -344,11 +346,7 @@ impl BlindDriver for ShellyCoverDriver {
         Self::parse_observation(&config, &status)
     }
 
-    async fn execute(
-        &self,
-        config: &Value,
-        command: BlindCommand,
-    ) -> Result<(), DriverFailure> {
+    async fn execute(&self, config: &Value, command: BlindCommand) -> Result<(), DriverFailure> {
         let (config, base_url) = Self::parse_config(config)?;
         let (method, params) = match command {
             BlindCommand::Open => ("Cover.Open", Self::component_params(&config)),
