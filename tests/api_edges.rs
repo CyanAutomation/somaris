@@ -742,20 +742,26 @@ async fn queue_limits_match_documented_defaults_and_can_be_configured() {
     assert_eq!(queue["adapter_concurrency"], 1);
     assert_eq!(queue["adapter_scan_window_ms"], 1000);
     assert_eq!(queue["command_execution_timeout_seconds"], 45);
-    let template_scan_window = include_str!("../.env.example")
+    let environment_template = include_str!("../.env.example")
         .lines()
-        .find_map(|line| line.strip_prefix("SOMARIS_ADAPTER_SCAN_WINDOW_MS="))
-        .expect("the environment template should specify its scan window");
-    assert_eq!(template_scan_window, "1000");
-    let compose_scan_window = include_str!("../docker-compose.yaml")
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("- SOMARIS_ADAPTER_SCAN_WINDOW_MS=${SOMARIS_ADAPTER_SCAN_WINDOW_MS:-")
-                .and_then(|value| value.strip_suffix('}'))
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            line.split_once('=')
+                .expect("environment entries use KEY=VALUE")
+                .0
         })
-        .expect("the compose template should specify its scan window fallback");
-    assert_eq!(compose_scan_window, "1000");
+        .collect::<Vec<_>>();
+    assert!(environment_template.iter().all(|key| matches!(
+        *key,
+        "SOMARIS_HOST_IP" | "SOMARIS_HOST_PORT" | "SOMARIS_DBUS_DIR"
+    )));
+    assert!(environment_template.contains(&"SOMARIS_HOST_IP"));
+    assert!(environment_template.contains(&"SOMARIS_HOST_PORT"));
+
+    let compose = include_str!("../docker-compose.yaml");
+    assert!(!compose.lines().any(|line| line.trim() == "environment:"));
+    assert!(compose.contains("- path: .env\n        required: false"));
 
     let configured_app = router(
         AppState::new()
@@ -781,6 +787,48 @@ async fn queue_limits_match_documented_defaults_and_can_be_configured() {
     assert_eq!(queue["max_queued_per_device"], 3);
     assert_eq!(queue["adapter_concurrency"], 2);
     assert_eq!(queue["adapter_scan_window_ms"], 250);
+}
+
+#[tokio::test]
+async fn settings_reports_effective_defaults_and_source_metadata() {
+    let app = router(AppState::new());
+    let (status, _, body) = request(&app, Method::GET, "/api/control/v1/settings", &[], None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let settings = body.unwrap()["data"].clone();
+    assert_eq!(settings["values"]["simulator_enabled"]["value"], true);
+    assert_eq!(settings["values"]["simulator_enabled"]["source"], "default");
+    assert_eq!(settings["values"]["simulator_enabled"]["locked"], false);
+    assert_eq!(settings["values"]["history_api_enabled"]["value"], false);
+    assert_eq!(settings["values"]["log_level"]["value"], "info");
+    assert_eq!(settings["values"]["queue_max_outstanding"]["value"], 1000);
+    assert_eq!(
+        settings["values"]["adapter_concurrency"]["requires_restart"],
+        true
+    );
+    assert_eq!(settings["pending_restart"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn settings_mutations_require_same_origin_admin_authentication() {
+    let app = router(AppState::new());
+    let headers = [("origin", "http://somaris.test"), ("host", "somaris.test")];
+    for (method, path, body) in [
+        (
+            Method::PUT,
+            "/api/control/v1/settings",
+            Some(json!({"simulator_enabled": false})),
+        ),
+        (
+            Method::POST,
+            "/api/control/v1/settings/reset",
+            Some(json!({})),
+        ),
+    ] {
+        let (status, _, body) = request(&app, method, path, &headers, body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.unwrap()["error"]["code"], "admin_auth_required");
+    }
 }
 
 #[test]
