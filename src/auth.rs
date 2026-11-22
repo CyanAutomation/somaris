@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     io::{self, Read},
+    net::IpAddr,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -10,15 +11,28 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(15 * 60);
+const AUTH_FAILURE_LIMIT: usize = 5;
+const AUTH_LOCKOUT_DURATION: Duration = Duration::from_secs(15 * 60);
+const MAX_AUTH_FAILURE_CLIENTS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthFailure {
     AlreadyConfigured,
+    NotConfigured,
     SetupCodeInvalid,
     PassphraseTooShort,
     PassphraseTooLong,
     InvalidPassphrase,
+    RateLimited(u64),
     Persistence,
+}
+
+#[derive(Debug, Default, Clone)]
+struct FailedAttempts {
+    failures: VecDeque<Instant>,
+    locked_until: Option<Instant>,
+    last_seen: Option<Instant>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,6 +47,7 @@ pub struct AdminAuth {
     password_hash: Option<String>,
     setup_code: Option<String>,
     sessions: HashMap<String, Instant>,
+    failed_attempts: HashMap<IpAddr, FailedAttempts>,
 }
 
 impl AdminAuth {
@@ -64,6 +79,7 @@ impl AdminAuth {
             password_hash: Some(document.password_hash),
             setup_code: None,
             sessions: HashMap::new(),
+            failed_attempts: HashMap::new(),
         })
     }
 
@@ -76,6 +92,7 @@ impl AdminAuth {
             password_hash,
             setup_code,
             sessions: HashMap::new(),
+            failed_attempts: HashMap::new(),
         }
     }
 
@@ -88,13 +105,24 @@ impl AdminAuth {
     }
 
     pub fn setup(&mut self, code: &str, passphrase: &str) -> Result<String, AuthFailure> {
+        self.setup_from(IpAddr::from([127, 0, 0, 1]), code, passphrase)
+    }
+
+    pub fn setup_from(
+        &mut self,
+        client_ip: IpAddr,
+        code: &str,
+        passphrase: &str,
+    ) -> Result<String, AuthFailure> {
         if self.is_configured() {
             return Err(AuthFailure::AlreadyConfigured);
         }
+        self.check_rate_limit(client_ip, Instant::now())?;
         let Some(setup_code) = self.setup_code.as_deref() else {
             return Err(AuthFailure::SetupCodeInvalid);
         };
         if !constant_time_eq(setup_code.as_bytes(), code.as_bytes()) {
+            self.record_failure(client_ip, Instant::now());
             return Err(AuthFailure::SetupCodeInvalid);
         }
         validate_passphrase(passphrase)?;
@@ -103,20 +131,86 @@ impl AdminAuth {
             .map_err(|_| AuthFailure::Persistence)?;
         self.password_hash = Some(password_hash);
         self.setup_code = None;
+        self.failed_attempts.remove(&client_ip);
         self.create_session()
     }
 
     pub fn login(&mut self, passphrase: &str) -> Result<String, AuthFailure> {
+        self.login_from(IpAddr::from([127, 0, 0, 1]), passphrase)
+    }
+
+    pub fn login_from(
+        &mut self,
+        client_ip: IpAddr,
+        passphrase: &str,
+    ) -> Result<String, AuthFailure> {
         if passphrase.len() > 256 {
             return Err(AuthFailure::InvalidPassphrase);
         }
-        let Some(password_hash) = &self.password_hash else {
-            return Err(AuthFailure::AlreadyConfigured);
+        let Some(password_hash) = self.password_hash.clone() else {
+            return Err(AuthFailure::NotConfigured);
         };
-        if verify_passphrase(password_hash, passphrase) {
+        self.check_rate_limit(client_ip, Instant::now())?;
+        if verify_passphrase(&password_hash, passphrase) {
+            self.failed_attempts.remove(&client_ip);
             self.create_session()
         } else {
+            self.record_failure(client_ip, Instant::now());
             Err(AuthFailure::InvalidPassphrase)
+        }
+    }
+
+    fn check_rate_limit(&mut self, client_ip: IpAddr, now: Instant) -> Result<(), AuthFailure> {
+        let Some(attempts) = self.failed_attempts.get_mut(&client_ip) else {
+            return Ok(());
+        };
+        attempts.last_seen = Some(now);
+        if let Some(locked_until) = attempts.locked_until {
+            if locked_until > now {
+                let retry_after = locked_until
+                    .saturating_duration_since(now)
+                    .as_secs()
+                    .saturating_add(1);
+                return Err(AuthFailure::RateLimited(retry_after));
+            }
+            attempts.locked_until = None;
+            attempts.failures.clear();
+        }
+        while attempts
+            .failures
+            .front()
+            .is_some_and(|failure| now.saturating_duration_since(*failure) >= AUTH_FAILURE_WINDOW)
+        {
+            attempts.failures.pop_front();
+        }
+        Ok(())
+    }
+
+    fn record_failure(&mut self, client_ip: IpAddr, now: Instant) {
+        if !self.failed_attempts.contains_key(&client_ip)
+            && self.failed_attempts.len() >= MAX_AUTH_FAILURE_CLIENTS
+        {
+            if let Some(oldest_client) = self
+                .failed_attempts
+                .iter()
+                .min_by_key(|(_, attempts)| attempts.last_seen)
+                .map(|(ip, _)| *ip)
+            {
+                self.failed_attempts.remove(&oldest_client);
+            }
+        }
+        let attempts = self.failed_attempts.entry(client_ip).or_default();
+        attempts.last_seen = Some(now);
+        while attempts
+            .failures
+            .front()
+            .is_some_and(|failure| now.saturating_duration_since(*failure) >= AUTH_FAILURE_WINDOW)
+        {
+            attempts.failures.pop_front();
+        }
+        attempts.failures.push_back(now);
+        if attempts.failures.len() >= AUTH_FAILURE_LIMIT {
+            attempts.locked_until = Some(now + AUTH_LOCKOUT_DURATION);
         }
     }
 
@@ -186,6 +280,13 @@ fn verify_passphrase(hash: &str, passphrase: &str) -> bool {
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
+        let difference = left
+            .iter()
+            .zip(left)
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (std::hint::black_box(*left) ^ *right)
+            });
+        std::hint::black_box(difference);
         return false;
     }
     left.iter()
@@ -198,8 +299,8 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminAuth, AuthFailure};
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use super::{AdminAuth, AuthFailure, constant_time_eq};
+    use std::{fs, net::IpAddr, os::unix::fs::PermissionsExt};
 
     #[test]
     fn setup_persists_only_a_private_argon2_hash_and_consumes_the_code() {
@@ -249,5 +350,45 @@ mod tests {
         let replacement = auth.login("correct horse battery staple").unwrap();
         auth.logout(Some(&replacement));
         assert!(!auth.is_authenticated(Some(&replacement), std::time::Instant::now()));
+    }
+
+    #[test]
+    fn login_before_setup_reports_that_setup_is_required() {
+        assert_eq!(
+            AdminAuth::memory().login("correct horse battery staple"),
+            Err(AuthFailure::NotConfigured)
+        );
+    }
+
+    #[test]
+    fn setup_code_attempts_are_limited_per_client_ip() {
+        let mut auth = AdminAuth::memory();
+        let client = IpAddr::from([192, 0, 2, 10]);
+        for _ in 0..5 {
+            assert_eq!(
+                auth.setup_from(client, "wrong", "correct horse battery staple"),
+                Err(AuthFailure::SetupCodeInvalid)
+            );
+        }
+        assert!(matches!(
+            auth.setup_from(client, "wrong", "correct horse battery staple"),
+            Err(AuthFailure::RateLimited(_))
+        ));
+        let correct_code = auth.setup_code().unwrap().to_owned();
+        assert!(
+            auth.setup_from(
+                IpAddr::from([192, 0, 2, 11]),
+                &correct_code,
+                "correct horse battery staple"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn mismatched_setup_code_lengths_are_rejected() {
+        assert!(!constant_time_eq(b"0123456789ABCDEF", b""));
+        assert!(!constant_time_eq(b"0123456789ABCDEF", b"0123456789ABCDE"));
+        assert!(!constant_time_eq(b"0123456789ABCDEF", b"0123456789ABCDEFG"));
     }
 }
