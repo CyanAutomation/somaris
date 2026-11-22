@@ -7107,10 +7107,10 @@ fn auth_failure_response(error: AuthFailure) -> Response {
         ),
     };
     let mut response = error_response(status, code, message);
-    if let AuthFailure::RateLimited(retry_after) = error {
-        if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
-        }
+    if let AuthFailure::RateLimited(retry_after) = error
+        && let Ok(value) = HeaderValue::from_str(&retry_after.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
     }
     response
 }

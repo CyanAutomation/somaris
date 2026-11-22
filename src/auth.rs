@@ -189,15 +189,13 @@ impl AdminAuth {
     fn record_failure(&mut self, client_ip: IpAddr, now: Instant) {
         if !self.failed_attempts.contains_key(&client_ip)
             && self.failed_attempts.len() >= MAX_AUTH_FAILURE_CLIENTS
-        {
-            if let Some(oldest_client) = self
+            && let Some(oldest_client) = self
                 .failed_attempts
                 .iter()
                 .min_by_key(|(_, attempts)| attempts.last_seen)
                 .map(|(ip, _)| *ip)
-            {
-                self.failed_attempts.remove(&oldest_client);
-            }
+        {
+            self.failed_attempts.remove(&oldest_client);
         }
         let attempts = self.failed_attempts.entry(client_ip).or_default();
         attempts.last_seen = Some(now);
