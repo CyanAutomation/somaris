@@ -61,7 +61,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.spawn_background_tasks();
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, "Somaris API listening");
-    axum::serve(listener, router(state)).await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

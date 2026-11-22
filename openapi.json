@@ -1499,7 +1499,7 @@
         "summary": "Set the administrator passphrase",
         "parameters": [],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminSetupRequest" } } } },
-        "responses": { "200": { "description": "Passphrase set and administrator session created.", "headers": { "Set-Cookie": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminAuthInfoEnvelope" } } } }, "400": { "$ref": "#/components/responses/Error" }, "403": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" } }
+        "responses": { "200": { "description": "Passphrase set and administrator session created.", "headers": { "Set-Cookie": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminAuthInfoEnvelope" } } } }, "400": { "$ref": "#/components/responses/Error" }, "403": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" }, "429": { "description": "Too many failed admin authentication attempts; wait before retrying.", "headers": { "Retry-After": { "description": "Seconds to wait before retrying.", "schema": { "type": "integer", "minimum": 1 } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } } }
       },
       "options": { "operationId": "preflightAdminAuthSetup", "summary": "Browser CORS preflight", "responses": { "204": { "description": "Preflight accepted." } } }
     },
@@ -1508,7 +1508,7 @@
         "operationId": "loginAdminAuth",
         "summary": "Sign in to service settings",
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminLoginRequest" } } } },
-        "responses": { "200": { "description": "Administrator session created.", "headers": { "Set-Cookie": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminAuthInfoEnvelope" } } } }, "401": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" } }
+        "responses": { "200": { "description": "Administrator session created.", "headers": { "Set-Cookie": { "schema": { "type": "string" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AdminAuthInfoEnvelope" } } } }, "401": { "$ref": "#/components/responses/Error" }, "404": { "$ref": "#/components/responses/Error" }, "409": { "$ref": "#/components/responses/Error" }, "429": { "description": "Too many failed admin authentication attempts; wait before retrying.", "headers": { "Retry-After": { "description": "Seconds to wait before retrying.", "schema": { "type": "integer", "minimum": 1 } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } } }
       },
       "options": { "operationId": "preflightAdminAuthLogin", "summary": "Browser CORS preflight", "responses": { "204": { "description": "Preflight accepted." } } }
     },

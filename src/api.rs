@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{self, Read, Write},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
@@ -31,7 +32,7 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        FromRequestParts, OriginalUri, Path as RoutePath, Query, State,
+        ConnectInfo, FromRequestParts, OriginalUri, Path as RoutePath, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
@@ -293,6 +294,25 @@ impl FromRequestParts<AppState> for RequestState {
                     "Your demo session has expired. Reload the page to start a fresh demo.",
                 )
             })
+    }
+}
+
+struct AuthClientIp(IpAddr);
+
+impl FromRequestParts<AppState> for AuthClientIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _app: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let client_ip = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |ConnectInfo(address)| {
+                address.ip()
+            });
+        Ok(Self(client_ip))
     }
 }
 
@@ -707,10 +727,15 @@ impl AppState {
     }
 
     pub async fn from_data_path(path: impl Into<PathBuf>) -> io::Result<Self> {
-        let data_path = path.into();
+        Self::from_data_path_with_environment(path.into(), settings::process_environment()).await
+    }
+
+    async fn from_data_path_with_environment(
+        data_path: PathBuf,
+        settings_environment: HashMap<String, String>,
+    ) -> io::Result<Self> {
         let settings_path = data_path.with_file_name("settings.json");
         let settings_document = SettingsDocument::load(&settings_path)?;
-        let settings_environment = HashMap::new();
         let resolved = settings::resolve(&settings_document, &settings_environment)
             .map_err(invalid_configuration)?;
         let values = resolved.values;
@@ -6803,9 +6828,7 @@ fn if_match_satisfies(header: &HeaderValue, etag: &HeaderValue) -> bool {
     let Ok(header) = header.to_str() else {
         return false;
     };
-    header
-        .split(',')
-        .any(|candidate| candidate.trim() == "*" || candidate.trim() == etag)
+    header.split(',').any(|candidate| candidate.trim() == etag)
 }
 
 async fn restart_service(
@@ -6885,6 +6908,7 @@ async fn get_admin_auth_status(State(state): State<AppState>, headers: HeaderMap
 async fn setup_admin_auth(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    AuthClientIp(client_ip): AuthClientIp,
     headers: HeaderMap,
     payload: Result<Json<AdminSetupRequest>, JsonRejection>,
 ) -> Response {
@@ -6906,12 +6930,11 @@ async fn setup_admin_auth(
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let session = match state
-        .admin_auth
-        .lock()
-        .await
-        .setup(&request.code, &request.passphrase)
-    {
+    let session = match state.admin_auth.lock().await.setup_from(
+        client_ip,
+        &request.code,
+        &request.passphrase,
+    ) {
         Ok(session) => session,
         Err(error) => return auth_failure_response(error),
     };
@@ -6929,6 +6952,7 @@ async fn setup_admin_auth(
 async fn login_admin_auth(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    AuthClientIp(client_ip): AuthClientIp,
     headers: HeaderMap,
     payload: Result<Json<AdminLoginRequest>, JsonRejection>,
 ) -> Response {
@@ -6950,7 +6974,12 @@ async fn login_admin_auth(
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let session = match state.admin_auth.lock().await.login(&request.passphrase) {
+    let session = match state
+        .admin_auth
+        .lock()
+        .await
+        .login_from(client_ip, &request.passphrase)
+    {
         Ok(session) => session,
         Err(error) => return auth_failure_response(error),
     };
@@ -7039,7 +7068,12 @@ fn auth_failure_response(error: AuthFailure) -> Response {
         AuthFailure::AlreadyConfigured => (
             StatusCode::CONFLICT,
             "admin_auth_already_configured",
-            "Admin authentication is already configured or requires setup first.",
+            "Admin authentication is already configured.",
+        ),
+        AuthFailure::NotConfigured => (
+            StatusCode::CONFLICT,
+            "admin_setup_required",
+            "Complete admin setup before signing in.",
         ),
         AuthFailure::SetupCodeInvalid => (
             StatusCode::FORBIDDEN,
@@ -7061,13 +7095,24 @@ fn auth_failure_response(error: AuthFailure) -> Response {
             "admin_passphrase_invalid",
             "The passphrase is incorrect.",
         ),
+        AuthFailure::RateLimited(_) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "admin_auth_rate_limited",
+            "Too many failed admin authentication attempts. Retry after the indicated delay.",
+        ),
         AuthFailure::Persistence => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "admin_auth_persistence_failed",
             "Admin authentication could not be saved.",
         ),
     };
-    error_response(status, code, message)
+    let mut response = error_response(status, code, message);
+    if let AuthFailure::RateLimited(retry_after) = error {
+        if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+    }
+    response
 }
 
 fn admin_cookie_value(headers: &HeaderMap) -> Option<&str> {
@@ -9814,6 +9859,12 @@ mod security_hardening_tests {
         (router(state), session)
     }
 
+    async fn state_from_data_path(path: impl Into<PathBuf>) -> AppState {
+        AppState::from_data_path_with_environment(path.into(), HashMap::new())
+            .await
+            .unwrap()
+    }
+
     fn same_origin_headers(session: &str) -> Vec<(&'static str, String)> {
         vec![
             ("host", "somaris.test".into()),
@@ -9851,6 +9902,7 @@ mod security_hardening_tests {
         let denied = setup_admin_auth(
             State(state.clone()),
             OriginalUri(uri.clone()),
+            AuthClientIp(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             HeaderMap::new(),
             payload,
         )
@@ -9873,6 +9925,7 @@ mod security_hardening_tests {
         let response = setup_admin_auth(
             State(state.clone()),
             OriginalUri(uri),
+            AuthClientIp(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             headers.clone(),
             Ok(Json(AdminSetupRequest {
                 code: setup_code,
@@ -9932,6 +9985,22 @@ mod security_hardening_tests {
         assert_eq!(body["error"]["code"], "if_match_required");
 
         let headers = settings_headers(&session, Some("\"old-settings\""));
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect::<Vec<_>>();
+        let (status, _, body) = call_json(
+            &app,
+            axum::http::Method::PUT,
+            "/api/control/v1/settings",
+            &headers,
+            Some(update.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body["error"]["code"], "settings_changed");
+
+        let headers = settings_headers(&session, Some("*"));
         let headers = headers
             .iter()
             .map(|(name, value)| (*name, value.as_str()))
@@ -10024,6 +10093,96 @@ mod security_hardening_tests {
     }
 
     #[tokio::test]
+    async fn admin_auth_setup_and_login_limit_failed_attempts() {
+        let state = AppState::new();
+        let setup_headers = [("host", "somaris.test"), ("origin", "http://somaris.test")];
+        let unconfigured_app = router(state.clone());
+        let (status, _, body) = call_json(
+            &unconfigured_app,
+            axum::http::Method::POST,
+            "/api/control/v1/auth/login",
+            &setup_headers,
+            Some(serde_json::json!({"passphrase": "correct horse battery staple"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "admin_setup_required");
+
+        let setup_app = router(state);
+        for attempt in 0..6 {
+            let (status, response_headers, body) = call_json(
+                &setup_app,
+                axum::http::Method::POST,
+                "/api/control/v1/auth/setup",
+                &setup_headers,
+                Some(serde_json::json!({
+                    "code": "invalid",
+                    "passphrase": "correct horse battery staple"
+                })),
+            )
+            .await;
+            if attempt < 5 {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(body["error"]["code"], "admin_setup_code_invalid");
+            } else {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(body["error"]["code"], "admin_auth_rate_limited");
+                assert!(response_headers.contains_key(header::RETRY_AFTER));
+            }
+        }
+
+        let mut auth = AdminAuth::memory();
+        let code = auth.setup_code().unwrap().to_owned();
+        auth.setup(&code, "correct horse battery staple").unwrap();
+        let mut state = AppState::new();
+        state.admin_auth = Arc::new(Mutex::new(auth));
+        let login_app = router(state);
+        for attempt in 0..6 {
+            let (status, response_headers, body) = call_json(
+                &login_app,
+                axum::http::Method::POST,
+                "/api/control/v1/auth/login",
+                &setup_headers,
+                Some(serde_json::json!({"passphrase": "incorrect passphrase"})),
+            )
+            .await;
+            if attempt < 5 {
+                assert_eq!(status, StatusCode::UNAUTHORIZED);
+                assert_eq!(body["error"]["code"], "admin_passphrase_invalid");
+            } else {
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+                assert_eq!(body["error"]["code"], "admin_auth_rate_limited");
+                assert!(response_headers.contains_key(header::RETRY_AFTER));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn from_data_path_resolves_settings_with_supplied_process_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_path = directory.path().join("state.json");
+        let environment = HashMap::from([
+            ("SOMARIS_SIMULATOR".into(), "false".into()),
+            (
+                "SOMARIS_ALLOWED_ORIGINS".into(),
+                "https://override.example".into(),
+            ),
+            ("RUST_LOG".into(), "warn,somaris::api=debug".into()),
+        ]);
+        let state = AppState::from_data_path_with_environment(state_path, environment.clone())
+            .await
+            .unwrap();
+
+        assert!(!state.inner.lock().await.simulator_enabled);
+        assert!(
+            state
+                .allowed_origins_snapshot()
+                .contains(&HeaderValue::from_static("https://override.example"))
+        );
+        assert_eq!(&*state.settings_environment, &environment);
+    }
+
+    #[tokio::test]
     async fn environment_settings_are_locked_and_demo_does_not_register_write_routes() {
         let directory = tempfile::tempdir().unwrap();
         let environment = HashMap::from([("SOMARIS_SIMULATOR".into(), "true".into())]);
@@ -10093,7 +10252,7 @@ mod security_hardening_tests {
             .collect::<Vec<_>>();
         fs::write(&history_path, serialize_history(&history).unwrap()).unwrap();
         let settings_path = directory.path().join("settings.json");
-        let mut state = AppState::from_data_path(&state_path).await.unwrap();
+        let mut state = state_from_data_path(&state_path).await;
         let applied_log_levels = Arc::new(std::sync::Mutex::new(Vec::new()));
         let reloaded_log_levels = Arc::clone(&applied_log_levels);
         state
@@ -10203,7 +10362,7 @@ mod security_hardening_tests {
         );
         drop(app);
         assert_eq!(read_history(&history_path).unwrap().len(), 100);
-        let restarted = AppState::from_data_path(&state_path).await.unwrap();
+        let restarted = state_from_data_path(&state_path).await;
         assert_eq!(restarted.queue_config_snapshot().adapter_concurrency, 3);
         assert!(
             restarted
@@ -10219,7 +10378,7 @@ mod security_hardening_tests {
     async fn setup_checks_report_storage_and_network_guidance() {
         let directory = tempfile::tempdir().unwrap();
         let state_path = directory.path().join("state.json");
-        let app = router(AppState::from_data_path(&state_path).await.unwrap());
+        let app = router(state_from_data_path(&state_path).await);
         let (status, _, body) = call_json(
             &app,
             axum::http::Method::GET,
@@ -10944,7 +11103,7 @@ mod security_hardening_tests {
             std::fs::write(&path, serde_json::to_vec(&persisted).unwrap()).unwrap();
         }
 
-        let restored = AppState::from_data_path(&path).await.unwrap();
+        let restored = state_from_data_path(&path).await;
         let inner = restored.inner.lock().await;
         assert_eq!(inner.simulator.advertised_name, SIMULATOR_NAME);
         assert_eq!(
@@ -11623,7 +11782,7 @@ mod security_hardening_tests {
             state.persist(&inner).await.unwrap();
         }
 
-        let recovered = AppState::from_data_path(&path).await.unwrap();
+        let recovered = state_from_data_path(&path).await;
         let inner = recovered.inner.lock().await;
         let command = inner.commands.get(&command_id).unwrap();
         assert_eq!(command.status, CommandStatus::OutcomeUnknown);
