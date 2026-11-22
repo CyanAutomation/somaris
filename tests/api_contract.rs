@@ -1560,6 +1560,14 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
         ("/api/control/v1/batches/{id}", &["get", "options"]),
         ("/api/control/v1/audit-log", &["get", "options"]),
         ("/api/control/v1/queue", &["get", "options"]),
+        ("/api/control/v1/settings", &["get", "put", "options"]),
+        ("/api/control/v1/settings/reset", &["post", "options"]),
+        ("/api/control/v1/setup-checks", &["get", "options"]),
+        ("/api/control/v1/service/restart", &["post", "options"]),
+        ("/api/control/v1/auth", &["get", "options"]),
+        ("/api/control/v1/auth/setup", &["post", "options"]),
+        ("/api/control/v1/auth/login", &["post", "options"]),
+        ("/api/control/v1/auth/logout", &["post", "options"]),
         ("/api/control/v1/commands/{id}", &["get", "options"]),
         ("/openapi.json", &["get"]),
         ("/openapi.yaml", &["get"]),
@@ -1842,6 +1850,27 @@ async fn documented_routes_are_registered_and_openapi_paths_are_complete() {
                 "options" => Method::OPTIONS,
                 other => panic!("unexpected method in route inventory: {other}"),
             };
+            if (*path == "/api/control/v1/settings" && method == Method::PUT)
+                || (*path == "/api/control/v1/settings/reset" && method == Method::POST)
+                || (*path == "/api/control/v1/service/restart" && method == Method::POST)
+            {
+                let (status, _, _) = request(
+                    &app,
+                    method,
+                    &uri,
+                    &[("host", "somaris.test"), ("origin", "http://somaris.test")],
+                    None,
+                )
+                .await;
+                assert!(
+                    matches!(
+                        status,
+                        StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_FOUND
+                    ),
+                    "write route should be absent in demo: {uri}"
+                );
+                continue;
+            }
             let (status, headers, body) = request(&app, method, &uri, &[], None).await;
             assert_ne!(
                 status,

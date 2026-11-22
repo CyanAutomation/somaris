@@ -173,6 +173,49 @@ export interface Diagnostics {
   history_enabled?: boolean;
 }
 
+export interface SettingValue<T> {
+  value: T;
+  default: T;
+  source: 'env' | 'file' | 'default';
+  locked: boolean;
+  requires_restart: boolean;
+  constraints: string[];
+}
+
+export interface SettingsSnapshot {
+  values: {
+    simulator_enabled: SettingValue<boolean>;
+    allowed_origins: SettingValue<string[]>;
+    log_level: SettingValue<string>;
+    history_api_enabled: SettingValue<boolean>;
+    history_retention: SettingValue<number>;
+    queue_max_outstanding: SettingValue<number>;
+    queue_max_queued_per_device: SettingValue<number>;
+    adapter_concurrency: SettingValue<number>;
+    adapter_scan_window_ms: SettingValue<number>;
+    queue_wait_timeout_seconds: SettingValue<number>;
+  };
+  pending_restart: string[];
+}
+
+export interface AdminAuthStatus {
+  configured: boolean;
+  authenticated: boolean;
+  setup_required: boolean;
+}
+
+export interface SetupCheck {
+  key: string;
+  label: string;
+  status: 'ok' | 'attention' | 'not_applicable' | 'not_configured' | 'local_only';
+  message: string;
+  fix?: string;
+}
+
+export interface SetupChecks {
+  checks: SetupCheck[];
+}
+
 export interface Simulator {
   id: string;
   advertised_name: string;

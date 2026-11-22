@@ -28,7 +28,7 @@ FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d
 
 RUN apt-get update \
     && apt-get upgrade --no-install-recommends --yes \
-    && apt-get install --no-install-recommends -y ca-certificates curl libdbus-1-3 \
+    && apt-get install --no-install-recommends -y ca-certificates libdbus-1-3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --create-home somaris \
     && mkdir /data \
@@ -40,12 +40,10 @@ WORKDIR /app
 USER somaris
 
 ENV SOMARIS_LISTEN=0.0.0.0:8080 \
-    SOMARIS_DATA_DIR=/data \
-    SOMARIS_HEALTH_URL=http://127.0.0.1:8080/api/v1/health \
-    RUST_LOG=info
+    SOMARIS_DATA_DIR=/data
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl --fail --silent --show-error --noproxy '*' --max-time 3 "$SOMARIS_HEALTH_URL" >/dev/null || exit 1
+    CMD ["somaris", "healthcheck"]
 
 EXPOSE 8080
 VOLUME ["/data"]

@@ -2,6 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {parseHTML} from 'linkedom';
 import {readFileSync} from 'node:fs';
+import type {SettingsSnapshot} from '../types.mjs';
 import {
   blindState,
   movementStatusFromPositions,
@@ -600,18 +601,13 @@ test('undo snackbar actions are icon-only and remain named',()=>{
  assert.equal(action?.querySelector('svg')?.getAttribute('data-icon'),'undo');
 });
 
-test('layout and theme controls are named stateful icon buttons without redundant menus',()=>{
- const root=parseMarkup(renderTopbarActions({panelMode:false,displayPreference:'panel',themePreference:'dark'}));
- const layout=root.querySelector('#layout-mode-toggle');
+test('theme control stays in the topbar and display preference lives in Settings',()=>{
+ const root=parseMarkup(renderTopbarActions({panelMode:false,themePreference:'dark'}));
  const theme=root.querySelector('#theme-toggle');
- assert.equal(layout?.getAttribute('aria-label'),'Layout: Compact');
- assert.equal(layout?.getAttribute('data-action'),'layout-cycle');
- assert.equal(layout?.textContent,'');
- assert.equal(layout?.querySelector('svg')?.getAttribute('data-icon'),'panel');
+ assert.equal(root.querySelector('#layout-mode-toggle'),null);
  assert.equal(theme?.getAttribute('aria-label'),'Switch to light theme');
  assert.equal(theme?.textContent,'');
  assert.equal(theme?.querySelector('svg')?.getAttribute('data-icon'),'moon');
- assert.equal(root.querySelector('#layout-menu'),null);
  assert.equal(root.querySelector('#theme-menu-toggle'),null);
  assert.equal(root.querySelector('#theme-menu'),null);
  assert.equal(root.querySelector('[data-action="settings"]')?.getAttribute('aria-label'),'Settings');
@@ -633,8 +629,18 @@ test('theme preferences remain available as a native settings control',()=>{
 
 test('settings page reuses the icon-only back control and retains service diagnostics',async()=>{
  const {renderSettingsPage}=await import('../settings-page.mjs');
+ const setting=<T,>(value:T,source:'env'|'file'|'default'='default',locked=false,requires_restart=false)=>({value,default:value,source,locked,requires_restart,constraints:[]});
+ const serverSettings:SettingsSnapshot={
+  values:{
+   simulator_enabled:setting(true,'env',true),allowed_origins:setting([]),log_level:setting('info'),
+   history_api_enabled:setting(false),history_retention:setting(50000),queue_max_outstanding:setting(1000),
+   queue_max_queued_per_device:setting(32),adapter_concurrency:setting(1,'default',false,true),
+   adapter_scan_window_ms:setting(1000),queue_wait_timeout_seconds:setting(120),
+  },pending_restart:[],
+ };
  const page=parseMarkup(renderSettingsPage({
-  themePreference:'dark',demoMode:true,diagnostics:{demo_mode:true,simulator_ready:true},simulators:[{id:'simulator-1',advertised_name:'Demo blind'}],managedCount:1,serviceError:null,
+  themePreference:'dark',displayPreference:'panel',demoMode:true,diagnostics:{demo_mode:true,simulator_ready:true},simulators:[{id:'simulator-1',advertised_name:'Demo blind'}],managedCount:1,serviceError:null,serverSettings,serverSettingsError:null,
+  adminAuth:null,adminAuthError:null,setupChecks:{checks:[{key:'network_scope',label:'Network access',status:'local_only',message:'Local only'}]},
  }));
  assert.equal(page.querySelector('h1')?.textContent,'Settings');
  const back=page.querySelector('[data-action="home"]');
@@ -644,6 +650,30 @@ test('settings page reuses the icon-only back control and retains service diagno
  assert.equal(page.querySelector('.settings-service>h2')?.textContent,'Service status');
  assert.equal(page.querySelector('.service-health__summary')?.textContent,'Everything is working');
  assert.equal(page.querySelector('.service-health .info-item strong')?.textContent,'1');
+ assert.equal(page.querySelector('[data-display-preference] option[selected]')?.getAttribute('value'),'panel');
+ assert.equal(page.querySelector('[data-setting="simulator_enabled"] .setting-value')?.textContent,'On');
+ assert.match(page.querySelector('[data-setting="simulator_enabled"]')?.textContent||'',/SOMARIS_SIMULATOR/);
+ assert.match(page.querySelector('.settings-advanced')?.textContent||'',/Adapter concurrency/);
+ assert.match(page.querySelector('.settings-setup-checks')?.textContent||'',/Network access/);
+});
+
+test('authenticated settings render editable bounded controls and require administrator setup before edits',async()=>{
+ const {renderSettingsPage}=await import('../settings-page.mjs');
+ const setting=<T,>(value:T,source:'env'|'file'|'default'='default',locked=false,requires_restart=false)=>({value,default:value,source,locked,requires_restart,constraints:[]});
+ const serverSettings:SettingsSnapshot={values:{
+  simulator_enabled:setting(true),allowed_origins:setting([]),log_level:setting('info'),history_api_enabled:setting(false),
+  history_retention:setting(50000),queue_max_outstanding:setting(1000),queue_max_queued_per_device:setting(32),
+  adapter_concurrency:setting(1,'default',false,true),adapter_scan_window_ms:setting(1000),queue_wait_timeout_seconds:setting(120),
+ },pending_restart:[]};
+ const base={themePreference:'auto',displayPreference:'auto',demoMode:false,diagnostics:null,simulators:null,managedCount:0,serviceError:null,serverSettings,serverSettingsError:null,adminAuthError:null,setupChecks:null};
+ const locked=parseMarkup(renderSettingsPage({...base,adminAuth:{configured:false,authenticated:false,setup_required:true}}));
+ assert.equal(locked.querySelector('[data-admin-setup] input[name="code"]')!==null,true);
+ assert.equal(locked.querySelector('[data-service-settings] input'),null);
+ const open=parseMarkup(renderSettingsPage({...base,adminAuth:{configured:true,authenticated:true,setup_required:false}}));
+ assert.equal(open.querySelector('[data-service-settings] select[name="simulator_enabled"]')?.getAttribute('name'),'simulator_enabled');
+ assert.equal(open.querySelector('[data-service-settings] input[name="adapter_scan_window_ms"]')?.getAttribute('max'),'10000');
+ assert.equal(open.querySelector('[data-action="settings-reset"]')!==null,true);
+ assert.equal(open.querySelector('[data-action="service-restart"]')!==null,true);
 });
 
 test('battery and relative-time primitives show the last reading without cached jargon or duplicate info controls',()=>{
@@ -703,13 +733,12 @@ test('shared control tokens replace invalid slider CSS and panel size patches',(
  assert.match(components,/\.snackbar--info/);
 });
 
-test('topbar reuses named icon controls for settings, layout, theme, reset, and refresh', () => {
-  const panel = renderTopbarActions({blindCount:3, panelMode:true, demoMode:true, displayPreference:'panel'});
+test('topbar reuses named icon controls for settings, theme, reset, and refresh', () => {
+  const panel = renderTopbarActions({blindCount:3, panelMode:true, demoMode:true});
   assert.match(panel, /class="topbar-device-count">3 blinds<\/span>/);
   assert.match(panel, /data-action="add"[^>]*aria-label="Add a blind"/);
   assert.match(panel, /data-icon="add"/);
-  assert.match(panel, /id="layout-mode-toggle"/);
-  assert.match(panel, /data-action="layout-cycle"/);
+  assert.doesNotMatch(panel, /layout-mode-toggle|layout-cycle/);
   assert.match(panel, /id="theme-toggle"/);
   assert.doesNotMatch(panel, /id="layout-menu"|id="theme-menu"|More themes/);
   assert.match(panel, /data-action="refresh"[^>]*aria-label="Refresh"/);
@@ -720,13 +749,11 @@ test('topbar reuses named icon controls for settings, layout, theme, reset, and 
   const regular=renderTopbarActions({panelMode:false});
   assert.match(regular, /data-action="settings"[^>]*aria-label="Settings"/);
 
-  for (const displayPreference of ['mobile', 'desktop']) {
-    const regular = renderTopbarActions({blindCount:3, panelMode:false, displayPreference});
-    assert.doesNotMatch(regular, /topbar-device-count/);
-    assert.match(regular, /data-action="add"/);
-    assert.match(regular, /data-icon="add"/);
-    assert.match(regular, />Add a blind<\/span>/);
-  }
+  const regularWithManyBlinds=renderTopbarActions({blindCount:3,panelMode:false});
+  assert.doesNotMatch(regularWithManyBlinds, /topbar-device-count/);
+  assert.match(regularWithManyBlinds, /data-action="add"/);
+  assert.match(regularWithManyBlinds, /data-icon="add"/);
+  assert.match(regularWithManyBlinds, />Add a blind<\/span>/);
 });
 
 test('panel topbar keeps an accessible icon-only demo reset button when the banner is compacted away', () => {
