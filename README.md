@@ -12,7 +12,7 @@ cargo run
 
 The service listens on `127.0.0.1:8080` by default. Set `SOMARIS_LISTEN` to choose another address. Two built-in simulators are enabled by default: `Somaris Simulator 1` and `Somaris Simulator 2`, each starting closed at 100% and with independent position, scenario, wireless, and battery settings. Their names are synthetic and chosen to avoid likely collisions with physical blinds. Both use the hallway profile by default, with the observed 80 ms connection and 72 ms write-response delays, movement of about one percentage point per second, capture-informed RSSI variation, and a synthetic 4210 mV battery sample when a later service-resolution read fails. Physical discovery and control use the host Bluetooth adapter through `btleplug`; Linux deployments need a working BlueZ adapter and permission to access it. If Bluetooth is unavailable, the HTTP API stays up in a degraded state and retries adapter startup.
 
-Persistent service state is stored in `data/state.json` by default. Service configuration is stored separately in versioned `data/settings.json`. The Settings page reports the effective values, source and environment locks; environment variables take precedence over the settings file, which takes precedence over built-in defaults. Settings changes require an administrator passphrase. On first start, the service prints a one-time setup code in its logs; enter that code and choose a passphrase on the Settings page. The passphrase hash is stored with private file permissions. `somaris settings reset` clears file-based configuration and `somaris auth reset` clears the administrator credential; in Compose these commands stop the service so its restart policy can start it with the reset state and a fresh setup code. Settings writes are not exposed through MCP. Settings authentication does not protect blind-control endpoints, so keep the default loopback binding or place the service behind a trusted access boundary before exposing it to other machines.
+Persistent service state is stored in `data/state.json` by default. Service configuration is stored separately in versioned `data/settings.json`. The Settings page reports the effective values, source and environment locks; environment variables take precedence over the settings file, which takes precedence over built-in defaults. Settings changes require an administrator passphrase that you choose. On first start, Somaris logs a one-time setup code; the code is not the passphrase. Enter it on the Settings page to create your passphrase. See [Administrator setup and passphrase recovery](#administrator-setup-and-passphrase-recovery) for the full setup and recovery steps. Settings writes are not exposed through MCP. Settings authentication does not protect blind-control endpoints, so keep the default loopback binding or place the service behind a trusted access boundary before exposing it to other machines.
 
 Recent activity entries are stored with service state and include enrollment, command, batch, simulator, and settings changes. Settings audit details contain setting names only. Telemetry samples are kept in a separate append-only journal at `data/state.history.jsonl` by default, so they do not enlarge every state snapshot. Existing snapshots with embedded telemetry are migrated to the journal on startup. On Unix, these files are restricted to the service account. BLE discovery retains at most 1,024 recent physical devices. At capacity, it evicts the oldest safe entry or removes an un-enrolled ambiguous identity group together, while keeping enrolled candidates. A different peripheral ID cannot create a second fresh candidate for an already observed enrolled identity; it can refresh the identity once the retained observation is stale. Physical devices must be freshly observed and explicitly enrolled. The controller supports open, close, stop, toggle, direct percentage positioning, motor-speed settings, and supervised endpoint calibration. Percentage targets use the V2 motor target characteristic and are expressed as percent closed (0 is open, 100 is closed). Motor speed uses a typed Shade Config setting from 0% to 100%. Before sending a speed change, Somaris reads the standard firmware revision characteristic and requires firmware 2.2.0 or later; `GET /api/control/v1/devices/{id}/motor-settings` reads the firmware and, when supported, the current speed without moving the blind. It reports whether speed readback was skipped for unsupported or unrecognized firmware and returns phase timings on success and BLE failure. It also returns optional, typed read-only fields for local time offset, boot sequence, and sunrise/sunset when reported; those three mappings are reverse-engineered rather than manufacturer-specified. Endpoint calibration is a supervised start, nudge, mark, stop workflow that blocks ordinary movement and survives service restarts. Arbitrary GATT writes are not exposed. Battery voltage is cached from background BA71 reads for enrolled blinds. Successful reads are refreshed hourly; unavailable reads are retried after five minutes. Battery percentages are estimates derived from voltage.
 
@@ -99,16 +99,31 @@ For a local Compose setup, start the service without creating a `.env` file:
 docker compose up -d
 ```
 
-The API is available at `http://127.0.0.1:8080` by default, and a named volume retains service state, settings, and recent activity across container restarts. No `.env` file is needed for the default setup. Copy `.env.example` only to change the published host address/port or D-Bus directory. Compose passes an optional `.env` file into the container as an escape hatch for deployment-specific overrides. For example, `SOMARIS_DEMO_MODE=true` runs the isolated demo; demo sessions remain process-local and are not stored in the data volume. The optional `env_file` entry requires Docker Compose v2.24.0 or newer. First start prints an administrator setup code: read it with `docker compose logs somaris`, then use the Settings page to choose the passphrase. Demo mode exposes settings read-only and does not register settings write routes.
+The API is available at `http://127.0.0.1:8080` by default, and a named volume retains service state, settings, and recent activity across container restarts. No `.env` file is needed for the default setup. Copy `.env.example` only to change the published host address/port or D-Bus directory. Compose passes an optional `.env` file into the container as an escape hatch for deployment-specific overrides. For example, `SOMARIS_DEMO_MODE=true` runs the isolated demo; demo sessions remain process-local and are not stored in the data volume. The optional `env_file` entry requires Docker Compose v2.24.0 or newer. On first start, follow the setup steps below to get the one-time code and choose your passphrase. Demo mode exposes settings read-only and does not register settings write routes.
 
-To clear file-based settings or recover administrator access, run the corresponding command and let Compose restart the service:
+### Administrator setup and passphrase recovery
+
+The setup code and administrator passphrase are different:
+
+- **Setup code:** a one-time code printed in the service logs while administrator setup is incomplete. It authorizes you to create a passphrase. If setup is still incomplete when Somaris restarts, it generates a new code.
+- **Administrator passphrase:** a passphrase of at least 12 characters that you choose on the Settings page. Somaris never prints or stores it as plain text; only a password hash is saved. You cannot recover a forgotten passphrase from the logs or the hash.
+
+For initial setup, read the service logs and enter the current setup code on the Settings page. Then choose your administrator passphrase:
 
 ```sh
-docker compose exec somaris somaris settings reset
-docker compose exec somaris somaris auth reset
+docker compose logs somaris
 ```
 
-Settings reset removes file overrides; environment variables still take precedence. Auth reset removes the passphrase hash and generates a new one-time setup code in the service logs.
+If you forget the passphrase, reset the administrator credential. This does not clear your other service data or settings. Compose restarts the service, and the new setup code appears in its logs:
+
+```sh
+docker compose exec somaris somaris auth reset
+docker compose logs -f --since=1m somaris
+```
+
+Enter that new code on the Settings page and choose a replacement passphrase. If you run the log command more than a minute after the reset, use `docker compose logs somaris` to include older log entries. To clear file-based settings separately, run `docker compose exec somaris somaris settings reset`; environment variables still take precedence over those file settings.
+
+The setup code is logged at warning level. If it does not appear, check that your `RUST_LOG` setting allows warnings. For example, set `RUST_LOG=warn` in `.env`, recreate the service with `docker compose up -d --force-recreate somaris`, and check the logs again. Always use the code from the latest startup.
 
 ### Linux Bluetooth with Compose
 
